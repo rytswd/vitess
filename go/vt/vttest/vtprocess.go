@@ -19,18 +19,41 @@ package vttest
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
+	"path"
+	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
+	"testing"
 	"time"
 
-	"vitess.io/vitess/go/vt/log"
+	vtutils "vitess.io/vitess/go/vt/utils"
 
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/encoding/prototext"
+
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/servenv"
 )
+
+var versionRegex = regexp.MustCompile(`Version: ([0-9]+)\.([0-9]+)\.([0-9]+)`)
+
+// getMajorVersion extracts the major version from a binary by running binaryName --version
+func getMajorVersion(binaryName string) (int, error) {
+	version, err := exec.Command(binaryName, "--version").Output()
+	if err != nil {
+		return 0, err
+	}
+	v := versionRegex.FindStringSubmatch(string(version))
+	if len(v) != 4 {
+		return 0, fmt.Errorf("could not parse server version from: %s", version)
+	}
+
+	return strconv.Atoi(v[1])
+}
 
 // HealthChecker is a callback that impements a service-specific health check
 // It must return true if the service at the given `addr` is reachable, false
@@ -41,15 +64,17 @@ type HealthChecker func(addr string) bool
 // It can be spawned manually or through one of the available
 // helper methods.
 type VtProcess struct {
-	Name         string
-	Directory    string
-	LogDirectory string
-	Binary       string
-	ExtraArgs    []string
-	Env          []string
-	Port         int
-	PortGrpc     int
-	HealthCheck  HealthChecker
+	Name            string
+	Directory       string
+	LogDirectory    string
+	Binary          string
+	ExtraArgs       []string
+	Env             []string
+	BindAddress     string
+	BindAddressGprc string
+	Port            int
+	PortGrpc        int
+	HealthCheck     HealthChecker
 
 	proc *exec.Cmd
 	exit chan error
@@ -65,7 +90,7 @@ func getVars(addr string) ([]byte, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	return ioutil.ReadAll(resp.Body)
+	return io.ReadAll(resp.Body)
 }
 
 // defaultHealthCheck checks the health of the Vitess process using getVars.
@@ -88,7 +113,7 @@ func (vtp *VtProcess) IsHealthy() bool {
 // Address returns the main address for this Vitess process.
 // This is usually the main HTTP endpoint for the service.
 func (vtp *VtProcess) Address() string {
-	return fmt.Sprintf("localhost:%d", vtp.Port)
+	return fmt.Sprintf("%s:%d", vtp.BindAddress, vtp.Port)
 }
 
 // WaitTerminate attempts to gracefully shutdown the Vitess process by sending
@@ -124,26 +149,29 @@ func (vtp *VtProcess) WaitTerminate() error {
 func (vtp *VtProcess) WaitStart() (err error) {
 	vtp.proc = exec.Command(
 		vtp.Binary,
-		"-port", fmt.Sprintf("%d", vtp.Port),
-		"-log_dir", vtp.LogDirectory,
-		"-alsologtostderr",
+		"--port", strconv.Itoa(vtp.Port),
+		"--bind-address", vtp.BindAddress,
+		"--log_dir", vtp.LogDirectory,
+		"--alsologtostderr",
 	)
 
 	if vtp.PortGrpc != 0 {
-		vtp.proc.Args = append(vtp.proc.Args, "-grpc_port")
-		vtp.proc.Args = append(vtp.proc.Args, fmt.Sprintf("%d", vtp.PortGrpc))
+		vtp.proc.Args = append(vtp.proc.Args, "--grpc-port")
+		vtp.proc.Args = append(vtp.proc.Args, strconv.Itoa(vtp.PortGrpc))
+	}
+
+	if vtp.BindAddressGprc != "" {
+		vtp.proc.Args = append(vtp.proc.Args, "--grpc-bind-address")
+		vtp.proc.Args = append(vtp.proc.Args, vtp.BindAddressGprc)
 	}
 
 	vtp.proc.Args = append(vtp.proc.Args, vtp.ExtraArgs...)
-
-	vtp.proc.Stderr = os.Stderr
-	vtp.proc.Stdout = os.Stdout
-
 	vtp.proc.Env = append(vtp.proc.Env, os.Environ()...)
 	vtp.proc.Env = append(vtp.proc.Env, vtp.Env...)
-
-	vtp.proc.Stderr = os.Stderr
-	vtp.proc.Stderr = os.Stdout
+	if !testing.Testing() || testing.Verbose() {
+		vtp.proc.Stderr = os.Stderr
+		vtp.proc.Stdout = os.Stdout
+	}
 
 	log.Infof("%v %v", strings.Join(vtp.proc.Args, " "))
 	err = vtp.proc.Start()
@@ -174,33 +202,45 @@ func (vtp *VtProcess) WaitStart() (err error) {
 	return fmt.Errorf("process '%s' timed out after 60s (err: %s)", vtp.Name, <-vtp.exit)
 }
 
-// DefaultCharset is the default charset used by MySQL instances
-const DefaultCharset = "utf8"
+const (
+	// DefaultCharset is the default charset used by MySQL instances
+	DefaultCharset = "utf8mb4"
+)
 
 // QueryServerArgs are the default arguments passed to all Vitess query servers
 var QueryServerArgs = []string{
-	"-queryserver-config-pool-size", "4",
-	"-queryserver-config-query-timeout", "300",
-	"-queryserver-config-schema-reload-time", "60",
-	"-queryserver-config-stream-pool-size", "4",
-	"-queryserver-config-transaction-cap", "4",
-	"-queryserver-config-transaction-timeout", "300",
-	"-queryserver-config-txpool-timeout", "300",
+	"--queryserver-config-pool-size", "4",
+	"--queryserver-config-query-timeout", "300s",
+	"--queryserver-config-schema-reload-time", "60s",
+	"--queryserver-config-stream-pool-size", "4",
+	"--queryserver-config-transaction-cap", "4",
+	"--queryserver-config-txpool-timeout", "300s",
 }
 
 // VtcomboProcess returns a VtProcess handle for a local `vtcombo` service,
 // configured with the given Config.
 // The process must be manually started by calling WaitStart()
-func VtcomboProcess(env Environment, args *Config, mysql MySQLManager) *VtProcess {
+func VtcomboProcess(environment Environment, args *Config, mysql MySQLManager) (*VtProcess, error) {
+	vtcomboBindAddress := "127.0.0.1"
+	if args.VtComboBindAddress != "" {
+		vtcomboBindAddress = args.VtComboBindAddress
+	}
+	grpcBindAddress := ""
+	if servenv.GRPCBindAddress() != "" {
+		grpcBindAddress = servenv.GRPCBindAddress()
+	}
+
 	vt := &VtProcess{
-		Name:         "vtcombo",
-		Directory:    env.Directory(),
-		LogDirectory: env.LogDirectory(),
-		Binary:       env.BinaryPath("vtcombo"),
-		Port:         env.PortForProtocol("vtcombo", ""),
-		PortGrpc:     env.PortForProtocol("vtcombo", "grpc"),
-		HealthCheck:  env.ProcessHealthCheck("vtcombo"),
-		Env:          env.EnvVars(),
+		Name:            "vtcombo",
+		Directory:       environment.Directory(),
+		LogDirectory:    environment.LogDirectory(),
+		Binary:          environment.BinaryPath("vtcombo"),
+		BindAddress:     vtcomboBindAddress,
+		BindAddressGprc: grpcBindAddress,
+		Port:            environment.PortForProtocol("vtcombo", ""),
+		PortGrpc:        environment.PortForProtocol("vtcombo", "grpc"),
+		HealthCheck:     environment.ProcessHealthCheck("vtcombo"),
+		Env:             environment.EnvVars(),
 	}
 
 	user, pass := mysql.Auth()
@@ -209,69 +249,108 @@ func VtcomboProcess(env Environment, args *Config, mysql MySQLManager) *VtProces
 	if charset == "" {
 		charset = DefaultCharset
 	}
-
+	protoTopo, _ := prototext.Marshal(args.Topology)
 	vt.ExtraArgs = append(vt.ExtraArgs, []string{
-		"-db_charset", charset,
-		"-db_app_user", user,
-		"-db_app_password", pass,
-		"-db_dba_user", user,
-		"-db_dba_password", pass,
-		"-proto_topo", proto.CompactTextString(args.Topology),
-		"-mycnf_server_id", "1",
-		"-mycnf_socket_file", socket,
-		"-normalize_queries",
+		// TODO: Remove underscore(_) flags in v25, replace them with dashed(-) notation
+		"--db-charset", charset,
+		"--db-app-user", user,
+		"--db-app-password", pass,
+		"--db-dba-user", user,
+		"--db-dba-password", pass,
+		"--proto-topo", string(protoTopo),
+		"--mycnf-server-id", "1",
+		"--mycnf-socket-file", socket,
+		"--normalize-queries",
+		"--dbddl-plugin", "vttest",
+		"--foreign-key-mode", args.ForeignKeyMode,
+		"--planner-version", args.PlannerVersion,
+		fmt.Sprintf("--enable-online-ddl=%t", args.EnableOnlineDDL),
+		fmt.Sprintf("--enable-direct-ddl=%t", args.EnableDirectDDL),
+		fmt.Sprintf("--enable-system-settings=%t", args.EnableSystemSettings),
+		fmt.Sprintf("--no-scatter=%t", args.NoScatter),
 	}...)
 
-	vt.ExtraArgs = append(vt.ExtraArgs, QueryServerArgs...)
-	vt.ExtraArgs = append(vt.ExtraArgs, env.VtcomboArguments()...)
+	// If topo tablet refresh interval is not defined then we will give it value of 10s. Please note
+	// that the default value is 1 minute, but we are keeping it low to make vttestserver perform faster.
+	// Less value might result in high pressure on topo but for testing purpose that should not be a concern.
+	if args.VtgateTabletRefreshInterval <= 0 {
+		vt.ExtraArgs = append(vt.ExtraArgs, fmt.Sprintf("--tablet-refresh-interval=%v", 10*time.Second))
+	} else {
+		vt.ExtraArgs = append(vt.ExtraArgs, fmt.Sprintf("--tablet-refresh-interval=%v", args.VtgateTabletRefreshInterval))
+	}
 
+	// If gateway initial tablet timeout is not defined then we will give it value of 30s (vtcombo default).
+	// Setting it to a lower value will reduce the time VTGate waits for tablets at startup.
+	if args.VtgateGatewayInitialTabletTimeout <= 0 {
+		vt.ExtraArgs = append(vt.ExtraArgs, fmt.Sprintf("--gateway-initial-tablet-timeout=%v", 30*time.Second))
+	} else {
+		vt.ExtraArgs = append(vt.ExtraArgs, fmt.Sprintf("--gateway-initial-tablet-timeout=%v", args.VtgateGatewayInitialTabletTimeout))
+	}
+
+	vt.ExtraArgs = append(vt.ExtraArgs, QueryServerArgs...)
+	vt.ExtraArgs = append(vt.ExtraArgs, environment.VtcomboArguments()...)
+
+	// TODO: Remove underscore(_) flags in v25, replace them with dashed(-) notation
 	if args.SchemaDir != "" {
-		vt.ExtraArgs = append(vt.ExtraArgs, []string{"-schema_dir", args.SchemaDir}...)
+		vt.ExtraArgs = append(vt.ExtraArgs, []string{"--schema-dir", args.SchemaDir}...)
 	}
-	if args.WebDir != "" {
-		vt.ExtraArgs = append(vt.ExtraArgs, []string{"-web_dir", args.WebDir}...)
-	}
-	if args.WebDir2 != "" {
-		vt.ExtraArgs = append(vt.ExtraArgs, []string{"-web_dir2", args.WebDir2}...)
+	if args.PersistentMode && args.DataDir != "" {
+		vt.ExtraArgs = append(vt.ExtraArgs, []string{"--vschema-persistence-dir", path.Join(args.DataDir, "vschema_data")}...)
 	}
 	if args.TransactionMode != "" {
-		vt.ExtraArgs = append(vt.ExtraArgs, []string{"-transaction_mode", args.TransactionMode}...)
+		vt.ExtraArgs = append(vt.ExtraArgs, []string{"--transaction-mode", args.TransactionMode}...)
 	}
 	if args.TransactionTimeout != 0 {
-		vt.ExtraArgs = append(vt.ExtraArgs, "-queryserver-config-transaction-timeout", fmt.Sprintf("%f", args.TransactionTimeout))
+		vt.ExtraArgs = append(vt.ExtraArgs, "--queryserver-config-transaction-timeout", fmt.Sprintf("%v", args.TransactionTimeout))
 	}
 	if args.TabletHostName != "" {
-		vt.ExtraArgs = append(vt.ExtraArgs, []string{"-tablet_hostname", args.TabletHostName}...)
+		vt.ExtraArgs = append(vt.ExtraArgs, []string{"--tablet-hostname", args.TabletHostName}...)
 	}
-	if args.InitWorkflowManager {
-		vt.ExtraArgs = append(vt.ExtraArgs, []string{"-workflow_manager_init"}...)
+	if servenv.GRPCAuth() == "mtls" {
+		vt.ExtraArgs = append(vt.ExtraArgs, []string{"--grpc-auth-mode", servenv.GRPCAuth(), "--grpc-key", servenv.GRPCKey(), "--grpc-cert", servenv.GRPCCert(), "--grpc-ca", servenv.GRPCCertificateAuthority(), "--grpc-auth-mtls-allowed-substrings", servenv.ClientCertSubstrings()}...)
 	}
-
+	vtVer, err := getMajorVersion(vt.Binary)
+	if err != nil {
+		return nil, err
+	}
+	if args.VSchemaDDLAuthorizedUsers != "" {
+		vt.ExtraArgs = append(vt.ExtraArgs, []string{vtutils.GetFlagVariantForTestsByVersion("--vschema-ddl-authorized-users", vtVer), args.VSchemaDDLAuthorizedUsers}...)
+	}
+	vt.ExtraArgs = append(vt.ExtraArgs, "--mysql-server-version", servenv.MySQLServerVersion())
 	if socket != "" {
 		vt.ExtraArgs = append(vt.ExtraArgs, []string{
-			"-db_socket", socket,
+			"--db-socket", socket,
 		}...)
 	} else {
 		hostname, p := mysql.Address()
-		port := fmt.Sprintf("%d", p)
+		port := strconv.Itoa(p)
 
 		vt.ExtraArgs = append(vt.ExtraArgs, []string{
-			"-db_host", hostname,
-			"-db_port", port,
+			"--db-host", hostname,
+			"--db-port", port,
 		}...)
 	}
 
-	vtcomboMysqlPort := env.PortForProtocol("vtcombo_mysql_port", "")
+	vtcomboMysqlPort := environment.PortForProtocol("vtcombo_mysql_port", "")
 	vtcomboMysqlBindAddress := "localhost"
 	if args.MySQLBindHost != "" {
 		vtcomboMysqlBindAddress = args.MySQLBindHost
 	}
 
 	vt.ExtraArgs = append(vt.ExtraArgs, []string{
-		"-mysql_auth_server_impl", "none",
-		"-mysql_server_port", fmt.Sprintf("%d", vtcomboMysqlPort),
-		"-mysql_server_bind_address", vtcomboMysqlBindAddress,
+		"--mysql-auth-server-impl", "none",
+		"--mysql-server-port", strconv.Itoa(vtcomboMysqlPort),
+		"--mysql-server-bind-address", vtcomboMysqlBindAddress,
 	}...)
 
-	return vt
+	if args.ExternalTopoImplementation != "" {
+		vt.ExtraArgs = append(vt.ExtraArgs, []string{
+			"--external-topo-server",
+			"--topo-implementation", args.ExternalTopoImplementation,
+			"--topo-global-server-address", args.ExternalTopoGlobalServerAddress,
+			"--topo-global-root", args.ExternalTopoGlobalRoot,
+		}...)
+	}
+
+	return vt, nil
 }

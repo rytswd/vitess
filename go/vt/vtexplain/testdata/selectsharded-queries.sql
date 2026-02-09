@@ -8,10 +8,11 @@ select u.id, u.name, u.nickname, n.info from user u join name_info n on u.name =
 select m.id, m.song, e.extra from music m join music_extra e on m.id = e.id where m.user_id = 100 /* join on int */;
 
 select count(*) from user where id = 1 /* point aggregate */;
-select count(*) from user where name in ('alice','bob') /* scatter aggregate */;
+select count(*) from user where name in ('a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j') /* scatter aggregate */;
+select count(*) from customer where email in ('a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j') /* scatter aggregate with batching */;
 select name, count(*) from user group by name /* scatter aggregate */;
 
-select 1, "hello", 3.14 from user limit 10 /* select constant sql values */;
+select 1, "hello", 3.14, null from user limit 10 /* select constant sql values */;
 select * from (select id from user) s /* scatter paren select */;
 
 select name from user where id = (select id from t1) /* non-correlated subquery as value */;
@@ -32,3 +33,11 @@ select id, case when name = 'alice' then 'ALICE' when name = 'bob' then 'BOB' el
 select id, case when substr(name, 1, 5) = 'alice' then 'ALICE' when name = 'bob' then 'BOB' else 'OTHER' end as name from user where id = 1 /* select case */;
 
 select id, 'abc' as test from user where id = 1 union all select id, 'def' as test from user where id = 1 union all select id, 'ghi' as test from user where id = 1 /* union all */;
+
+select id from user where not id in (select col from music where music.user_id = 42) and id in (select col from music where music.user_id = 411);
+
+SELECT user.id, user.name, name_info.info FROM user INNER JOIN music ON (user.id = music.user_id) LEFT OUTER JOIN name_info ON (user.name = name_info.name);
+
+SELECT id FROM orders WHERE id IN (1, "1", 1);
+
+(SELECT user.id, user.name FROM user WHERE user.id = 1) UNION (SELECT user.id, user.name FROM user WHERE user.id = 3);

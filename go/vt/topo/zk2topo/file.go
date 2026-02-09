@@ -18,11 +18,11 @@ package zk2topo
 
 import (
 	"bytes"
-	"fmt"
+	"context"
+	"errors"
 	"path"
 
 	"github.com/z-division/go-zookeeper/zk"
-	"golang.org/x/net/context"
 
 	"vitess.io/vitess/go/vt/topo"
 )
@@ -45,7 +45,7 @@ func (zs *Server) Create(ctx context.Context, filePath string, contents []byte) 
 		return nil, convertError(err, zkPath)
 	}
 	if !bytes.Equal(data, contents) {
-		return nil, fmt.Errorf("file contents changed between zk.Create and zk.Get")
+		return nil, errors.New("file contents changed between zk.Create and zk.Get")
 	}
 
 	return ZKVersion(stat.Version), nil
@@ -85,6 +85,16 @@ func (zs *Server) Get(ctx context.Context, filePath string) ([]byte, topo.Versio
 		return nil, nil, convertError(err, zkPath)
 	}
 	return contents, ZKVersion(stat.Version), nil
+}
+
+// GetVersion is part of topo.Conn interface.
+func (zs *Server) GetVersion(ctx context.Context, filePath string, version int64) ([]byte, error) {
+	return nil, topo.NewError(topo.NoImplementation, "GetVersion not supported in ZK2 topo")
+}
+
+// List is part of the topo.Conn interface.
+func (zs *Server) List(ctx context.Context, filePathPrefix string) ([]topo.KVInfo, error) {
+	return nil, topo.NewError(topo.NoImplementation, "List not supported in ZK2 topo")
 }
 
 // Delete is part of the topo.Conn interface.

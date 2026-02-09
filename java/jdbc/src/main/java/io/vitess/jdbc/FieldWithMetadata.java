@@ -17,17 +17,19 @@
 package io.vitess.jdbc;
 
 import com.google.common.annotations.VisibleForTesting;
-
 import io.vitess.proto.Query;
 import io.vitess.util.Constants;
 import io.vitess.util.MysqlDefs;
 import io.vitess.util.StringUtils;
 import io.vitess.util.charset.CharsetMapping;
-
 import java.sql.SQLException;
 import java.sql.Types;
 import java.util.regex.PatternSyntaxException;
 
+/**
+ * FieldWithMetadata wraps a Query.Field with additional metadata derived from connection
+ * properties and field characteristics.
+ */
 public class FieldWithMetadata {
 
   private final ConnectionProperties connectionProperties;
@@ -257,7 +259,7 @@ public class FieldWithMetadata {
     String excludePattern = connectionProperties.getUtf8OutsideBmpExcludedColumnNamePattern();
 
     // When UseBlobToStoreUTF8OutsideBMP is set, we by default set blobs to UTF-8. So we first
-    // look for fields to exclude from that remapping (blacklist)
+    // look for fields to exclude from that remapping (denylist)
     if (excludePattern != null && !StringUtils.isNullOrEmptyWithoutWS(excludePattern)) {
       try {
         if (getOrgName().matches(excludePattern)) {

@@ -17,11 +17,10 @@ limitations under the License.
 package wrangler
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"time"
-
-	"golang.org/x/net/context"
 
 	"vitess.io/vitess/go/vt/grpcclient"
 	"vitess.io/vitess/go/vt/topo"
@@ -41,7 +40,7 @@ const (
 // on a Shard.
 func (wr *Wrangler) SetSourceShards(ctx context.Context, keyspace, shard string, sources []*topodatapb.TabletAlias, tables []string) error {
 	// Read the source tablets.
-	sourceTablets, err := wr.ts.GetTabletMap(ctx, sources)
+	sourceTablets, err := wr.ts.GetTabletMap(ctx, sources, nil)
 	if err != nil {
 		return err
 	}
@@ -55,7 +54,7 @@ func (wr *Wrangler) SetSourceShards(ctx context.Context, keyspace, shard string,
 	for i, alias := range sources {
 		ti := sourceTablets[topoproto.TabletAliasString(alias)]
 		sourceShards[i] = &topodatapb.Shard_SourceShard{
-			Uid:      uint32(i),
+			Uid:      int32(i),
 			Keyspace: ti.Keyspace,
 			Shard:    ti.Shard,
 			KeyRange: ti.KeyRange,
@@ -68,7 +67,7 @@ func (wr *Wrangler) SetSourceShards(ctx context.Context, keyspace, shard string,
 		// If the shard already has sources, maybe it's already been restored,
 		// so let's be safe and abort right here.
 		if len(si.SourceShards) > 0 {
-			return fmt.Errorf("shard %v/%v already has SourceShards, not overwriting them (full record: %v)", keyspace, shard, *si.Shard)
+			return fmt.Errorf("shard %v/%v already has SourceShards, not overwriting them (full record: %v)", keyspace, shard, si.Shard)
 		}
 
 		si.SourceShards = sourceShards
@@ -86,10 +85,10 @@ func (wr *Wrangler) WaitForFilteredReplication(ctx context.Context, keyspace, sh
 	if len(shardInfo.SourceShards) == 0 {
 		return fmt.Errorf("shard %v/%v has no source shard", keyspace, shard)
 	}
-	if !shardInfo.HasMaster() {
-		return fmt.Errorf("shard %v/%v has no master", keyspace, shard)
+	if !shardInfo.HasPrimary() {
+		return fmt.Errorf("shard %v/%v has no primary", keyspace, shard)
 	}
-	alias := shardInfo.MasterAlias
+	alias := shardInfo.PrimaryAlias
 	tabletInfo, err := wr.TopoServer().GetTablet(ctx, alias)
 	if err != nil {
 		return err
@@ -102,7 +101,7 @@ func (wr *Wrangler) WaitForFilteredReplication(ctx context.Context, keyspace, sh
 		return fmt.Errorf("failed to run explicit healthcheck on tablet: %v err: %v", tabletInfo, err)
 	}
 
-	conn, err := tabletconn.GetDialer()(tabletInfo.Tablet, grpcclient.FailFast(false))
+	conn, err := tabletconn.GetDialer()(ctx, tabletInfo.Tablet, grpcclient.FailFast(false))
 	if err != nil {
 		return fmt.Errorf("cannot connect to tablet %v: %v", alias, err)
 	}
@@ -120,7 +119,7 @@ func (wr *Wrangler) WaitForFilteredReplication(ctx context.Context, keyspace, sh
 			return fmt.Errorf("no filtered replication running on tablet: %v health record: %v", alias, shr)
 		}
 
-		delaySecs := stats.SecondsBehindMasterFilteredReplication
+		delaySecs := stats.FilteredReplicationLagSeconds
 		lastSeenDelay = time.Duration(delaySecs) * time.Second
 		if lastSeenDelay < 0 {
 			return fmt.Errorf("last seen delay should never be negative. tablet: %v delay: %v", alias, lastSeenDelay)

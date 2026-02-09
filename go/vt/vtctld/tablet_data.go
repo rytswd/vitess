@@ -17,16 +17,19 @@ limitations under the License.
 package vtctld
 
 import (
-	"flag"
+	"context"
 	"io"
 	"sync"
 	"time"
 
-	"golang.org/x/net/context"
+	"github.com/spf13/pflag"
+
 	"vitess.io/vitess/go/vt/grpcclient"
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/servenv"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/topoproto"
+	"vitess.io/vitess/go/vt/utils"
 	"vitess.io/vitess/go/vt/vttablet/tabletconn"
 
 	querypb "vitess.io/vitess/go/vt/proto/query"
@@ -37,9 +40,7 @@ import (
 // connections with tablets, and updates its internal state with the
 // result.
 
-var (
-	tabletHealthKeepAlive = flag.Duration("tablet_health_keep_alive", 5*time.Minute, "close streaming tablet health connection if there are no requests for this long")
-)
+var tabletHealthKeepAlive = 5 * time.Minute
 
 type tabletHealth struct {
 	mu sync.Mutex
@@ -55,6 +56,16 @@ type tabletHealth struct {
 	done chan struct{}
 	// ready is closed when there is at least one result to read.
 	ready chan struct{}
+}
+
+func init() {
+	for _, cmd := range []string{"vtcombo", "vtctld"} {
+		servenv.OnParseFor(cmd, registerVtctlTabletFlags)
+	}
+}
+
+func registerVtctlTabletFlags(fs *pflag.FlagSet) {
+	utils.SetFlagDurationVar(fs, &tabletHealthKeepAlive, "tablet-health-keep-alive", tabletHealthKeepAlive, "close streaming tablet health connection if there are no requests for this long")
 }
 
 func newTabletHealth() *tabletHealth {
@@ -101,7 +112,7 @@ func (th *tabletHealth) stream(ctx context.Context, ts *topo.Server, tabletAlias
 		return err
 	}
 
-	conn, err := tabletconn.GetDialer()(ti.Tablet, grpcclient.FailFast(true))
+	conn, err := tabletconn.GetDialer()(ctx, ti.Tablet, grpcclient.FailFast(true))
 	if err != nil {
 		return err
 	}
@@ -118,7 +129,7 @@ func (th *tabletHealth) stream(ctx context.Context, ts *topo.Server, tabletAlias
 			close(th.ready)
 			first = false
 		}
-		if time.Since(th.lastAccessed()) >= *tabletHealthKeepAlive {
+		if time.Since(th.lastAccessed()) >= tabletHealthKeepAlive {
 			return io.EOF
 		}
 		return nil

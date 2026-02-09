@@ -18,20 +18,19 @@ package tabletserver
 
 import (
 	"fmt"
-	"html/template"
 	"io"
 	"net/http"
 	"time"
 
+	"github.com/google/safehtml/template"
+
 	"vitess.io/vitess/go/acl"
-	"vitess.io/vitess/go/streamlog"
 	"vitess.io/vitess/go/vt/callerid"
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/logz"
-	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
-
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
 )
 
 var (
@@ -71,22 +70,18 @@ var (
 		</tr>`))
 )
 
-func init() {
-	http.HandleFunc("/txlogz", txlogzHandler)
-}
-
 // txlogzHandler serves a human readable snapshot of the
 // current transaction log.
 // Endpoint: /txlogz?timeout=%d&limit=%d
 // timeout: the txlogz will keep dumping transactions until timeout
 // limit: txlogz will keep dumping transactions until it hits the limit
-func txlogzHandler(w http.ResponseWriter, req *http.Request) {
+func txlogzHandler(w http.ResponseWriter, req *http.Request, redactUIQuery bool) {
 	if err := acl.CheckAccessHTTP(req, acl.DEBUGGING); err != nil {
 		acl.SendError(w, err)
 		return
 	}
 
-	if *streamlog.RedactDebugUIQueries {
+	if redactUIQuery {
 		io.WriteString(w, `
 <!DOCTYPE html>
 <html>
@@ -108,37 +103,45 @@ func txlogzHandler(w http.ResponseWriter, req *http.Request) {
 
 	tmr := time.NewTimer(timeout)
 	defer tmr.Stop()
-	for i := 0; i < limit; i++ {
+	for range limit {
 		select {
 		case out := <-ch:
-			txc, ok := out.(*TxConnection)
+			txc, ok := out.(*StatefulConnection)
 			if !ok {
-				err := fmt.Errorf("unexpected value in %s: %#v (expecting value of type %T)", tabletenv.TxLogger.Name(), out, &TxConnection{})
+				err := fmt.Errorf("unexpected value in %s: %#v (expecting value of type %T)", tabletenv.TxLogger.Name(), out, &StatefulConnection{})
 				io.WriteString(w, `<tr class="error">`)
 				io.WriteString(w, err.Error())
 				io.WriteString(w, "</tr>")
 				log.Error(err)
 				continue
 			}
-			duration := txc.EndTime.Sub(txc.StartTime).Seconds()
-			var level string
-			if duration < 0.1 {
-				level = "low"
-			} else if duration < 1.0 {
-				level = "medium"
-			} else {
-				level = "high"
-			}
-			tmplData := struct {
-				*TxConnection
-				Duration   float64
-				ColorLevel string
-			}{txc, duration, level}
-			if err := txlogzTmpl.Execute(w, tmplData); err != nil {
-				log.Errorf("txlogz: couldn't execute template: %v", err)
+			// not all StatefulConnections contain transactions
+			if txc.txProps != nil {
+				writeTransactionData(w, txc)
 			}
 		case <-tmr.C:
 			return
 		}
+	}
+}
+
+func writeTransactionData(w http.ResponseWriter, txc *StatefulConnection) {
+	props := txc.txProps
+	var level string
+	duration := props.EndTime.Sub(props.StartTime).Seconds()
+	if duration < 0.1 {
+		level = "low"
+	} else if duration < 1.0 {
+		level = "medium"
+	} else {
+		level = "high"
+	}
+	tmplData := struct {
+		*StatefulConnection
+		Duration   float64
+		ColorLevel string
+	}{txc, duration, level}
+	if err := txlogzTmpl.Execute(w, tmplData); err != nil {
+		log.Errorf("txlogz: couldn't execute template: %v", err)
 	}
 }

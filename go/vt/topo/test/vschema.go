@@ -17,10 +17,12 @@ limitations under the License.
 package test
 
 import (
+	"context"
 	"testing"
 
-	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
+
 	"vitess.io/vitess/go/vt/topo"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
@@ -28,8 +30,7 @@ import (
 )
 
 // checkVSchema runs the tests on the VSchema part of the API
-func checkVSchema(t *testing.T, ts *topo.Server) {
-	ctx := context.Background()
+func checkVSchema(t *testing.T, ctx context.Context, ts *topo.Server) {
 	if err := ts.CreateKeyspace(ctx, "test_keyspace", &topodatapb.Keyspace{}); err != nil {
 		t.Fatalf("CreateKeyspace: %v", err)
 	}
@@ -43,9 +44,12 @@ func checkVSchema(t *testing.T, ts *topo.Server) {
 		t.Error(err)
 	}
 
-	err = ts.SaveVSchema(ctx, "test_keyspace", &vschemapb.Keyspace{
-		Tables: map[string]*vschemapb.Table{
-			"unsharded": {},
+	err = ts.SaveVSchema(ctx, &topo.KeyspaceVSchemaInfo{
+		Name: "test_keyspace",
+		Keyspace: &vschemapb.Keyspace{
+			Tables: map[string]*vschemapb.Table{
+				"unsharded": {},
+			},
 		},
 	})
 	if err != nil {
@@ -53,9 +57,7 @@ func checkVSchema(t *testing.T, ts *topo.Server) {
 	}
 
 	got, err := ts.GetVSchema(ctx, "test_keyspace")
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 	want := &vschemapb.Keyspace{
 		Tables: map[string]*vschemapb.Table{
 			"unsharded": {},
@@ -65,17 +67,16 @@ func checkVSchema(t *testing.T, ts *topo.Server) {
 		t.Errorf("GetVSchema: %s, want %s", got, want)
 	}
 
-	err = ts.SaveVSchema(ctx, "test_keyspace", &vschemapb.Keyspace{
-		Sharded: true,
+	err = ts.SaveVSchema(ctx, &topo.KeyspaceVSchemaInfo{
+		Name: "test_keyspace",
+		Keyspace: &vschemapb.Keyspace{
+			Sharded: true,
+		},
 	})
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 
 	got, err = ts.GetVSchema(ctx, "test_keyspace")
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 	want = &vschemapb.Keyspace{
 		Sharded: true,
 	}
@@ -95,9 +96,7 @@ func checkVSchema(t *testing.T, ts *topo.Server) {
 }
 
 // checkRoutingRules runs the tests on the routing rules part of the API
-func checkRoutingRules(t *testing.T, ts *topo.Server) {
-	ctx := context.Background()
-
+func checkRoutingRules(t *testing.T, ctx context.Context, ts *topo.Server) {
 	if _, err := ts.GetRoutingRules(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -113,9 +112,7 @@ func checkRoutingRules(t *testing.T, ts *topo.Server) {
 	}
 
 	got, err := ts.GetRoutingRules(ctx)
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 	if !proto.Equal(got, want) {
 		t.Errorf("GetRoutingRules: %v, want %v", got, want)
 	}

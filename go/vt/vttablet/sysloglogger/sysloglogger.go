@@ -1,3 +1,5 @@
+//go:build !windows
+
 /*
 Copyright 2019 The Vitess Authors.
 
@@ -18,12 +20,14 @@ limitations under the License.
 package sysloglogger
 
 import (
-	"bytes"
-	"flag"
 	"log/syslog"
+	"strings"
+
+	"github.com/spf13/pflag"
 
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/servenv"
+	"vitess.io/vitess/go/vt/utils"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
 )
 
@@ -37,14 +41,21 @@ type syslogWriter interface {
 var writer syslogWriter
 
 // ch holds the tabletserver.StatsLogger channel to which this plugin subscribes (or a mock when under test).
-var ch chan interface{}
+var ch chan *tabletenv.LogStats
 
-// logQueries is the vttablet startup flag that must be set for this plugin to be active.
-var logQueries = flag.Bool("log_queries", false, "Enable query logging to syslog.")
+var logQueries bool
+
+func registerFlags(fs *pflag.FlagSet) {
+	// logQueries is the vttablet startup flag that must be set for this plugin to be active.
+	utils.SetFlagBoolVar(fs, &logQueries, "log-queries", logQueries, "Enable query logging to syslog.")
+}
 
 func init() {
+	servenv.OnParseFor("vtcombo", registerFlags)
+	servenv.OnParseFor("vttablet", registerFlags)
+
 	servenv.OnRun(func() {
-		if *logQueries {
+		if logQueries {
 			var err error
 			writer, err = syslog.New(syslog.LOG_INFO, "vtquerylogger")
 			if err != nil {
@@ -68,13 +79,10 @@ func run() {
 	}
 
 	formatParams := map[string][]string{"full": {}}
-	for out := range ch {
-		stats, ok := out.(*tabletenv.LogStats)
-		if !ok {
-			log.Errorf("Unexpected value in query logs: %#v (expecting value of type %T)", out, &tabletenv.LogStats{})
-			continue
-		}
-		var b bytes.Buffer
+
+	var b strings.Builder
+	for stats := range ch {
+		b.Reset()
 		if err := stats.Logf(&b, formatParams); err != nil {
 			log.Errorf("Error formatting logStats: %v", err)
 			continue

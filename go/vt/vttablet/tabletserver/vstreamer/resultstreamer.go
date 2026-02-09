@@ -19,33 +19,44 @@ package vstreamer
 import (
 	"context"
 	"fmt"
+	"time"
 
-	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/dbconfigs"
-	"vitess.io/vitess/go/vt/log"
-	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
+	"vitess.io/vitess/go/vt/logutil"
 	"vitess.io/vitess/go/vt/sqlparser"
+	vttablet "vitess.io/vitess/go/vt/vttablet/common"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/throttle/throttlerapp"
+
+	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 )
 
+// resultStreamer streams the results of the requested query
+// along with the GTID of the snapshot. This is used by vdiff
+// to synchronize the target to that GTID before comparing
+// the results.
 type resultStreamer struct {
 	ctx    context.Context
 	cancel func()
 
-	cp        *mysql.ConnParams
+	cp        dbconfigs.Connector
 	query     string
-	tableName sqlparser.TableIdent
+	tableName sqlparser.IdentifierCS
 	send      func(*binlogdatapb.VStreamResultsResponse) error
+	vse       *Engine
+	pktsize   PacketSizer
 }
 
-func newResultStreamer(ctx context.Context, cp *mysql.ConnParams, query string, send func(*binlogdatapb.VStreamResultsResponse) error) *resultStreamer {
+func newResultStreamer(ctx context.Context, cp dbconfigs.Connector, query string, send func(*binlogdatapb.VStreamResultsResponse) error, vse *Engine) *resultStreamer {
 	ctx, cancel := context.WithCancel(ctx)
 	return &resultStreamer{
-		ctx:    ctx,
-		cancel: cancel,
-		cp:     cp,
-		query:  query,
-		send:   send,
+		ctx:     ctx,
+		cancel:  cancel,
+		cp:      cp,
+		query:   query,
+		send:    send,
+		vse:     vse,
+		pktsize: DefaultPacketSizer(vttablet.VStreamerUseDynamicPacketSize, vttablet.VStreamerDefaultPacketSize),
 	}
 }
 
@@ -54,18 +65,21 @@ func (rs *resultStreamer) Cancel() {
 }
 
 func (rs *resultStreamer) Stream() error {
-	_, fromTable, err := analyzeSelect(rs.query)
+	_, fromTable, err := analyzeSelect(rs.query, rs.vse.env.Environment().Parser())
 	if err != nil {
 		return err
 	}
 	rs.tableName = fromTable
 
-	conn, err := rs.mysqlConnect()
+	conn, err := snapshotConnect(rs.ctx, rs.cp)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
-	gtid, err := rs.startStreaming(conn)
+	gtid, rotatedLog, err := conn.streamWithSnapshot(rs.ctx, rs.tableName.String(), rs.query)
+	if rotatedLog {
+		rs.vse.vstreamerFlushedBinlogs.Add(1)
+	}
 	if err != nil {
 		return err
 	}
@@ -86,6 +100,8 @@ func (rs *resultStreamer) Stream() error {
 
 	response := &binlogdatapb.VStreamResultsResponse{}
 	byteCount := 0
+	loggerName := fmt.Sprintf("%s (%v)", rs.vse.GetTabletInfo(), rs.tableName)
+	logger := logutil.NewThrottledLogger(loggerName, throttledLoggerInterval)
 	for {
 		select {
 		case <-rs.ctx.Done():
@@ -93,7 +109,13 @@ func (rs *resultStreamer) Stream() error {
 		default:
 		}
 
-		row, err := conn.FetchNext()
+		// check throttler.
+		if _, ok := rs.vse.throttlerClient.ThrottleCheckOKOrWaitAppName(rs.ctx, throttlerapp.ResultStreamerName); !ok {
+			logger.Infof("throttled.")
+			continue
+		}
+
+		row, err := conn.FetchNext(nil)
 		if err != nil {
 			return err
 		}
@@ -105,11 +127,15 @@ func (rs *resultStreamer) Stream() error {
 			byteCount += s.Len()
 		}
 
-		if byteCount >= *PacketSize {
+		if rs.pktsize.ShouldSend(byteCount) {
+			rs.vse.resultStreamerNumRows.Add(int64(len(response.Rows)))
+			rs.vse.resultStreamerNumPackets.Add(int64(1))
+			startSend := time.Now()
 			err = rs.send(response)
 			if err != nil {
 				return err
 			}
+			rs.pktsize.Record(byteCount, time.Since(startSend))
 			// empty the rows so we start over, but we keep the
 			// same capacity
 			response.Rows = response.Rows[:0]
@@ -118,6 +144,7 @@ func (rs *resultStreamer) Stream() error {
 	}
 
 	if len(response.Rows) > 0 {
+		rs.vse.resultStreamerNumRows.Add(int64(len(response.Rows)))
 		err = rs.send(response)
 		if err != nil {
 			return err
@@ -125,44 +152,4 @@ func (rs *resultStreamer) Stream() error {
 	}
 
 	return nil
-}
-
-func (rs *resultStreamer) startStreaming(conn *mysql.Conn) (string, error) {
-	lockConn, err := rs.mysqlConnect()
-	if err != nil {
-		return "", err
-	}
-	// To be safe, always unlock tables, even if lock tables might fail.
-	defer func() {
-		_, err := lockConn.ExecuteFetch("unlock tables", 0, false)
-		if err != nil {
-			log.Warning("Unlock tables failed: %v", err)
-		} else {
-			log.Infof("Tables unlocked", rs.tableName)
-		}
-		lockConn.Close()
-	}()
-
-	log.Infof("Locking table %s for copying", rs.tableName)
-	if _, err := lockConn.ExecuteFetch(fmt.Sprintf("lock tables %s read", sqlparser.String(rs.tableName)), 0, false); err != nil {
-		return "", err
-	}
-	pos, err := lockConn.MasterPosition()
-	if err != nil {
-		return "", err
-	}
-
-	if err := conn.ExecuteStreamFetch(rs.query); err != nil {
-		return "", err
-	}
-
-	return mysql.EncodePosition(pos), nil
-}
-
-func (rs *resultStreamer) mysqlConnect() (*mysql.Conn, error) {
-	cp, err := dbconfigs.WithCredentials(rs.cp)
-	if err != nil {
-		return nil, err
-	}
-	return mysql.Connect(rs.ctx, cp)
 }

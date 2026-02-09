@@ -17,13 +17,18 @@ limitations under the License.
 package trace
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
-	"strings"
 	"testing"
 
-	"golang.org/x/net/context"
+	"github.com/opentracing/opentracing-go"
+	"github.com/spf13/viper"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+
+	"vitess.io/vitess/go/viperutil/vipertest"
 )
 
 func TestFakeSpan(t *testing.T) {
@@ -49,43 +54,75 @@ func TestRegisterService(t *testing.T) {
 		return tracer, tracer, nil
 	}
 
-	tracingServer = &fakeName
+	v := viper.New()
+	t.Cleanup(vipertest.Stub(t, v, tracingServer))
+
+	v.Set(tracingServer.Key(), fakeName)
 
 	serviceName := "vtservice"
 	closer := StartTracing(serviceName)
-	tracer, ok := closer.(*fakeTracer)
-	if !ok {
-		t.Fatalf("did not get the expected tracer")
-	}
+	tracer := closer.(*fakeTracer)
 
-	if tracer.name != serviceName {
-		t.Fatalf("expected the name to be `%v` but it was `%v`", serviceName, tracer.name)
+	require.Equal(t, serviceName, tracer.name, fmt.Sprintf("tracer name mismatch: expected %s, got %s", serviceName, tracer.name))
+}
+
+func TestNewFromString(t *testing.T) {
+	tests := []struct {
+		parent      string
+		label       string
+		context     context.Context
+		expectedLog string
+		isPresent   bool
+		expectedErr string
+	}{
+		{
+			parent:      "",
+			label:       "empty parent",
+			context:     context.TODO(),
+			expectedLog: "",
+			isPresent:   true,
+			expectedErr: "parent is empty",
+		},
+		{
+			parent:      "parent",
+			label:       "non-empty parent",
+			expectedLog: "[key: sql-statement-type values:non-empty parent]\n",
+			context:     context.Background(),
+			isPresent:   false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.label, func(t *testing.T) {
+			span, ctx, err := NewFromString(context.Background(), tt.parent, tt.label)
+			if tt.expectedErr == "" {
+				require.NoError(t, err)
+				require.NotEmpty(t, span)
+				require.Equal(t, tt.context, ctx)
+
+				got := captureOutput(t, func() {
+					AnnotateSQL(span, &fakeStringer{tt.label})
+				}, true)
+
+				require.Equal(t, tt.expectedLog, got)
+			} else {
+				require.ErrorContains(t, err, tt.expectedErr)
+				require.Nil(t, span)
+				require.Nil(t, ctx)
+			}
+
+			copySpan := CopySpan(context.TODO(), tt.context)
+			if tt.isPresent {
+				require.Equal(t, tt.context, copySpan)
+			} else {
+				require.Equal(t, context.TODO(), copySpan)
+			}
+		})
 	}
 }
 
-func TestProtectPII(t *testing.T) {
-	// set up fake tracer that we can assert on
-	fakeName := "test"
-	var tracer *fakeTracer
-	tracingBackendFactories[fakeName] = func(serviceName string) (tracingService, io.Closer, error) {
-		tracer = &fakeTracer{name: serviceName}
-		return tracer, tracer, nil
-	}
-
-	tracingServer = &fakeName
-
-	serviceName := "vtservice"
-	closer := StartTracing(serviceName)
-	_, ok := closer.(*fakeTracer)
-	if !ok {
-		t.Fatalf("did not get the expected tracer")
-	}
-
-	span, _ := NewSpan(context.Background(), "span-name")
-	AnnotateSQL(span, "SELECT * FROM Tabble WHERE name = 'SECRET_INFORMATION'")
-	span.Finish()
-
-	tracer.assertNoSpanWith(t, "SECRET_INFORMATION")
+func TestNilCloser(t *testing.T) {
+	nc := nilCloser{}
+	require.Nil(t, nc.Close())
 }
 
 type fakeTracer struct {
@@ -93,18 +130,30 @@ type fakeTracer struct {
 	log  []string
 }
 
-func (f *fakeTracer) NewFromString(parent, label string) (Span, error) {
-	panic("implement me")
+func (f *fakeTracer) GetOpenTracingTracer() opentracing.Tracer {
+	return opentracing.GlobalTracer()
 }
 
-func (f *fakeTracer) New(parent Span, label string) Span {
+func (f *fakeTracer) NewFromString(ctx context.Context, parent, label string) (Span, context.Context, error) {
+	if parent == "" {
+		return nil, nil, errors.New("parent is empty")
+	}
+	span := &mockSpan{tracer: f}
+	return span, f.NewContext(ctx, span), nil
+}
+
+func (f *fakeTracer) New(ctx context.Context, label string) (Span, context.Context) {
 	f.log = append(f.log, "span started")
 
-	return &mockSpan{tracer: f}
+	span := &mockSpan{tracer: f}
+	return span, f.NewContext(ctx, span)
 }
 
 func (f *fakeTracer) FromContext(ctx context.Context) (Span, bool) {
-	return nil, false
+	if ctx == context.Background() {
+		return nil, false
+	}
+	return &mockSpan{}, true
 }
 
 func (f *fakeTracer) NewContext(parent context.Context, span Span) context.Context {
@@ -123,15 +172,6 @@ func (f *fakeTracer) Close() error {
 	panic("implement me")
 }
 
-func (f *fakeTracer) assertNoSpanWith(t *testing.T, substr string) {
-	t.Helper()
-	for _, logLine := range f.log {
-		if strings.Contains(logLine, substr) {
-			t.Fatalf("expected to not find [%v] but found it in [%v]", substr, logLine)
-		}
-	}
-}
-
 type mockSpan struct {
 	tracer *fakeTracer
 }
@@ -140,6 +180,15 @@ func (m *mockSpan) Finish() {
 	m.tracer.log = append(m.tracer.log, "span finished")
 }
 
-func (m *mockSpan) Annotate(key string, value interface{}) {
+func (m *mockSpan) Annotate(key string, value any) {
 	m.tracer.log = append(m.tracer.log, fmt.Sprintf("key: %v values:%v", key, value))
+	fmt.Println(m.tracer.log)
+}
+
+type fakeStringer struct {
+	str string
+}
+
+func (fs *fakeStringer) String() string {
+	return fs.str
 }

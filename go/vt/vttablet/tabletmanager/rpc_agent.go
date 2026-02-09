@@ -17,9 +17,8 @@ limitations under the License.
 package tabletmanager
 
 import (
+	"context"
 	"time"
-
-	"golang.org/x/net/context"
 
 	"vitess.io/vitess/go/vt/hook"
 	"vitess.io/vitess/go/vt/logutil"
@@ -31,24 +30,30 @@ import (
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
-// RPCAgent defines the interface implemented by the Agent for RPCs.
+// RPCTM defines the interface implemented by the TM for RPCs.
 // It is useful for RPC implementations to test their full stack.
-type RPCAgent interface {
+type RPCTM interface {
 	// RPC calls
 
 	// Various read-only methods
 
 	Ping(ctx context.Context, args string) string
 
-	GetSchema(ctx context.Context, tables, excludeTables []string, includeViews bool) (*tabletmanagerdatapb.SchemaDefinition, error)
+	GetSchema(ctx context.Context, request *tabletmanagerdatapb.GetSchemaRequest) (*tabletmanagerdatapb.SchemaDefinition, error)
 
 	GetPermissions(ctx context.Context) (*tabletmanagerdatapb.Permissions, error)
+
+	// GetGlobalStatusVars returns the server's global status variables asked for.
+	// An empty/nil variable name parameter slice means you want all of them.
+	GetGlobalStatusVars(ctx context.Context, variables []string) (map[string]string, error)
 
 	// Various read-write methods
 
 	SetReadOnly(ctx context.Context, rdonly bool) error
 
-	ChangeType(ctx context.Context, tabletType topodatapb.TabletType) error
+	ChangeTags(ctx context.Context, tabletTags map[string]string, replace bool) (map[string]string, error)
+
+	ChangeType(ctx context.Context, tabletType topodatapb.TabletType, semiSync bool) error
 
 	Sleep(ctx context.Context, duration time.Duration)
 
@@ -58,81 +63,120 @@ type RPCAgent interface {
 
 	RunHealthCheck(ctx context.Context)
 
-	IgnoreHealthError(ctx context.Context, pattern string) error
-
 	ReloadSchema(ctx context.Context, waitPosition string) error
 
 	PreflightSchema(ctx context.Context, changes []string) ([]*tabletmanagerdatapb.SchemaChangeResult, error)
 
 	ApplySchema(ctx context.Context, change *tmutils.SchemaChange) (*tabletmanagerdatapb.SchemaChangeResult, error)
 
+	ResetSequences(ctx context.Context, tables []string) error
+
 	LockTables(ctx context.Context) error
 
 	UnlockTables(ctx context.Context) error
 
-	ExecuteFetchAsDba(ctx context.Context, query []byte, dbName string, maxrows int, disableBinlogs bool, reloadSchema bool) (*querypb.QueryResult, error)
+	ExecuteQuery(ctx context.Context, req *tabletmanagerdatapb.ExecuteQueryRequest) (*querypb.QueryResult, error)
 
-	ExecuteFetchAsAllPrivs(ctx context.Context, query []byte, dbName string, maxrows int, reloadSchema bool) (*querypb.QueryResult, error)
+	ExecuteFetchAsDba(ctx context.Context, req *tabletmanagerdatapb.ExecuteFetchAsDbaRequest) (*querypb.QueryResult, error)
 
-	ExecuteFetchAsApp(ctx context.Context, query []byte, maxrows int) (*querypb.QueryResult, error)
+	ExecuteMultiFetchAsDba(ctx context.Context, req *tabletmanagerdatapb.ExecuteMultiFetchAsDbaRequest) ([]*querypb.QueryResult, error)
+
+	ExecuteFetchAsAllPrivs(ctx context.Context, req *tabletmanagerdatapb.ExecuteFetchAsAllPrivsRequest) (*querypb.QueryResult, error)
+
+	ExecuteFetchAsApp(ctx context.Context, req *tabletmanagerdatapb.ExecuteFetchAsAppRequest) (*querypb.QueryResult, error)
+
+	GetUnresolvedTransactions(ctx context.Context, abandonAgeSeconds int64) ([]*querypb.TransactionMetadata, error)
+
+	ReadTransaction(ctx context.Context, req *tabletmanagerdatapb.ReadTransactionRequest) (*querypb.TransactionMetadata, error)
+
+	GetTransactionInfo(ctx context.Context, req *tabletmanagerdatapb.GetTransactionInfoRequest) (*tabletmanagerdatapb.GetTransactionInfoResponse, error)
+
+	ConcludeTransaction(ctx context.Context, req *tabletmanagerdatapb.ConcludeTransactionRequest) error
+
+	MysqlHostMetrics(ctx context.Context, req *tabletmanagerdatapb.MysqlHostMetricsRequest) (*tabletmanagerdatapb.MysqlHostMetricsResponse, error)
 
 	// Replication related methods
+	PrimaryStatus(ctx context.Context) (*replicationdatapb.PrimaryStatus, error)
 
-	SlaveStatus(ctx context.Context) (*replicationdatapb.Status, error)
+	ReplicationStatus(ctx context.Context) (*replicationdatapb.Status, error)
 
-	MasterPosition(ctx context.Context) (string, error)
+	FullStatus(ctx context.Context) (*replicationdatapb.FullStatus, error)
+
+	StopReplication(ctx context.Context) error
+
+	StopReplicationMinimum(ctx context.Context, position string, waitTime time.Duration) (string, error)
+
+	StartReplication(ctx context.Context, semiSync bool) error
+
+	RestartReplication(ctx context.Context, semiSync bool) error
+
+	StartReplicationUntilAfter(ctx context.Context, position string, waitTime time.Duration) error
+
+	GetReplicas(ctx context.Context) ([]string, error)
+
+	PrimaryPosition(ctx context.Context) (string, error)
 
 	WaitForPosition(ctx context.Context, pos string) error
 
-	StopSlave(ctx context.Context) error
-
-	StopSlaveMinimum(ctx context.Context, position string, waitTime time.Duration) (string, error)
-
-	StartSlave(ctx context.Context) error
-
-	StartSlaveUntilAfter(ctx context.Context, position string, waitTime time.Duration) error
-
-	TabletExternallyReparented(ctx context.Context, externalID string) error
-
-	GetSlaves(ctx context.Context) ([]string, error)
-
 	// VReplication API
+	CreateVReplicationWorkflow(ctx context.Context, req *tabletmanagerdatapb.CreateVReplicationWorkflowRequest) (*tabletmanagerdatapb.CreateVReplicationWorkflowResponse, error)
+	DeleteTableData(ctx context.Context, req *tabletmanagerdatapb.DeleteTableDataRequest) (*tabletmanagerdatapb.DeleteTableDataResponse, error)
+	DeleteVReplicationWorkflow(ctx context.Context, req *tabletmanagerdatapb.DeleteVReplicationWorkflowRequest) (*tabletmanagerdatapb.DeleteVReplicationWorkflowResponse, error)
+	HasVReplicationWorkflows(ctx context.Context, req *tabletmanagerdatapb.HasVReplicationWorkflowsRequest) (*tabletmanagerdatapb.HasVReplicationWorkflowsResponse, error)
+	ReadVReplicationWorkflows(ctx context.Context, req *tabletmanagerdatapb.ReadVReplicationWorkflowsRequest) (*tabletmanagerdatapb.ReadVReplicationWorkflowsResponse, error)
+	ReadVReplicationWorkflow(ctx context.Context, req *tabletmanagerdatapb.ReadVReplicationWorkflowRequest) (*tabletmanagerdatapb.ReadVReplicationWorkflowResponse, error)
+	ValidateVReplicationPermissions(ctx context.Context, req *tabletmanagerdatapb.ValidateVReplicationPermissionsRequest) (*tabletmanagerdatapb.ValidateVReplicationPermissionsResponse, error)
 	VReplicationExec(ctx context.Context, query string) (*querypb.QueryResult, error)
-	VReplicationWaitForPos(ctx context.Context, id int, pos string) error
+	VReplicationWaitForPos(ctx context.Context, id int32, pos string) error
+	UpdateVReplicationWorkflow(ctx context.Context, req *tabletmanagerdatapb.UpdateVReplicationWorkflowRequest) (*tabletmanagerdatapb.UpdateVReplicationWorkflowResponse, error)
+	UpdateVReplicationWorkflows(ctx context.Context, req *tabletmanagerdatapb.UpdateVReplicationWorkflowsRequest) (*tabletmanagerdatapb.UpdateVReplicationWorkflowsResponse, error)
+	UpdateSequenceTables(ctx context.Context, request *tabletmanagerdatapb.UpdateSequenceTablesRequest) (*tabletmanagerdatapb.UpdateSequenceTablesResponse, error)
+	GetMaxValueForSequences(ctx context.Context, request *tabletmanagerdatapb.GetMaxValueForSequencesRequest) (*tabletmanagerdatapb.GetMaxValueForSequencesResponse, error)
+
+	// VDiff API
+	VDiff(ctx context.Context, req *tabletmanagerdatapb.VDiffRequest) (*tabletmanagerdatapb.VDiffResponse, error)
 
 	// Reparenting related functions
 
 	ResetReplication(ctx context.Context) error
 
-	InitMaster(ctx context.Context) (string, error)
+	InitPrimary(ctx context.Context, semiSync bool) (string, error)
 
-	PopulateReparentJournal(ctx context.Context, timeCreatedNS int64, actionName string, masterAlias *topodatapb.TabletAlias, pos string) error
+	PopulateReparentJournal(ctx context.Context, timeCreatedNS int64, actionName string, tabletAlias *topodatapb.TabletAlias, pos string) error
 
-	InitSlave(ctx context.Context, parent *topodatapb.TabletAlias, replicationPosition string, timeCreatedNS int64) error
+	ReadReparentJournalInfo(ctx context.Context) (int32, error)
 
-	DemoteMaster(ctx context.Context) (string, error)
+	InitReplica(ctx context.Context, parent *topodatapb.TabletAlias, replicationPosition string, timeCreatedNS int64, semiSync bool) error
 
-	UndoDemoteMaster(ctx context.Context) error
+	DemotePrimary(ctx context.Context, force bool) (*replicationdatapb.PrimaryStatus, error)
 
-	PromoteSlaveWhenCaughtUp(ctx context.Context, replicationPosition string) (string, error)
+	UndoDemotePrimary(ctx context.Context, semiSync bool) error
 
-	SlaveWasPromoted(ctx context.Context) error
+	ReplicaWasPromoted(ctx context.Context) error
 
-	SetMaster(ctx context.Context, parent *topodatapb.TabletAlias, timeCreatedNS int64, waitPosition string, forceStartSlave bool) error
+	ResetReplicationParameters(ctx context.Context) error
 
-	SlaveWasRestarted(ctx context.Context, parent *topodatapb.TabletAlias) error
+	SetReplicationSource(ctx context.Context, parent *topodatapb.TabletAlias, timeCreatedNS int64, waitPosition string, forceStartReplication bool, semiSync bool, heartbeatInterval float64) error
 
-	StopReplicationAndGetStatus(ctx context.Context) (*replicationdatapb.Status, error)
+	StopReplicationAndGetStatus(ctx context.Context, stopReplicationMode replicationdatapb.StopReplicationMode) (StopReplicationAndGetStatusResponse, error)
 
-	PromoteSlave(ctx context.Context) (string, error)
+	ReplicaWasRestarted(ctx context.Context, parent *topodatapb.TabletAlias) error
+
+	PromoteReplica(ctx context.Context, semiSync bool) (string, error)
 
 	// Backup / restore related methods
 
-	Backup(ctx context.Context, concurrency int, logger logutil.Logger, allowMaster bool) error
+	Backup(ctx context.Context, logger logutil.Logger, request *tabletmanagerdatapb.BackupRequest) error
 
-	RestoreFromBackup(ctx context.Context, logger logutil.Logger) error
+	RestoreFromBackup(ctx context.Context, logger logutil.Logger, request *tabletmanagerdatapb.RestoreFromBackupRequest) error
+
+	IsBackupRunning() bool
 
 	// HandleRPCPanic is to be called in a defer statement in each
 	// RPC input point.
-	HandleRPCPanic(ctx context.Context, name string, args, reply interface{}, verbose bool, err *error)
+	HandleRPCPanic(ctx context.Context, name string, args, reply any, verbose bool, err *error)
+
+	// Throttler
+	CheckThrottler(ctx context.Context, request *tabletmanagerdatapb.CheckThrottlerRequest) (*tabletmanagerdatapb.CheckThrottlerResponse, error)
+	GetThrottlerStatus(ctx context.Context, request *tabletmanagerdatapb.GetThrottlerStatusRequest) (*tabletmanagerdatapb.GetThrottlerStatusResponse, error)
 }

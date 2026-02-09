@@ -19,22 +19,37 @@ limitations under the License.
 package backupstorage
 
 import (
-	"flag"
-	"fmt"
+	"context"
+	"errors"
 	"io"
 
-	"golang.org/x/net/context"
+	"github.com/spf13/pflag"
+
+	mysqlctlerrors "vitess.io/vitess/go/vt/mysqlctl/errors"
+	"vitess.io/vitess/go/vt/servenv"
+	"vitess.io/vitess/go/vt/utils"
 )
 
 var (
 	// BackupStorageImplementation is the implementation to use
 	// for BackupStorage. Exported for test purposes.
-	BackupStorageImplementation = flag.String("backup_storage_implementation", "", "which implementation to use for the backup storage feature")
+	BackupStorageImplementation string
 	// FileSizeUnknown is a special value indicating that the file size is not known.
 	// This is typically used while creating a file programmatically, where it is
 	// impossible to compute the final size on disk ahead of time.
 	FileSizeUnknown = int64(-1)
 )
+
+func registerBackupFlags(fs *pflag.FlagSet) {
+	utils.SetFlagStringVar(fs, &BackupStorageImplementation, "backup-storage-implementation", "", "Which backup storage implementation to use for creating and restoring backups.")
+}
+
+func init() {
+	servenv.OnParseFor("vtbackup", registerBackupFlags)
+	servenv.OnParseFor("vtctl", registerBackupFlags)
+	servenv.OnParseFor("vtctld", registerBackupFlags)
+	servenv.OnParseFor("vttablet", registerBackupFlags)
+}
 
 // BackupHandle describes an individual backup.
 type BackupHandle interface {
@@ -74,6 +89,10 @@ type BackupHandle interface {
 	// The context is valid for the duration of the reads, until the
 	// ReadCloser is closed.
 	ReadFile(ctx context.Context, filename string) (io.ReadCloser, error)
+
+	// BackupErrorRecorder is embedded here to coordinate reporting and
+	// handling of errors among all the components involved in taking/restoring a backup.
+	mysqlctlerrors.BackupErrorRecorder
 }
 
 // BackupStorage is the interface to the storage system
@@ -101,6 +120,13 @@ type BackupStorage interface {
 	// session, such as closing connections. Implementations of
 	// BackupStorage must support being reused after Close() is called.
 	Close() error
+
+	// WithParams should return a new BackupStorage which is a shared-nothing
+	// copy of the current BackupStorage and which uses Params.
+	//
+	// This method is intended to give BackupStorage implementations logging
+	// and metrics mechanisms.
+	WithParams(Params) BackupStorage
 }
 
 // BackupStorageMap contains the registered implementations for BackupStorage
@@ -110,9 +136,9 @@ var BackupStorageMap = make(map[string]BackupStorage)
 // Should be called after flags have been initialized.
 // When all operations are done, call BackupStorage.Close() to free resources.
 func GetBackupStorage() (BackupStorage, error) {
-	bs, ok := BackupStorageMap[*BackupStorageImplementation]
+	bs, ok := BackupStorageMap[BackupStorageImplementation]
 	if !ok {
-		return nil, fmt.Errorf("no registered implementation of BackupStorage")
+		return nil, errors.New("no registered implementation of BackupStorage")
 	}
 	return bs, nil
 }

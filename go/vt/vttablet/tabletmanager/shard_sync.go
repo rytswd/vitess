@@ -17,23 +17,33 @@ limitations under the License.
 package tabletmanager
 
 import (
-	"flag"
+	"context"
 	"time"
 
-	"golang.org/x/net/context"
+	"github.com/spf13/pflag"
 
+	"vitess.io/vitess/go/protoutil"
 	"vitess.io/vitess/go/vt/log"
-	"vitess.io/vitess/go/vt/logutil"
 	"vitess.io/vitess/go/vt/mysqlctl"
-	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/servenv"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/topoproto"
+	"vitess.io/vitess/go/vt/utils"
 	"vitess.io/vitess/go/vt/vterrors"
+
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
-var (
-	shardSyncRetryDelay = flag.Duration("shard_sync_retry_delay", 30*time.Second, "delay between retries of updates to keep the tablet and its shard record in sync")
-)
+var shardSyncRetryDelay = 30 * time.Second
+
+func registerShardSyncFlags(fs *pflag.FlagSet) {
+	utils.SetFlagDurationVar(fs, &shardSyncRetryDelay, "shard-sync-retry-delay", shardSyncRetryDelay, "delay between retries of updates to keep the tablet and its shard record in sync")
+}
+
+func init() {
+	servenv.OnParseFor("vtcombo", registerShardSyncFlags)
+	servenv.OnParseFor("vttablet", registerShardSyncFlags)
+}
 
 // shardSyncLoop is a loop that tries to keep the tablet state and the
 // shard record in sync.
@@ -48,11 +58,8 @@ var (
 // This goroutine gets woken up for shard record changes by maintaining a
 // topo watch on the shard record. It gets woken up for tablet state changes by
 // a notification signal from setTablet().
-func (agent *ActionAgent) shardSyncLoop(ctx context.Context) {
-	// Make a copy of the channel so we don't race when stopShardSync() clears it.
-	agent.mutex.Lock()
-	notifyChan := agent._shardSyncChan
-	agent.mutex.Unlock()
+func (tm *TabletManager) shardSyncLoop(ctx context.Context, notifyChan <-chan struct{}, doneChan chan<- struct{}) {
+	defer close(doneChan)
 
 	// retryChan is how we wake up after going to sleep between retries.
 	// If no retry is pending, this channel will be nil, which means it's fine
@@ -60,7 +67,7 @@ func (agent *ActionAgent) shardSyncLoop(ctx context.Context) {
 	var retryChan <-chan time.Time
 
 	// shardWatch is how we get notified when the shard record is updated.
-	// We only watch the shard record while we are master.
+	// We only watch the shard record while we are primary.
 	shardWatch := &shardWatcher{}
 	defer shardWatch.stop()
 
@@ -79,10 +86,15 @@ func (agent *ActionAgent) shardSyncLoop(ctx context.Context) {
 			// We don't use the watch event except to know that we should
 			// re-read the shard record, and to know if the watch dies.
 			log.Info("Change in shard record")
-			if event.Err != nil {
-				// The watch failed. Stop it so we start a new one if needed.
-				log.Errorf("Shard watch failed: %v", event.Err)
-				shardWatch.stop()
+
+			if event != nil {
+				if event.Err != nil {
+					// The watch failed. Stop it so we start a new one if needed.
+					log.Errorf("Shard watch failed: %v", event.Err)
+					shardWatch.stop()
+				}
+			} else {
+				log.Infof("Got a nil event from the shard watcher for %s. This should not happen.", tm.tabletAlias)
 			}
 		case <-ctx.Done():
 			// Our context was cancelled. Terminate the loop.
@@ -94,198 +106,208 @@ func (agent *ActionAgent) shardSyncLoop(ctx context.Context) {
 		retryChan = nil
 
 		// Get the latest internal tablet value, representing what we think we are.
-		tablet := agent.Tablet()
+		tablet := tm.Tablet()
 
 		switch tablet.Type {
-		case topodatapb.TabletType_MASTER:
-			// If we think we're master, check if we need to update the shard record.
-			masterAlias, err := syncShardMaster(ctx, agent.TopoServer, tablet, agent.masterTermStartTime())
+		case topodatapb.TabletType_PRIMARY:
+			// This is a failsafe code because we've seen races that can cause
+			// primary term start time to become zero.
+			if tablet.PrimaryTermStartTime == nil {
+				log.Errorf("PrimaryTermStartTime should not be nil: %v", tablet)
+				// Start retry timer and go back to sleep.
+				retryChan = time.After(shardSyncRetryDelay)
+				continue
+			}
+			// If we think we're primary, check if we need to update the shard record.
+			// Fetch the start time from the record we just got, because the tm's tablet can change.
+			primaryAlias, shouldDemote, err := syncShardPrimary(ctx, tm.TopoServer, tablet, protoutil.TimeFromProto(tablet.PrimaryTermStartTime).UTC())
 			if err != nil {
 				log.Errorf("Failed to sync shard record: %v", err)
 				// Start retry timer and go back to sleep.
-				retryChan = time.After(*shardSyncRetryDelay)
+				retryChan = time.After(shardSyncRetryDelay)
 				continue
 			}
-			if !topoproto.TabletAliasEqual(masterAlias, tablet.Alias) {
-				// Another master has taken over while we still think we're master.
-				if err := agent.abortMasterTerm(ctx, masterAlias); err != nil {
-					log.Errorf("Failed to abort master term: %v", err)
+			if shouldDemote {
+				// Someone updated the PrimaryTermStartTime while we still think we're primary.
+				// This means that we should end our term, since someone else must have claimed primaryship
+				// and wrote to the shard record
+				if err := tm.endPrimaryTerm(ctx, primaryAlias); err != nil {
+					log.Errorf("Failed to end primary term: %v", err)
 					// Start retry timer and go back to sleep.
-					retryChan = time.After(*shardSyncRetryDelay)
+					retryChan = time.After(shardSyncRetryDelay)
 					continue
 				}
-				// We're not master anymore, so stop watching the shard record.
+				// We're not primary anymore, so stop watching the shard record.
 				shardWatch.stop()
 				continue
 			}
 
-			// As long as we're master, watch the shard record so we'll be
-			// notified if another master takes over.
+			// As long as we're primary, watch the shard record so we'll be
+			// notified if another primary takes over.
 			if shardWatch.active() {
 				// We already have an active watch. Nothing to do.
 				continue
 			}
-			if err := shardWatch.start(ctx, agent.TopoServer, tablet.Keyspace, tablet.Shard); err != nil {
+			if err := shardWatch.start(tm.TopoServer, tablet.Keyspace, tablet.Shard); err != nil {
 				log.Errorf("Failed to start shard watch: %v", err)
 				// Start retry timer and go back to sleep.
-				retryChan = time.After(*shardSyncRetryDelay)
+				retryChan = time.After(shardSyncRetryDelay)
 				continue
 			}
 		default:
-			// If we're not master, stop watching the shard record,
-			// so only masters contribute to global topo watch load.
+			// If we're not primary, stop watching the shard record,
+			// so only primaries contribute to global topo watch load.
 			shardWatch.stop()
 		}
 	}
 }
 
-// syncShardMaster is called when we think we're master.
+// syncShardPrimary is called when we think we're primary.
 // It checks that the shard record agrees, and updates it if possible.
 //
-// If the returned error is nil, the returned masterAlias indicates the current
-// master tablet according to the shard record.
+// If the returned error is nil, the returned primaryAlias indicates the current
+// primary tablet according to the shard record.
 //
-// If the shard record indicates a new master has taken over, this returns
-// success (we successfully synchronized), but the returned masterAlias will be
+// If the shard record indicates a new primary has taken over, this returns
+// success (we successfully synchronized), but the returned primaryAlias will be
 // different from the input tablet.Alias.
-func syncShardMaster(ctx context.Context, ts *topo.Server, tablet *topodatapb.Tablet, masterTermStartTime time.Time) (masterAlias *topodatapb.TabletAlias, err error) {
-	ctx, cancel := context.WithTimeout(ctx, *topo.RemoteOperationTimeout)
+func syncShardPrimary(ctx context.Context, ts *topo.Server, tablet *topodatapb.Tablet, PrimaryTermStartTime time.Time) (primaryAlias *topodatapb.TabletAlias, shouldDemote bool, err error) {
+	ctx, cancel := context.WithTimeout(ctx, topo.RemoteOperationTimeout)
 	defer cancel()
 
 	var shardInfo *topo.ShardInfo
+	shouldDemote = false
 	_, err = ts.UpdateShardFields(ctx, tablet.Keyspace, tablet.Shard, func(si *topo.ShardInfo) error {
-		lastTerm := si.GetMasterTermStartTime()
+		lastTerm := si.GetPrimaryTermStartTime()
 
 		// Save the ShardInfo so we can check it afterward.
 		// We can't use the return value of UpdateShardFields because it might be nil.
 		shardInfo = si
 
+		if PrimaryTermStartTime.Before(lastTerm) {
+			// In this case, we have outdated information, we will demote ourself
+			shouldDemote = true
+		}
+
 		// Only attempt an update if our term is more recent.
-		if !masterTermStartTime.After(lastTerm) {
+		if !PrimaryTermStartTime.After(lastTerm) {
 			return topo.NewError(topo.NoUpdateNeeded, si.ShardName())
 		}
 
 		aliasStr := topoproto.TabletAliasString(tablet.Alias)
-		log.Infof("Updating shard record: master_alias=%v, master_term_start_time=%v", aliasStr, masterTermStartTime)
-		si.MasterAlias = tablet.Alias
-		si.MasterTermStartTime = logutil.TimeToProto(masterTermStartTime)
+		log.Infof("Updating shard record: primary_alias=%v, primary_term_start_time=%v", aliasStr, PrimaryTermStartTime)
+		si.PrimaryAlias = tablet.Alias
+		si.PrimaryTermStartTime = protoutil.TimeToProto(PrimaryTermStartTime)
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, shouldDemote, err
 	}
 
-	return shardInfo.MasterAlias, nil
+	return shardInfo.PrimaryAlias, shouldDemote, nil
 }
 
-// abortMasterTerm is called when we unexpectedly lost mastership.
+// endPrimaryTerm is called when we unexpectedly lost primaryship.
 //
 // Under normal circumstances, we should be gracefully demoted before a new
-// master appears. This function is only reached when that graceful demotion
-// failed or was skipped, so we only found out we're no longer master after the
-// new master started advertising itself.
+// primary appears. This function is only reached when that graceful demotion
+// failed or was skipped, so we only found out we're no longer primary after the
+// new primary started advertising itself.
 //
 // If active reparents are enabled, we demote our own MySQL to a replica and
 // update our tablet type to REPLICA.
 //
 // If active reparents are disabled, we don't touch our MySQL.
 // We just directly update our tablet type to REPLICA.
-func (agent *ActionAgent) abortMasterTerm(ctx context.Context, masterAlias *topodatapb.TabletAlias) error {
-	masterAliasStr := topoproto.TabletAliasString(masterAlias)
-	log.Warningf("Another tablet (%v) has won master election. Stepping down to REPLICA.", masterAliasStr)
+func (tm *TabletManager) endPrimaryTerm(ctx context.Context, primaryAlias *topodatapb.TabletAlias) error {
+	primaryAliasStr := topoproto.TabletAliasString(primaryAlias)
+	log.Warningf("Another tablet (%v) has won primary election. Stepping down to %v.", primaryAliasStr, tm.baseTabletType)
 
-	if *mysqlctl.DisableActiveReparents {
+	if mysqlctl.DisableActiveReparents {
 		// Don't touch anything at the MySQL level. Just update tablet state.
 		log.Infof("Active reparents are disabled; updating tablet state only.")
-		changeTypeCtx, cancel := context.WithTimeout(ctx, *topo.RemoteOperationTimeout)
+		changeTypeCtx, cancel := context.WithTimeout(ctx, topo.RemoteOperationTimeout)
 		defer cancel()
-		if err := agent.ChangeType(changeTypeCtx, topodatapb.TabletType_REPLICA); err != nil {
-			return vterrors.Wrap(err, "failed to change type to REPLICA")
+		if err := tm.tmState.ChangeTabletType(changeTypeCtx, tm.baseTabletType, DBActionNone); err != nil {
+			return vterrors.Wrapf(err, "failed to change type to %v", tm.baseTabletType)
 		}
 		return nil
 	}
 
 	// Do a full demotion to convert MySQL into a replica.
 	// We do not revert on partial failure here because this code path only
-	// triggers after a new master has taken over, so we are past the point of
+	// triggers after a new primary has taken over, so we are past the point of
 	// no return. Instead, we should leave partial results and retry the rest
 	// later.
 	log.Infof("Active reparents are enabled; converting MySQL to replica.")
-	demoteMasterCtx, cancelDemoteMaster := context.WithTimeout(ctx, *topo.RemoteOperationTimeout)
-	defer cancelDemoteMaster()
-	if _, err := agent.demoteMaster(demoteMasterCtx, false /* revertPartialFailure */); err != nil {
-		return vterrors.Wrap(err, "failed to demote master")
+	demotePrimaryCtx, cancelDemotePrimary := context.WithTimeout(ctx, topo.RemoteOperationTimeout)
+	defer cancelDemotePrimary()
+	if _, err := tm.demotePrimary(demotePrimaryCtx, false /* revertPartialFailure */, true /* force */); err != nil {
+		return vterrors.Wrap(err, "failed to demote primary")
 	}
-	setMasterCtx, cancelSetMaster := context.WithTimeout(ctx, *topo.RemoteOperationTimeout)
-	defer cancelSetMaster()
-	log.Infof("Attempting to reparent self to new master %v.", masterAliasStr)
-	if err := agent.SetMaster(setMasterCtx, masterAlias, 0, "", true); err != nil {
-		return vterrors.Wrap(err, "failed to reparent self to new master")
+	setPrimaryCtx, cancelSetPrimary := context.WithTimeout(ctx, topo.RemoteOperationTimeout)
+	defer cancelSetPrimary()
+	log.Infof("Attempting to reparent self to new primary %v.", primaryAliasStr)
+	if primaryAlias == nil {
+		if err := tm.tmState.ChangeTabletType(ctx, topodatapb.TabletType_REPLICA, DBActionNone); err != nil {
+			return err
+		}
+	} else {
+		if err := tm.setReplicationSourceSemiSyncNoAction(setPrimaryCtx, primaryAlias, 0, "", true); err != nil {
+			return vterrors.Wrap(err, "failed to reparent self to new primary")
+		}
 	}
 	return nil
 }
 
-func (agent *ActionAgent) startShardSync() {
+func (tm *TabletManager) startShardSync() {
 	// Use a buffer size of 1 so we can remember we need to check the state
 	// even if the receiver is busy. We can drop any additional send attempts
 	// if the buffer is full because all we care about is that the receiver will
 	// be told it needs to recheck the state.
-	agent.mutex.Lock()
-	agent._shardSyncChan = make(chan struct{}, 1)
+	tm.mutex.Lock()
+	defer tm.mutex.Unlock()
+	tm._shardSyncChan = make(chan struct{}, 1)
+	tm._shardSyncDone = make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
-	agent._shardSyncCancel = cancel
-	agent.mutex.Unlock()
-
-	// Queue up a pending notification to force the loop to run once at startup.
-	agent.notifyShardSync()
+	tm._shardSyncCancel = cancel
 
 	// Start the sync loop in the background.
-	go agent.shardSyncLoop(ctx)
+	go tm.shardSyncLoop(ctx, tm._shardSyncChan, tm._shardSyncDone)
+
+	// Queue up a pending notification to force the loop to run once at startup.
+	go tm.notifyShardSync()
 }
 
-func (agent *ActionAgent) stopShardSync() {
-	agent.mutex.Lock()
-	if agent._shardSyncCancel != nil {
-		agent._shardSyncCancel()
-		agent._shardSyncCancel = nil
-		agent._shardSyncChan = nil
+func (tm *TabletManager) stopShardSync() {
+	var doneChan <-chan struct{}
+
+	tm.mutex.Lock()
+	if tm._shardSyncCancel != nil {
+		tm._shardSyncCancel()
 	}
-	agent.mutex.Unlock()
+	doneChan = tm._shardSyncDone
+	tm.mutex.Unlock()
+
+	// If the shard sync loop was running, wait for it to fully stop.
+	if doneChan != nil {
+		<-doneChan
+	}
 }
 
-func (agent *ActionAgent) notifyShardSync() {
+func (tm *TabletManager) notifyShardSync() {
 	// If this is called before the shard sync is started, do nothing.
-	agent.mutex.Lock()
-	defer agent.mutex.Unlock()
+	tm.mutex.Lock()
+	defer tm.mutex.Unlock()
 
-	if agent._shardSyncChan == nil {
+	if tm._shardSyncChan == nil {
 		return
 	}
 
 	// Try to send. If the channel buffer is full, it means a notification is
 	// already pending, so we don't need to do anything.
 	select {
-	case agent._shardSyncChan <- struct{}{}:
+	case tm._shardSyncChan <- struct{}{}:
 	default:
 	}
-}
-
-// setMasterTermStartTime remembers the time when our term as master began.
-//
-// If another tablet claims to be master and offers a more recent time,
-// that tablet will be trusted over us.
-func (agent *ActionAgent) setMasterTermStartTime(t time.Time) {
-	agent.mutex.Lock()
-	agent._masterTermStartTime = t
-	agent._replicationDelay = 0
-	agent.mutex.Unlock()
-
-	// Notify the shard sync loop that the tablet state changed.
-	agent.notifyShardSync()
-}
-
-func (agent *ActionAgent) masterTermStartTime() time.Time {
-	agent.mutex.Lock()
-	defer agent.mutex.Unlock()
-	return agent._masterTermStartTime
 }

@@ -28,8 +28,8 @@ type replicationLagRecord struct {
 	// time is the time at which "value" was observed.
 	time time.Time
 
-	// TabletStats holds a copy of the current health data of the tablet.
-	discovery.TabletStats
+	// LegacyTabletStats holds a copy of the current health data of the tablet.
+	discovery.TabletHealth
 }
 
 func (r replicationLagRecord) isZero() bool {
@@ -37,5 +37,5 @@ func (r replicationLagRecord) isZero() bool {
 }
 
 func (r replicationLagRecord) lag() int64 {
-	return int64(r.Stats.SecondsBehindMaster)
+	return int64(r.Stats.ReplicationLagSeconds)
 }

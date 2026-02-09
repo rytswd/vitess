@@ -17,14 +17,15 @@ limitations under the License.
 package topo
 
 import (
-	"fmt"
+	"context"
 	"path"
+	"strings"
 
-	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
+	"vitess.io/vitess/go/sets"
 	"vitess.io/vitess/go/vt/vterrors"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 )
 
 // This file provides the utility methods to save / retrieve CellInfo
@@ -45,6 +46,9 @@ func pathForCellInfo(cell string) string {
 // GetCellInfoNames returns the names of the existing cells. They are
 // sorted by name.
 func (ts *Server) GetCellInfoNames(ctx context.Context) ([]string, error) {
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
 	entries, err := ts.globalCell.ListDir(ctx, CellsPath, false /*full*/)
 	switch {
 	case IsErrType(err, NoNode):
@@ -58,6 +62,9 @@ func (ts *Server) GetCellInfoNames(ctx context.Context) ([]string, error) {
 
 // GetCellInfo reads a CellInfo from the global Conn.
 func (ts *Server) GetCellInfo(ctx context.Context, cell string, strongRead bool) (*topodatapb.CellInfo, error) {
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
 	conn := ts.globalCell
 	if !strongRead {
 		conn = ts.globalReadOnlyCell
@@ -71,7 +78,7 @@ func (ts *Server) GetCellInfo(ctx context.Context, cell string, strongRead bool)
 
 	// Unpack the contents.
 	ci := &topodatapb.CellInfo{}
-	if err := proto.Unmarshal(contents, ci); err != nil {
+	if err := ci.UnmarshalVT(contents); err != nil {
 		return nil, err
 	}
 	return ci, nil
@@ -79,8 +86,11 @@ func (ts *Server) GetCellInfo(ctx context.Context, cell string, strongRead bool)
 
 // CreateCellInfo creates a new CellInfo with the provided content.
 func (ts *Server) CreateCellInfo(ctx context.Context, cell string, ci *topodatapb.CellInfo) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	// Pack the content.
-	contents, err := proto.Marshal(ci)
+	contents, err := ci.MarshalVT()
 	if err != nil {
 		return err
 	}
@@ -99,13 +109,17 @@ func (ts *Server) CreateCellInfo(ctx context.Context, cell string, ci *topodatap
 func (ts *Server) UpdateCellInfoFields(ctx context.Context, cell string, update func(*topodatapb.CellInfo) error) error {
 	filePath := pathForCellInfo(cell)
 	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
 		ci := &topodatapb.CellInfo{}
 
 		// Read the file, unpack the contents.
 		contents, version, err := ts.globalCell.Get(ctx, filePath)
 		switch {
 		case err == nil:
-			if err := proto.Unmarshal(contents, ci); err != nil {
+			if err := ci.UnmarshalVT(contents); err != nil {
 				return err
 			}
 		case IsErrType(err, NoNode):
@@ -123,7 +137,7 @@ func (ts *Server) UpdateCellInfoFields(ctx context.Context, cell string, update 
 		}
 
 		// Pack and save.
-		contents, err = proto.Marshal(ci)
+		contents, err = ci.MarshalVT()
 		if err != nil {
 			return err
 		}
@@ -135,18 +149,39 @@ func (ts *Server) UpdateCellInfoFields(ctx context.Context, cell string, update 
 }
 
 // DeleteCellInfo deletes the specified CellInfo.
-// We first make sure no Shard record points to the cell.
-func (ts *Server) DeleteCellInfo(ctx context.Context, cell string) error {
+// We first try to make sure no Shard record points to the cell,
+// but we'll continue regardless if 'force' is true.
+func (ts *Server) DeleteCellInfo(ctx context.Context, cell string, force bool) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	srvKeyspaces, err := ts.GetSrvKeyspaceNames(ctx, cell)
 	switch {
 	case err == nil:
-		if len(srvKeyspaces) != 0 {
-			return vterrors.Wrap(err, fmt.Sprintf("cell %v has serving keyspaces. Before deleting, delete keyspace with: DeleteKeyspace", cell))
+		if len(srvKeyspaces) != 0 && !force {
+			return vterrors.Errorf(vtrpcpb.Code_FAILED_PRECONDITION, "cell %v has serving keyspaces. Before deleting, delete keyspace with DeleteKeyspace, or use -force to continue anyway.", cell)
 		}
 	case IsErrType(err, NoNode):
 		// Nothing to do.
 	default:
-		return vterrors.Wrap(err, "GetSrvKeyspaceNames() failed")
+		if !force {
+			return vterrors.Wrap(err, "can't list SrvKeyspace entries in the cell; use -force flag to continue anyway (e.g. if cell-local topo was already permanently shut down)")
+		}
+
+		select {
+		case <-ctx.Done():
+			// If our context has expired and we got an error back from
+			// GetSrvKeyspaceNames, we assume that call failed because the
+			// local cell topo was down. If force=true, then we make a new
+			// background context to cleanup from the global topo. Otherwise a
+			// local-down-topo scenario would mean we never can delete it.
+			// (see https://github.com/vitessio/vitess/issues/8220).
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(context.Background(), RemoteOperationTimeout)
+			defer cancel()
+		default:
+			// Context still has some time left, no need to make a new one.
+		}
 	}
 
 	filePath := pathForCellInfo(cell)
@@ -158,6 +193,10 @@ func (ts *Server) DeleteCellInfo(ctx context.Context, cell string) error {
 // TODO(alainjobart) once the cell map is migrated to this generic
 // package, we can do better than this.
 func (ts *Server) GetKnownCells(ctx context.Context) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	// Note we use the global read-only cell here, as the result
 	// is not time sensitive.
 	entries, err := ts.globalReadOnlyCell.ListDir(ctx, CellsPath, false /*full*/)
@@ -165,4 +204,57 @@ func (ts *Server) GetKnownCells(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 	return DirEntriesToStringArray(entries), nil
+}
+
+// ExpandCells takes a comma-separated list of cells and returns an array of cell names
+// Aliases are expanded and an empty string returns all cells
+func (ts *Server) ExpandCells(ctx context.Context, cells string) ([]string, error) {
+	var (
+		err         error
+		inputCells  []string
+		outputCells = sets.New[string]() // Use a set to dedupe if the input cells list includes an alias and a cell in that alias.
+	)
+
+	if cells == "" {
+		inputCells, err = ts.GetCellInfoNames(ctx)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		inputCells = strings.Split(cells, ",")
+	}
+
+	expandCell := func(ctx context.Context, cell string) error {
+		shortCtx, cancel := context.WithTimeout(ctx, RemoteOperationTimeout)
+		defer cancel()
+
+		_, err := ts.GetCellInfo(shortCtx, cell, false /* strongRead */)
+		if err != nil {
+			// Not a valid cell name. Check whether it is an alias.
+			shortCtx, cancel := context.WithTimeout(ctx, RemoteOperationTimeout)
+			defer cancel()
+
+			alias, err2 := ts.GetCellsAlias(shortCtx, cell, false /* strongRead */)
+			if err2 != nil {
+				return err // return the original err to indicate the cell does not exist
+			}
+
+			// Expand the alias cells list into the final set.
+			outputCells.Insert(alias.Cells...)
+			return nil
+		}
+
+		// Valid cell.
+		outputCells.Insert(cell)
+		return nil
+	}
+
+	for _, cell := range inputCells {
+		cell2 := strings.TrimSpace(cell)
+		if err := expandCell(ctx, cell2); err != nil {
+			return nil, err
+		}
+	}
+
+	return sets.List(outputCells), nil
 }

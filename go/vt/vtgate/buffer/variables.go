@@ -105,12 +105,18 @@ var (
 // stopReason is used in "stopsByReason" as "Reason" label.
 type stopReason string
 
-var stopReasons = []stopReason{stopFailoverEndDetected, stopMaxFailoverDurationExceeded, stopShutdown}
+var stopReasons = []stopReason{stopShardMissing, stopFailoverEndDetected, stopMaxFailoverDurationExceeded, stopShutdown}
 
 const (
-	stopFailoverEndDetected         stopReason = "NewMasterSeen"
+	stopShardMissing                stopReason = "ReshardingComplete"
+	stopFailoverEndDetected         stopReason = "NewPrimarySeen"
 	stopMaxFailoverDurationExceeded stopReason = "MaxDurationExceeded"
 	stopShutdown                    stopReason = "Shutdown"
+	stopMoveTablesSwitchingTraffic  stopReason = "MoveTablesSwitchedTraffic"
+
+	stopMoveTablesSwitchingTrafficMessage = "MoveTables has switched writes"
+	stopFailoverEndDetectedMessage        = "a primary promotion has been detected"
+	stopShardMissingMessage               = "the keyspace has been resharded"
 )
 
 // evictedReason is used in "requestsEvicted" as "Reason" label.
@@ -120,7 +126,7 @@ var evictReasons = []evictedReason{evictedContextDone, evictedBufferFull, evicte
 
 const (
 	evictedContextDone evictedReason = "ContextDone"
-	//lint: ignore SA9004 ok not to use explicit type here because implicit type string is correct
+	// lint: ignore SA9004 ok not to use explicit type here because implicit type string is correct
 	evictedBufferFull     = "BufferFull"
 	evictedWindowExceeded = "WindowExceeded"
 )
@@ -176,9 +182,9 @@ func initVariablesForShard(statsKey []string) {
 // TODO(mberlin): Remove the gauge values below once we store them
 // internally and have a /bufferz page where we can show this.
 var (
-	// bufferSize publishes the configured per vtgate buffer size. It can be used
+	// bufferSizeStat publishes the configured per vtgate buffer size. It can be used
 	// to calculate the utilization of the buffer.
-	bufferSize             = stats.NewGauge("BufferSize", "The configured per vtgate buffer size")
+	bufferSizeStat         = stats.NewGauge("BufferSize", "The configured per vtgate buffer size")
 	lastFailoverDurationMs = stats.NewGaugesWithMultiLabels(
 		"BufferLastFailoverDurationMs",
 		"Buffered requests during the last failover. The value for a given shard will be reset at the next failover.",

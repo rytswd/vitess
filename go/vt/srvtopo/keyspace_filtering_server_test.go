@@ -17,12 +17,11 @@ limitations under the License.
 package srvtopo
 
 import (
-	"fmt"
+	"context"
+	"errors"
 	"reflect"
 	"sync"
 	"testing"
-
-	"golang.org/x/net/context"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
@@ -36,9 +35,9 @@ var (
 	stockCtx       = context.Background()
 	stockFilters   = []string{"bar", "baz"}
 	stockKeyspaces = map[string]*topodatapb.SrvKeyspace{
-		"foo": {ShardingColumnName: "foo"},
-		"bar": {ShardingColumnName: "bar"},
-		"baz": {ShardingColumnName: "baz"},
+		"foo": {},
+		"bar": {},
+		"baz": {},
 	}
 	stockVSchema = &vschemapb.SrvVSchema{
 		Keyspaces: map[string]*vschemapb.Keyspace{
@@ -49,12 +48,12 @@ var (
 	}
 )
 
-func newFiltering(filter []string) (*topo.Server, *srvtopotest.PassthroughSrvTopoServer, Server) {
+func newFiltering(ctx context.Context, filter []string) (*topo.Server, *srvtopotest.PassthroughSrvTopoServer, Server) {
 	testServer := srvtopotest.NewPassthroughSrvTopoServer()
 
-	testServer.TopoServer = memorytopo.NewServer(stockCell)
+	testServer.TopoServer = memorytopo.NewServer(ctx, stockCell)
 	testServer.SrvKeyspaceNames = []string{"foo", "bar", "baz"}
-	testServer.SrvKeyspace = &topodatapb.SrvKeyspace{ShardingColumnName: "test-column"}
+	testServer.SrvKeyspace = &topodatapb.SrvKeyspace{}
 	testServer.WatchedSrvVSchema = stockVSchema
 
 	filtering, _ := NewKeyspaceFilteringServer(testServer, filter)
@@ -72,13 +71,20 @@ func TestFilteringServerHandlesNilUnderlying(t *testing.T) {
 }
 
 func TestFilteringServerReturnsUnderlyingServer(t *testing.T) {
-	_, _, f := newFiltering(nil)
+	ctx := t.Context()
+	_, _, f := newFiltering(ctx, nil)
 	got, gotErr := f.GetTopoServer()
-	if got != nil {
-		t.Errorf("Got non-nil topo.Server from FilteringServer")
+	if gotErr != nil {
+		t.Errorf("Got error getting topo.Server from FilteringServer")
 	}
-	if gotErr != ErrTopoServerNotAvailable {
-		t.Errorf("Unexpected error from GetTopoServer; wanted %v but got %v", ErrTopoServerNotAvailable, gotErr)
+
+	readOnly, err := got.IsReadOnly()
+	if err != nil || !readOnly {
+		t.Errorf("Got read-write topo.Server from FilteringServer -- must be read-only")
+	}
+	gotErr = got.CreateCellsAlias(stockCtx, "should_fail", &topodatapb.CellsAlias{Cells: []string{stockCell}})
+	if gotErr == nil {
+		t.Errorf("Were able to perform a write against the topo.Server from a FilteringServer -- it must be read-only")
 	}
 }
 
@@ -89,7 +95,7 @@ func doTestGetSrvKeyspaceNames(
 	want []string,
 	wantErr error,
 ) {
-	got, gotErr := f.GetSrvKeyspaceNames(stockCtx, cell)
+	got, gotErr := f.GetSrvKeyspaceNames(stockCtx, cell, false)
 
 	if got == nil {
 		t.Errorf("GetSrvKeyspaceNames failed: should not return nil")
@@ -103,18 +109,21 @@ func doTestGetSrvKeyspaceNames(
 }
 
 func TestFilteringServerGetSrvKeyspameNamesFiltersEverythingOut(t *testing.T) {
-	_, _, f := newFiltering(nil)
+	ctx := t.Context()
+	_, _, f := newFiltering(ctx, nil)
 	doTestGetSrvKeyspaceNames(t, f, stockCell, []string{}, nil)
 }
 
 func TestFilteringServerGetSrvKeyspaceNamesFiltersKeyspaces(t *testing.T) {
-	_, _, f := newFiltering(stockFilters)
+	ctx := t.Context()
+	_, _, f := newFiltering(ctx, stockFilters)
 	doTestGetSrvKeyspaceNames(t, f, stockCell, stockFilters, nil)
 }
 
 func TestFilteringServerGetSrvKeyspaceNamesPassesThroughErrors(t *testing.T) {
-	_, mock, f := newFiltering(stockFilters)
-	wantErr := fmt.Errorf("some badcell error")
+	ctx := t.Context()
+	_, mock, f := newFiltering(ctx, stockFilters)
+	wantErr := errors.New("some badcell error")
 	mock.SrvKeyspaceNamesError = wantErr
 	doTestGetSrvKeyspaceNames(t, f, "badcell", stockFilters, wantErr)
 }
@@ -127,22 +136,7 @@ func doTestGetSrvKeyspace(
 	want *topodatapb.SrvKeyspace,
 	wantErr error,
 ) {
-	got, gotErr := f.GetSrvKeyspace(stockCtx, cell, ksName)
-
-	gotColumnName := ""
-	wantColumnName := ""
-	if got != nil {
-		gotColumnName = got.ShardingColumnName
-	}
-	if want != nil {
-		wantColumnName = want.ShardingColumnName
-	}
-
-	// a different pointer comes back so compare the expected return by proxy
-	// of a field we know the value of
-	if gotColumnName != wantColumnName {
-		t.Errorf("keyspace incorrect: got %v, want %v", got, want)
-	}
+	_, gotErr := f.GetSrvKeyspace(stockCtx, cell, ksName)
 
 	if wantErr != gotErr {
 		t.Errorf("returned error incorrect: got %v, want %v", gotErr, wantErr)
@@ -150,28 +144,32 @@ func doTestGetSrvKeyspace(
 }
 
 func TestFilteringServerGetSrvKeyspaceReturnsSelectedKeyspaces(t *testing.T) {
-	_, mock, f := newFiltering(stockFilters)
+	ctx := t.Context()
+	_, mock, f := newFiltering(ctx, stockFilters)
 	mock.SrvKeyspace = stockKeyspaces["bar"]
 	doTestGetSrvKeyspace(t, f, stockCell, "bar", stockKeyspaces["bar"], nil)
 }
 
 func TestFilteringServerGetSrvKeyspaceErrorPassthrough(t *testing.T) {
-	wantErr := fmt.Errorf("some error")
-	_, mock, f := newFiltering(stockFilters)
+	ctx := t.Context()
+	wantErr := errors.New("some error")
+	_, mock, f := newFiltering(ctx, stockFilters)
 	mock.SrvKeyspace = stockKeyspaces["bar"]
 	mock.SrvKeyspaceError = wantErr
 	doTestGetSrvKeyspace(t, f, "badcell", "bar", stockKeyspaces["bar"], wantErr)
 }
 
 func TestFilteringServerGetSrvKeyspaceFilters(t *testing.T) {
+	ctx := t.Context()
 	wantErr := topo.NewError(topo.NoNode, "foo")
-	_, mock, f := newFiltering(stockFilters)
+	_, mock, f := newFiltering(ctx, stockFilters)
 	mock.SrvKeyspaceError = wantErr
 	doTestGetSrvKeyspace(t, f, stockCell, "foo", nil, wantErr)
 }
 
 func TestFilteringServerWatchSrvVSchemaFiltersPassthroughSrvVSchema(t *testing.T) {
-	_, mock, f := newFiltering(stockFilters)
+	ctx := t.Context()
+	_, mock, f := newFiltering(ctx, stockFilters)
 
 	allowed := map[string]bool{}
 	for _, ks := range stockFilters {
@@ -182,7 +180,7 @@ func TestFilteringServerWatchSrvVSchemaFiltersPassthroughSrvVSchema(t *testing.T
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 
-	cb := func(gotSchema *vschemapb.SrvVSchema, gotErr error) {
+	cb := func(gotSchema *vschemapb.SrvVSchema, gotErr error) bool {
 		// ensure that only selected keyspaces made it into the callback
 		for name, ks := range gotSchema.Keyspaces {
 			if !allowed[name] {
@@ -198,6 +196,7 @@ func TestFilteringServerWatchSrvVSchemaFiltersPassthroughSrvVSchema(t *testing.T
 			}
 		}
 		wg.Done()
+		return true
 	}
 
 	f.WatchSrvVSchema(stockCtx, stockCell, cb)
@@ -205,8 +204,10 @@ func TestFilteringServerWatchSrvVSchemaFiltersPassthroughSrvVSchema(t *testing.T
 }
 
 func TestFilteringServerWatchSrvVSchemaHandlesNilSchema(t *testing.T) {
-	wantErr := fmt.Errorf("some err")
-	_, mock, f := newFiltering(stockFilters)
+	ctx := t.Context()
+
+	wantErr := errors.New("some err")
+	_, mock, f := newFiltering(ctx, stockFilters)
 	mock.WatchedSrvVSchema = nil
 	mock.WatchedSrvVSchemaError = wantErr
 
@@ -214,7 +215,7 @@ func TestFilteringServerWatchSrvVSchemaHandlesNilSchema(t *testing.T) {
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 
-	cb := func(gotSchema *vschemapb.SrvVSchema, gotErr error) {
+	cb := func(gotSchema *vschemapb.SrvVSchema, gotErr error) bool {
 		if gotSchema != nil {
 			t.Errorf("Expected nil gotSchema: got %#v", gotSchema)
 		}
@@ -222,6 +223,7 @@ func TestFilteringServerWatchSrvVSchemaHandlesNilSchema(t *testing.T) {
 			t.Errorf("Unexpected error: want %v got %v", wantErr, gotErr)
 		}
 		wg.Done()
+		return true
 	}
 
 	f.WatchSrvVSchema(stockCtx, "other-cell", cb)

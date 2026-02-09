@@ -16,11 +16,7 @@ limitations under the License.
 
 package etcd2topo
 
-import (
-	"fmt"
-
-	"vitess.io/vitess/go/vt/topo"
-)
+import "strconv"
 
 // EtcdVersion is etcd's idea of a version.
 // It implements topo.Version.
@@ -29,15 +25,5 @@ type EtcdVersion int64
 
 // String is part of the topo.Version interface.
 func (v EtcdVersion) String() string {
-	return fmt.Sprintf("%v", int64(v))
-}
-
-// VersionFromInt is used by old-style functions to create a proper
-// Version: if version is -1, returns nil. Otherwise returns the
-// EtcdVersion object.
-func VersionFromInt(version int64) topo.Version {
-	if version == -1 {
-		return nil
-	}
-	return EtcdVersion(version)
+	return strconv.FormatInt(int64(v), 10)
 }

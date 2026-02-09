@@ -17,16 +17,29 @@ limitations under the License.
 package vttest
 
 import (
-	"fmt"
-	"io/ioutil"
-	"math/rand"
+	"errors"
+	"math/rand/v2"
+	"net"
 	"os"
 	"path"
+	"slices"
+	"strconv"
 	"strings"
-	"time"
+	"sync"
+
+	"vitess.io/vitess/go/vt/proto/vttest"
+	"vitess.io/vitess/go/vt/vterrors"
 
 	// we use gRPC everywhere, so import the vtgate client.
 	_ "vitess.io/vitess/go/vt/vtgate/grpcvtgateconn"
+)
+
+var (
+	// randomPortsMu provides synchronization for randomPorts().
+	randomPortsMu sync.Mutex
+
+	// usedRandomPorts stores ports that have been used by remotePort().
+	usedRandomPorts []int
 )
 
 // Environment is the interface that customizes the global settings for
@@ -45,6 +58,12 @@ type Environment interface {
 	// and destructing the MySQL instance(s) that will be used by the cluster.
 	// See: vttest.MySQLManager for the interface the manager must implement
 	MySQLManager(mycnf []string, snapshot string) (MySQLManager, error)
+
+	// TopoManager is the constructor for the Topology manager that will
+	// be used by the cluster. It's only used when we run the local cluster with
+	// a remote topo server instead of in-memory topo server within vtcombo process
+	// See: vttest.TopoManager for the interface of topo manager
+	TopoManager(topoImplementation, topoServerAddress, topoRoot string, topology *vttest.VTTestTopology) TopoManager
 
 	// Directory is the path where the local cluster will store all its
 	// data and metadata. For local testing, this should probably be an
@@ -93,36 +112,24 @@ type LocalTestEnv struct {
 	BasePort     int
 	TmpPath      string
 	DefaultMyCnf []string
+	InitDBFile   string
 	Env          []string
 }
 
-// DefaultMySQLFlavor is the MySQL flavor used by vttest when MYSQL_FLAVOR is not
-// set in the environment
+// DefaultMySQLFlavor is the MySQL flavor used by vttest when no explicit
+// flavor is given.
 const DefaultMySQLFlavor = "MySQL56"
 
-// GetMySQLOptions returns the default option set for the given MySQL
-// flavor. If flavor is not set, the value from the `MYSQL_FLAVOR` env
-// variable is used, and if this is not set, DefaultMySQLFlavor will
-// be used.
-// Returns the name of the MySQL flavor being used, the set of MySQL CNF
-// files specific to this flavor, and any errors.
-func GetMySQLOptions(flavor string) (string, []string, error) {
-	if flavor == "" {
-		flavor = os.Getenv("MYSQL_FLAVOR")
-	}
-
-	if flavor == "" {
-		flavor = DefaultMySQLFlavor
-	}
-
+// GetMySQLOptions returns the set of MySQL CNF files and any errors.
+func GetMySQLOptions() ([]string, error) {
 	mycnf := []string{}
-	mycnf = append(mycnf, "config/mycnf/default-fast.cnf")
+	mycnf = append(mycnf, "config/mycnf/test-suite.cnf")
 
 	for i, cnf := range mycnf {
-		mycnf[i] = path.Join(os.Getenv("VTTOP"), cnf)
+		mycnf[i] = path.Join(os.Getenv("VTROOT"), cnf)
 	}
 
-	return flavor, mycnf, nil
+	return mycnf, nil
 }
 
 // EnvVars implements EnvVars for LocalTestEnv
@@ -139,12 +146,23 @@ func (env *LocalTestEnv) BinaryPath(binary string) string {
 func (env *LocalTestEnv) MySQLManager(mycnf []string, snapshot string) (MySQLManager, error) {
 	return &Mysqlctl{
 		Binary:    env.BinaryPath("mysqlctl"),
-		InitFile:  path.Join(os.Getenv("VTTOP"), "config/init_db.sql"),
+		InitFile:  env.InitDBFile,
 		Directory: env.TmpPath,
 		Port:      env.PortForProtocol("mysql", ""),
 		MyCnf:     append(env.DefaultMyCnf, mycnf...),
 		Env:       env.EnvVars(),
+		UID:       1,
 	}, nil
+}
+
+// TopoManager implements TopoManager for LocalTestEnv
+func (env *LocalTestEnv) TopoManager(topoImplementation, topoServerAddress, topoRoot string, topology *vttest.VTTestTopology) TopoManager {
+	return &Topoctl{
+		TopoImplementation:      topoImplementation,
+		TopoGlobalServerAddress: topoServerAddress,
+		TopoGlobalRoot:          topoRoot,
+		Topology:                topology,
+	}
 }
 
 // DefaultProtocol implements DefaultProtocol for LocalTestEnv.
@@ -182,9 +200,10 @@ func (env *LocalTestEnv) ProcessHealthCheck(name string) HealthChecker {
 // VtcomboArguments implements VtcomboArguments for LocalTestEnv.
 func (env *LocalTestEnv) VtcomboArguments() []string {
 	return []string{
-		"-service_map", strings.Join(
-			[]string{"grpc-vtgateservice", "grpc-vtctl"}, ",",
-		)}
+		"--service-map", strings.Join(
+			[]string{"grpc-vtgateservice", "grpc-vtctl", "grpc-vtctld"}, ",",
+		),
+	}
 }
 
 // LogDirectory implements LogDirectory for LocalTestEnv.
@@ -203,13 +222,40 @@ func (env *LocalTestEnv) TearDown() error {
 }
 
 func tmpdir(dataroot string) (dir string, err error) {
-	dir, err = ioutil.TempDir(dataroot, "vttest")
+	dir, err = os.MkdirTemp(dataroot, "vttest")
 	return
 }
 
-func randomPort() int {
-	v := rand.Int31n(20000)
-	return int(v + 10000)
+// randomPort gets a random port that is available for a TCP connection.
+// After we generate a random port, we try to establish tcp connections on it and the next 5 values.
+// If any of them fail, then we try a different port.
+func randomPort() (port int) {
+	randomPortsMu.Lock()
+	defer randomPortsMu.Unlock()
+	for {
+		portBase := int(rand.Int32N(20000) + 10000)
+		portInUse := false
+		portRange := make([]int, 0, 6)
+		for i := range 6 {
+			port = portBase + i
+			if slices.Contains(usedRandomPorts, port) {
+				portInUse = true
+				break
+			}
+			ln, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+			if err != nil {
+				portInUse = true
+				break
+			}
+			portRange = append(portRange, port)
+			ln.Close()
+		}
+		if portInUse {
+			continue
+		}
+		usedRandomPorts = append(usedRandomPorts, portRange...)
+		return port
+	}
 }
 
 // NewLocalTestEnv returns an instance of the default test environment used
@@ -218,8 +264,7 @@ func randomPort() int {
 // up when closing the Environment.
 // - LogDirectory() is the `logs` subdir inside Directory()
 // - The MySQL flavor is set to `flavor`. If the argument is not set, it will
-// default to the value of MYSQL_FLAVOR, and if this variable is not set, to
-// DefaultMySQLFlavor
+// default DefaultMySQLFlavor
 // - PortForProtocol() will return ports based off the given basePort. If basePort
 // is zero, a random port between 10000 and 20000 will be chosen.
 // - DefaultProtocol() is always "grpc"
@@ -228,23 +273,25 @@ func randomPort() int {
 // - MySQLManager() will return a vttest.Mysqlctl instance, configured with the
 // given MySQL flavor. This will use the `mysqlctl` command to initialize and
 // teardown a single mysqld instance.
-func NewLocalTestEnv(flavor string, basePort int) (*LocalTestEnv, error) {
+func NewLocalTestEnv(basePort int) (*LocalTestEnv, error) {
 	directory, err := tmpdir(os.Getenv("VTDATAROOT"))
 	if err != nil {
 		return nil, err
 	}
-	return NewLocalTestEnvWithDirectory(flavor, basePort, directory)
+	return NewLocalTestEnvWithDirectory(basePort, directory)
 }
 
 // NewLocalTestEnvWithDirectory returns a new instance of the default test
 // environment with a directory explicitly specified.
-func NewLocalTestEnvWithDirectory(flavor string, basePort int, directory string) (*LocalTestEnv, error) {
-	err := os.Mkdir(path.Join(directory, "logs"), 0700)
-	if err != nil {
-		return nil, err
+func NewLocalTestEnvWithDirectory(basePort int, directory string) (*LocalTestEnv, error) {
+	if _, err := os.Stat(path.Join(directory, "logs")); os.IsNotExist(err) {
+		err := os.Mkdir(path.Join(directory, "logs"), 0o700)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	flavor, mycnf, err := GetMySQLOptions(flavor)
+	mycnf, err := GetMySQLOptions()
 	if err != nil {
 		return nil, err
 	}
@@ -257,19 +304,16 @@ func NewLocalTestEnvWithDirectory(flavor string, basePort int, directory string)
 		BasePort:     basePort,
 		TmpPath:      directory,
 		DefaultMyCnf: mycnf,
+		InitDBFile:   path.Join(os.Getenv("VTROOT"), "config/init_db.sql"),
 		Env: []string{
-			fmt.Sprintf("VTDATAROOT=%s", directory),
-			fmt.Sprintf("MYSQL_FLAVOR=%s", flavor),
+			"VTDATAROOT=" + directory,
+			"VTTEST=endtoend",
 		},
 	}, nil
 }
 
 func defaultEnvFactory() (Environment, error) {
-	return NewLocalTestEnv("", 0)
-}
-
-func init() {
-	rand.Seed(time.Now().UnixNano())
+	return NewLocalTestEnv(0)
 }
 
 // NewDefaultEnv is an user-configurable callback that returns a new Environment
@@ -277,3 +321,32 @@ func init() {
 // This callback is only used in cases where the user hasn't explicitly set
 // the Env variable when initializing a LocalCluster
 var NewDefaultEnv = defaultEnvFactory
+
+// WriteInitDBFile is a helper function that writes a modified init_db.sql file with custom SQL statements.
+func WriteInitDBFile(initFile, customSQL, newInitFile string) error {
+	initDb, _ := os.ReadFile(initFile)
+	sql, err := getInitDBSQL(string(initDb), customSQL)
+	if err != nil {
+		return vterrors.Wrap(err, "failed to get a modified init db sql")
+	}
+	err = os.WriteFile(newInitFile, []byte(sql), 0o600)
+	if err != nil {
+		return vterrors.Wrap(err, "failed to write a modified init db file")
+	}
+	return nil
+}
+
+// getInitDBSQL is a helper function that retrieves the modified contents of the init_db.sql file with custom SQL statements.
+// We avoid using vitess.io/vitess/go/test/endtoend/utils.GetInitDBSQL as importing this package adds unnecessary flags to vttestserver.
+func getInitDBSQL(initDBSQL string, customSQL string) (string, error) {
+	splitString := strings.Split(initDBSQL, "# {{custom_sql}}")
+	if len(splitString) != 2 {
+		return "", errors.New("missing `# {{custom_sql}}` in init_db.sql file")
+	}
+	var builder strings.Builder
+	builder.WriteString(splitString[0])
+	builder.WriteString(customSQL)
+	builder.WriteString(splitString[1])
+
+	return builder.String(), nil
+}

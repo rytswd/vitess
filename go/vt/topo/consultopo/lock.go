@@ -17,10 +17,12 @@ limitations under the License.
 package consultopo
 
 import (
+	"context"
 	"path"
+	"time"
 
 	"github.com/hashicorp/consul/api"
-	"golang.org/x/net/context"
+
 	"vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/vterrors"
 
@@ -47,13 +49,82 @@ func (s *Server) Lock(ctx context.Context, dirPath, contents string) (topo.LockD
 		return nil, convertError(err, dirPath)
 	}
 
+	return s.lock(ctx, dirPath, contents, s.lockTTL)
+}
+
+// LockWithTTL is part of the topo.Conn interface.
+func (s *Server) LockWithTTL(ctx context.Context, dirPath, contents string, ttl time.Duration) (topo.LockDescriptor, error) {
+	// We list the directory first to make sure it exists.
+	if _, err := s.ListDir(ctx, dirPath, false /*full*/); err != nil {
+		// We need to return the right error codes, like
+		// topo.ErrNoNode and topo.ErrInterrupted, and the
+		// easiest way to do this is to return convertError(err).
+		// It may lose some of the context, if this is an issue,
+		// maybe logging the error would work here.
+		return nil, convertError(err, dirPath)
+	}
+
+	return s.lock(ctx, dirPath, contents, ttl.String())
+}
+
+// LockName is part of the topo.Conn interface.
+func (s *Server) LockName(ctx context.Context, dirPath, contents string) (topo.LockDescriptor, error) {
+	return s.lock(ctx, dirPath, contents, topo.NamedLockTTL.String())
+}
+
+// TryLock is part of the topo.Conn interface.
+func (s *Server) TryLock(ctx context.Context, dirPath, contents string) (topo.LockDescriptor, error) {
+	// We list all the entries under dirPath
+	entries, err := s.ListDir(ctx, dirPath, true)
+	if err != nil {
+		// We need to return the right error codes, like
+		// topo.ErrNoNode and topo.ErrInterrupted, and the
+		// easiest way to do this is to return convertError(err).
+		// It may lose some of the context, if this is an issue,
+		// maybe logging the error would work here.
+		return nil, convertError(err, dirPath)
+	}
+
+	// If there is a file 'lock' in it then we can assume that someone else already has a lock.
+	// Throw error in this case
+	for _, e := range entries {
+		if e.Name == locksFilename && e.Type == topo.TypeFile && e.Ephemeral {
+			return nil, topo.NewError(topo.NodeExists, "lock already exists at path "+dirPath)
+		}
+	}
+
+	// everything is good let's acquire the lock.
+	return s.lock(ctx, dirPath, contents, s.lockTTL)
+}
+
+// Lock is part of the topo.Conn interface.
+func (s *Server) lock(ctx context.Context, dirPath, contents, ttl string) (topo.LockDescriptor, error) {
 	lockPath := path.Join(s.root, dirPath, locksFilename)
 
-	// Build the lock structure.
-	l, err := s.client.LockOpts(&api.LockOptions{
+	lockOpts := &api.LockOptions{
 		Key:   lockPath,
 		Value: []byte(contents),
-	})
+		SessionOpts: &api.SessionEntry{
+			Name: api.DefaultLockSessionName,
+			TTL:  api.DefaultLockSessionTTL,
+		},
+	}
+	lockOpts.SessionOpts.Checks = s.lockChecks
+	if s.lockTTL != "" {
+		// Override the API default with the global default from
+		// --topo-consul-lock-session-ttl.
+		lockOpts.SessionOpts.TTL = s.lockTTL
+	}
+	if ttl != "" {
+		// Override the global default with the one provided by the
+		// caller.
+		lockOpts.SessionOpts.TTL = ttl
+	}
+	if s.lockDelay > 0 {
+		lockOpts.SessionOpts.LockDelay = s.lockDelay
+	}
+	// Build the lock structure.
+	l, err := s.client.LockOpts(lockOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -84,14 +155,18 @@ func (s *Server) Lock(ctx context.Context, dirPath, contents string) (topo.LockD
 
 	// We are the only ones trying to lock now.
 	lost, err := l.Lock(ctx.Done())
-	if err != nil {
+	if err != nil || lost == nil {
 		// Failed to lock, give up our slot in locks map.
 		// Close the channel to unblock anyone else.
 		s.mu.Lock()
 		delete(s.locks, lockPath)
 		s.mu.Unlock()
 		close(li.done)
-
+		// Consul will return empty leaderCh with nil error if we cannot get lock before the timeout
+		// therefore we return a timeout error here
+		if lost == nil {
+			return nil, topo.NewError(topo.Timeout, lockPath)
+		}
 		return nil, err
 	}
 

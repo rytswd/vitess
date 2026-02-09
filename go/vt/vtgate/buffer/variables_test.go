@@ -17,24 +17,32 @@ limitations under the License.
 package buffer
 
 import (
-	"flag"
+	"context"
 	"fmt"
 	"strings"
 	"testing"
 
-	"golang.org/x/net/context"
+	"github.com/spf13/pflag"
 
 	"vitess.io/vitess/go/stats"
 )
 
 func TestVariables(t *testing.T) {
-	flag.Set("buffer_size", "23")
-	defer resetFlagsForTesting()
+	fs := pflag.NewFlagSet("vtgate_buffer_variables_test", pflag.ContinueOnError)
+	registerFlags(fs)
+	if err := fs.Parse(nil); err != nil {
+		t.Errorf("failed to parse with default values: %v", err)
+	}
+
+	fs.Set("buffer-size", "23")
+	defer func() {
+		fs.Set("buffer-size", "1")
+	}()
 
 	// Create new buffer which will the flags.
-	New()
+	NewConfigFromFlags()
 
-	if got, want := bufferSize.Get(), int64(23); got != want {
+	if got, want := bufferSizeStat.Get(), int64(23); got != want {
 		t.Fatalf("BufferSize variable not set during initilization: got = %v, want = %v", got, want)
 	}
 }
@@ -42,8 +50,8 @@ func TestVariables(t *testing.T) {
 func TestVariablesAreInitialized(t *testing.T) {
 	// Create a new buffer and make a call which will create the shardBuffer object.
 	// After that, the variables should be initialized for that shard.
-	b := New()
-	_, err := b.WaitForFailoverEnd(context.Background(), "init_test", "0", nil /* err */)
+	b := New(NewDefaultConfig())
+	_, err := b.WaitForFailoverEnd(context.Background(), "init_test", "0", nil, nil)
 	if err != nil {
 		t.Fatalf("buffer should just passthrough and not return an error: %v", err)
 	}

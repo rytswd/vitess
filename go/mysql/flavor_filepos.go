@@ -17,82 +17,121 @@ limitations under the License.
 package mysql
 
 import (
-	"errors"
+	"context"
 	"fmt"
 	"io"
-	"strconv"
+	"strings"
 	"time"
 
-	"golang.org/x/net/context"
+	"vitess.io/vitess/go/mysql/capabilities"
+	"vitess.io/vitess/go/mysql/replication"
+	"vitess.io/vitess/go/mysql/sqlerror"
+	"vitess.io/vitess/go/vt/proto/replicationdata"
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/vterrors"
 )
 
 type filePosFlavor struct {
-	format     BinlogFormat
-	file       string
-	savedEvent BinlogEvent
+	format        BinlogFormat
+	file          string
+	savedEvent    BinlogEvent
+	serverVersion string
 }
 
 // newFilePosFlavor creates a new filePos flavor.
-func newFilePosFlavor() flavor {
-	return &filePosFlavor{}
+func newFilePosFlavor(serverVersion string) flavor {
+	return &filePosFlavor{serverVersion: serverVersion}
 }
 
-// masterGTIDSet is part of the Flavor interface.
-func (flv *filePosFlavor) masterGTIDSet(c *Conn) (GTIDSet, error) {
-	qr, err := c.ExecuteFetch("SHOW SLAVE STATUS", 100, true /* wantfields */)
+// primaryGTIDSet is part of the Flavor interface.
+func (flv *filePosFlavor) primaryGTIDSet(c *Conn) (replication.GTIDSet, error) {
+	query := "SHOW MASTER STATUS"
+	if ok, err := c.SupportsCapability(capabilities.BinaryLogStatus); err == nil && ok {
+		query = "SHOW BINARY LOG STATUS"
+	}
+
+	qr, err := c.ExecuteFetch(query, 100, true /* wantfields */)
 	if err != nil {
 		return nil, err
 	}
 	if len(qr.Rows) == 0 {
-		qr, err = c.ExecuteFetch("SHOW MASTER STATUS", 100, true /* wantfields */)
-		if err != nil {
-			return nil, err
-		}
-		if len(qr.Rows) == 0 {
-			return nil, errors.New("no master or slave status")
-		}
-		resultMap, err := resultToMap(qr)
-		if err != nil {
-			return nil, err
-		}
-		return filePosGTID{
-			file: resultMap["File"],
-			pos:  resultMap["Position"],
-		}, nil
+		return nil, ErrNoPrimaryStatus
 	}
 
 	resultMap, err := resultToMap(qr)
 	if err != nil {
 		return nil, err
 	}
-	return filePosGTID{
-		file: resultMap["Relay_Master_Log_File"],
-		pos:  resultMap["Exec_Master_Log_Pos"],
-	}, nil
+	return replication.ParseFilePosGTIDSet(fmt.Sprintf("%s:%s", resultMap["File"], resultMap["Position"]))
 }
 
-func (flv *filePosFlavor) startSlaveCommand() string {
+// purgedGTIDSet is part of the Flavor interface.
+func (flv *filePosFlavor) purgedGTIDSet(c *Conn) (replication.GTIDSet, error) {
+	return nil, nil
+}
+
+// gtidMode is part of the Flavor interface.
+func (flv *filePosFlavor) gtidMode(c *Conn) (string, error) {
+	qr, err := c.ExecuteFetch("select @@global.gtid_mode", 1, false)
+	if err != nil {
+		return "", err
+	}
+	if len(qr.Rows) != 1 || len(qr.Rows[0]) != 1 {
+		return "", vterrors.Errorf(vtrpcpb.Code_INTERNAL, "unexpected result format for gtid_mode: %#v", qr)
+	}
+	return qr.Rows[0][0].ToString(), nil
+}
+
+// serverUUID is part of the Flavor interface.
+func (flv *filePosFlavor) serverUUID(c *Conn) (string, error) {
+	// keep @@global as lowercase, as some servers like a binlog server only honors a lowercase `global` value
+	qr, err := c.ExecuteFetch("SELECT @@global.server_uuid", 1, false)
+	if err != nil {
+		return "", err
+	}
+	if len(qr.Rows) != 1 || len(qr.Rows[0]) != 1 {
+		return "", vterrors.Errorf(vtrpcpb.Code_INTERNAL, "unexpected result format for server_uuid: %#v", qr)
+	}
+	return qr.Rows[0][0].ToString(), nil
+}
+
+func (flv *filePosFlavor) startReplicationCommand() string {
 	return "unsupported"
 }
 
-func (flv *filePosFlavor) stopSlaveCommand() string {
+func (flv *filePosFlavor) resetReplicationCommand() string {
+	return "unsupported"
+}
+
+func (flv *filePosFlavor) restartReplicationCommands() []string {
+	return []string{"unsupported"}
+}
+
+func (flv *filePosFlavor) stopReplicationCommand() string {
+	return "unsupported"
+}
+
+func (flv *filePosFlavor) stopIOThreadCommand() string {
+	return "unsupported"
+}
+
+func (flv *filePosFlavor) stopSQLThreadCommand() string {
+	return "unsupported"
+}
+
+func (flv *filePosFlavor) startSQLThreadCommand() string {
 	return "unsupported"
 }
 
 // sendBinlogDumpCommand is part of the Flavor interface.
-func (flv *filePosFlavor) sendBinlogDumpCommand(c *Conn, slaveID uint32, startPos Position) error {
-	rpos, ok := startPos.GTIDSet.(filePosGTID)
+func (flv *filePosFlavor) sendBinlogDumpCommand(c *Conn, serverID uint32, binlogFilename string, startPos replication.Position) error {
+	rpos, ok := startPos.GTIDSet.(replication.FilePosGTID)
 	if !ok {
 		return fmt.Errorf("startPos.GTIDSet is wrong type - expected filePosGTID, got: %#v", startPos.GTIDSet)
 	}
 
-	pos, err := strconv.Atoi(rpos.pos)
-	if err != nil {
-		return fmt.Errorf("invalid position: %v", startPos.GTIDSet)
-	}
-	flv.file = rpos.file
-
-	return c.WriteComBinlogDump(slaveID, rpos.file, uint32(pos), 0)
+	flv.file = rpos.File
+	return c.WriteComBinlogDump(serverID, rpos.File, rpos.Pos, 0)
 }
 
 // readBinlogEvent is part of the Flavor interface.
@@ -109,12 +148,16 @@ func (flv *filePosFlavor) readBinlogEvent(c *Conn) (BinlogEvent, error) {
 		}
 		switch result[0] {
 		case EOFPacket:
-			return nil, NewSQLError(CRServerLost, SSUnknownSQLState, "%v", io.EOF)
+			return nil, sqlerror.NewSQLErrorf(sqlerror.CRServerLost, sqlerror.SSUnknownSQLState, "%v", io.EOF)
 		case ErrPacket:
 			return nil, ParseErrorPacket(result)
 		}
 
-		event := &filePosBinlogEvent{binlogEvent: binlogEvent(result[1:])}
+		buf, semiSyncAckRequested, err := c.AnalyzeSemiSyncAckRequest(result[1:])
+		if err != nil {
+			return nil, err
+		}
+		event := newFilePosBinlogEventWithSemiSyncInfo(buf, semiSyncAckRequested)
 		switch event.Type() {
 		case eGTIDEvent, eAnonymousGTIDEvent, ePreviousGTIDsEvent, eMariaGTIDListEvent:
 			// Don't transmit fake or irrelevant events because we should not
@@ -143,10 +186,17 @@ func (flv *filePosFlavor) readBinlogEvent(c *Conn) (BinlogEvent, error) {
 				// No need to transmit. Just update the internal position for the next event.
 				continue
 			}
-		case eXIDEvent, eQueryEvent, eTableMapEvent,
+		case eXIDEvent, eTableMapEvent,
 			eWriteRowsEventV0, eWriteRowsEventV1, eWriteRowsEventV2,
 			eDeleteRowsEventV0, eDeleteRowsEventV1, eDeleteRowsEventV2,
 			eUpdateRowsEventV0, eUpdateRowsEventV1, eUpdateRowsEventV2:
+			flv.savedEvent = event
+			return newFilePosGTIDEvent(flv.file, event.nextPosition(flv.format), event.Timestamp()), nil
+		case eQueryEvent:
+			q, err := event.Query(flv.format)
+			if err == nil && strings.HasPrefix(q.SQL, "#") {
+				continue
+			}
 			flv.savedEvent = event
 			return newFilePosGTIDEvent(flv.file, event.nextPosition(flv.format), event.Timestamp()), nil
 		default:
@@ -170,71 +220,186 @@ func (flv *filePosFlavor) resetReplicationCommands(c *Conn) []string {
 	}
 }
 
-// setSlavePositionCommands is part of the Flavor interface.
-func (flv *filePosFlavor) setSlavePositionCommands(pos Position) []string {
+// resetReplicationParametersCommands is part of the Flavor interface.
+func (flv *filePosFlavor) resetReplicationParametersCommands(c *Conn) []string {
 	return []string{
 		"unsupported",
 	}
 }
 
-// setSlavePositionCommands is part of the Flavor interface.
-func (flv *filePosFlavor) changeMasterArg() string {
+// setReplicationPositionCommands is part of the Flavor interface.
+func (flv *filePosFlavor) setReplicationPositionCommands(pos replication.Position) []string {
+	return []string{
+		"unsupported",
+	}
+}
+
+// setReplicationSourceCommand is part of the Flavor interface.
+func (flv *filePosFlavor) setReplicationSourceCommand(params *ConnParams, host string, port int32, heartbeatInterval float64, connectRetry int) string {
+	return "unsupported"
+}
+
+// resetBinaryLogsCommand is part of the Flavor interface.
+func (flv *filePosFlavor) resetBinaryLogsCommand() string {
 	return "unsupported"
 }
 
 // status is part of the Flavor interface.
-func (flv *filePosFlavor) status(c *Conn) (SlaveStatus, error) {
+func (flv *filePosFlavor) status(c *Conn) (replication.ReplicationStatus, error) {
 	qr, err := c.ExecuteFetch("SHOW SLAVE STATUS", 100, true /* wantfields */)
 	if err != nil {
-		return SlaveStatus{}, err
+		return replication.ReplicationStatus{}, err
 	}
 	if len(qr.Rows) == 0 {
 		// The query returned no data, meaning the server
-		// is not configured as a slave.
-		return SlaveStatus{}, ErrNotSlave
+		// is not configured as a replica.
+		return replication.ReplicationStatus{}, ErrNotReplica
 	}
 
 	resultMap, err := resultToMap(qr)
 	if err != nil {
-		return SlaveStatus{}, err
+		return replication.ReplicationStatus{}, err
 	}
 
-	status := parseSlaveStatus(resultMap)
-	status.Position.GTIDSet = filePosGTID{
-		file: resultMap["Relay_Master_Log_File"],
-		pos:  resultMap["Exec_Master_Log_Pos"],
-	}
-	return status, nil
+	return replication.ParseFilePosReplicationStatus(resultMap)
 }
 
-// waitUntilPositionCommand is part of the Flavor interface.
-func (flv *filePosFlavor) waitUntilPositionCommand(ctx context.Context, pos Position) (string, error) {
-	filePosPos, ok := pos.GTIDSet.(filePosGTID)
-	if !ok {
-		return "", fmt.Errorf("Position is not filePos compatible: %#v", pos.GTIDSet)
+// primaryStatus is part of the Flavor interface.
+func (flv *filePosFlavor) primaryStatus(c *Conn) (replication.PrimaryStatus, error) {
+	qr, err := c.ExecuteFetch("SHOW MASTER STATUS", 100, true /* wantfields */)
+	if err != nil {
+		return replication.PrimaryStatus{}, err
+	}
+	if len(qr.Rows) == 0 {
+		// The query returned no data. We don't know how this could happen.
+		return replication.PrimaryStatus{}, ErrNoPrimaryStatus
 	}
 
+	resultMap, err := resultToMap(qr)
+	if err != nil {
+		return replication.PrimaryStatus{}, err
+	}
+
+	return replication.ParseFilePosPrimaryStatus(resultMap)
+}
+
+func (flv *filePosFlavor) replicationConfiguration(c *Conn) (*replicationdata.Configuration, error) {
+	return nil, nil
+}
+
+func (flv *filePosFlavor) replicationNetTimeout(c *Conn) (int32, error) {
+	return 0, nil
+}
+
+// waitUntilPosition is part of the Flavor interface.
+func (flv *filePosFlavor) waitUntilPosition(ctx context.Context, c *Conn, pos replication.Position) error {
+	filePosPos, ok := pos.GTIDSet.(replication.FilePosGTID)
+	if !ok {
+		return vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "position is not filePos compatible: %#v", pos.GTIDSet)
+	}
+	queryPos := "SELECT MASTER_POS_WAIT('%s', %d)"
+	queryPosSub := "SELECT MASTER_POS_WAIT('%s', %d, %.6f)"
+
+	if ok, err := c.SupportsCapability(capabilities.ReplicaTerminologyCapability); err == nil && ok {
+		queryPos = "SELECT SOURCE_POS_WAIT('%s', %d)"
+		queryPosSub = "SELECT SOURCE_POS_WAIT('%s', %d, %.6f)"
+	}
+
+	query := fmt.Sprintf(queryPos, filePosPos.File, filePosPos.Pos)
 	if deadline, ok := ctx.Deadline(); ok {
 		timeout := time.Until(deadline)
 		if timeout <= 0 {
-			return "", fmt.Errorf("timed out waiting for position %v", pos)
+			return vterrors.Errorf(vtrpcpb.Code_DEADLINE_EXCEEDED, "timed out waiting for position %v", pos)
 		}
-		return fmt.Sprintf("SELECT MASTER_POS_WAIT('%s', %s, %.6f)", filePosPos.file, filePosPos.pos, timeout.Seconds()), nil
+		query = fmt.Sprintf(queryPosSub, filePosPos.File, filePosPos.Pos, timeout.Seconds())
 	}
 
-	return fmt.Sprintf("SELECT MASTER_POS_WAIT('%s', %s)", filePosPos.file, filePosPos.pos), nil
+	result, err := c.ExecuteFetch(query, 1, false)
+	if err != nil {
+		return err
+	}
+
+	// For MASTER_POS_WAIT(), the return value is the number of log events
+	// the replica had to wait for to advance to the specified position.
+	// The function returns NULL if the replica SQL thread is not started,
+	// the replica's source information is not initialized, the arguments
+	// are incorrect, or an error occurs. It returns -1 if the timeout has
+	// been exceeded. If the replica SQL thread stops while MASTER_POS_WAIT()
+	// is waiting, the function returns NULL. If the replica is past the
+	// specified position, the function returns immediately.
+	if len(result.Rows) != 1 || len(result.Rows[0]) != 1 {
+		return vterrors.Errorf(vtrpcpb.Code_INTERNAL, "invalid results: %#v", result)
+	}
+	val := result.Rows[0][0]
+	if val.IsNull() {
+		return vterrors.Errorf(vtrpcpb.Code_INTERNAL, "replication is not running")
+	}
+	state, err := val.ToInt64()
+	if err != nil {
+		return vterrors.Errorf(vtrpcpb.Code_INTERNAL, "invalid result of %#v", val)
+	}
+	switch {
+	case state == -1:
+		return vterrors.Errorf(vtrpcpb.Code_DEADLINE_EXCEEDED, "timed out waiting for position %v", pos)
+	case state >= 0:
+		return nil
+	default:
+		return vterrors.Errorf(vtrpcpb.Code_INTERNAL, "invalid result of %d", state)
+	}
 }
 
-func (*filePosFlavor) startSlaveUntilAfter(pos Position) string {
+func (*filePosFlavor) startReplicationUntilAfter(pos replication.Position) string {
 	return "unsupported"
 }
 
-// enableBinlogPlaybackCommand is part of the Flavor interface.
-func (*filePosFlavor) enableBinlogPlaybackCommand() string {
+func (*filePosFlavor) startSQLThreadUntilAfter(pos replication.Position) string {
+	return "unsupported"
+}
+
+// baseShowTables is part of the Flavor interface.
+func (*filePosFlavor) baseShowTables() string {
+	return mysqlFlavor{}.baseShowTables()
+}
+
+// baseShowTablesWithSizes is part of the Flavor interface.
+func (*filePosFlavor) baseShowTablesWithSizes() string {
+	return TablesWithSize56
+}
+
+func (filePosFlavor) baseShowInnodbTableSizes() string {
 	return ""
 }
 
-// disableBinlogPlaybackCommand is part of the Flavor interface.
-func (*filePosFlavor) disableBinlogPlaybackCommand() string {
+func (filePosFlavor) baseShowPartitions() string {
 	return ""
+}
+
+func (filePosFlavor) baseShowTableRowCountClusteredIndex() string {
+	return ""
+}
+
+func (filePosFlavor) baseShowIndexSizes() string {
+	return ""
+}
+
+func (filePosFlavor) baseShowIndexCardinalities() string {
+	return ""
+}
+
+// supportsCapability is part of the Flavor interface.
+func (f *filePosFlavor) supportsCapability(capability capabilities.FlavorCapability) (bool, error) {
+	switch capability {
+	case capabilities.BinaryLogStatus:
+		return capabilities.ServerVersionAtLeast(f.serverVersion, 8, 2, 0)
+	default:
+		return false, nil
+	}
+}
+
+func (*filePosFlavor) catchupToGTIDCommands(_ *ConnParams, _ replication.Position) []string {
+	return []string{"unsupported"}
+}
+
+func (*filePosFlavor) binlogReplicatedUpdates() string {
+	return "@@global.log_slave_updates"
 }

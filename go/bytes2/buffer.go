@@ -16,6 +16,8 @@ limitations under the License.
 
 package bytes2
 
+import "unsafe"
+
 // Buffer implements a subset of the write portion of
 // bytes.Buffer, but more efficiently. This is meant to
 // be used in very high QPS operations, especially for
@@ -24,11 +26,6 @@ package bytes2
 // but they do not return errors.
 type Buffer struct {
 	bytes []byte
-}
-
-// NewBuffer is equivalent to bytes.NewBuffer.
-func NewBuffer(b []byte) *Buffer {
-	return &Buffer{bytes: b}
 }
 
 // Write is equivalent to bytes.Buffer.Write.
@@ -57,6 +54,18 @@ func (buf *Buffer) Bytes() []byte {
 // Strings is equivalent to bytes.Buffer.Strings.
 func (buf *Buffer) String() string {
 	return string(buf.bytes)
+}
+
+// StringUnsafe is equivalent to String, but the copy of the string that it returns
+// is _not_ allocated, so modifying this buffer after calling StringUnsafe will lead
+// to undefined behavior.
+func (buf *Buffer) StringUnsafe() string {
+	return unsafe.String(unsafe.SliceData(buf.bytes), len(buf.bytes))
+}
+
+// Reset is equivalent to bytes.Buffer.Reset.
+func (buf *Buffer) Reset() {
+	buf.bytes = buf.bytes[:0]
 }
 
 // Len is equivalent to bytes.Buffer.Len.

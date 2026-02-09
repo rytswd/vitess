@@ -4,6 +4,9 @@
 # For mac users
 .DS_Store
 
+# For direnv users
+.envrc
+
 # Produced by yacc
 *.output
 
@@ -26,19 +29,13 @@ tags
 
 # vscode
 .vscode/
+__debug_bin
 
 # C build dirs
 **/build
 
-# site-local example files
-/examples/kubernetes/config.sh
-
 # generated protobuf files
 /go/vt/.proto.tmp
-
-# Godeps files
-/Godeps/_workspace/pkg
-/Godeps/_workspace/bin
 
 # Eclipse Java CheckStyle plugin configuration.
 /java/*/.checkstyle
@@ -51,12 +48,7 @@ tags
 /java/pom.xml.versionsBackup
 /java/*/pom.xml.versionsBackup
 
-# php downloaded dependencies
-/php/composer.phar
-/php/vendor
-
-# vitess.io preview site
-/preview-vitess.io/
+report*.xml
 
 # vitess.io generated site files
 /docs/
@@ -65,17 +57,23 @@ tags
 _test/
 /test/stats.json
 
-# Go vendored libs
-/vendor/*/
+# Local examples
+/examples/local/vtdataroot
 
-# release folder
-releases
+/dist/
+/bin/
+/vtdataroot/
+/vthook/
+venv
 
-# Angular2 Bower Libs
-/web/vtctld2/.bowerrc~
-/web/vtctld2/bower.json~
-/web/vtctld2/public/bower_components/
+.scannerwork
+report
 
+# plan test output
+/go/vt/vtgate/planbuilder/testdata/plan_test*
+/go/vt/vtgate/planbuilder/testdata/expected
 
-# Vagrant
-.vagrant
+# mise files
+.mise.toml
+/errors/
+go/flags/endtoend/count_flags.sh

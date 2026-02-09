@@ -16,8 +16,6 @@
 
 package io.vitess.example;
 
-import org.joda.time.Instant;
-
 import java.sql.BatchUpdateException;
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -26,6 +24,7 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.Random;
+import org.joda.time.Instant;
 
 /**
  * VitessJDBCExample.java is a sample for using the Vitess JDBC driver.
@@ -49,18 +48,18 @@ public class VitessJDBCExample {
       conn.setAutoCommit(false);
 
       // Insert some messages on random pages.
-      System.out.println("Inserting into master...");
+      System.out.println("Inserting into primary...");
       insertData(conn);
 
       // To Commit Open Transaction
       conn.commit();
 
-      // Read it back from master.
-      System.out.println("Reading from master...");
+      // Read it back from primary.
+      System.out.println("Reading from primary...");
       readData(conn);
 
       // To Commit Open Transaction,
-      // as select was made on master with autocommit false a transaction was open
+      // as select was made on primary with autocommit false a transaction was open
       conn.commit();
 
       // Read it back from replica.

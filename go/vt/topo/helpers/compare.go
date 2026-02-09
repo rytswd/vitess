@@ -19,10 +19,11 @@ limitations under the License.
 package helpers
 
 import (
+	"context"
 	"reflect"
 
-	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
+	"google.golang.org/protobuf/proto"
+
 	"vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/vterrors"
@@ -36,7 +37,6 @@ func CompareKeyspaces(ctx context.Context, fromTS, toTS *topo.Server) error {
 	}
 
 	for _, keyspace := range keyspaces {
-
 		fromKs, err := fromTS.GetKeyspace(ctx, keyspace)
 		if err != nil {
 			return vterrors.Wrapf(err, "GetKeyspace(%v)", keyspace)
@@ -117,12 +117,11 @@ func CompareTablets(ctx context.Context, fromTS, toTS *topo.Server) error {
 	}
 
 	for _, cell := range cells {
-		tabletAliases, err := fromTS.GetTabletsByCell(ctx, cell)
+		tabletAliases, err := fromTS.GetTabletAliasesByCell(ctx, cell)
 		if err != nil {
 			return vterrors.Wrapf(err, "GetTabletsByCell(%v)", cell)
 		}
 		for _, tabletAlias := range tabletAliases {
-
 			// read the source tablet
 			fromTi, err := fromTS.GetTablet(ctx, tabletAlias)
 			if err != nil {

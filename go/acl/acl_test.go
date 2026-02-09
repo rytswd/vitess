@@ -18,18 +18,18 @@ package acl
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
 	"testing"
+
+	"github.com/spf13/pflag"
+	"github.com/stretchr/testify/assert"
 )
 
 type TestPolicy struct{}
-
-func (tp TestPolicy) CheckAccessActor(actor, role string) error {
-	if role == ADMIN {
-		return errors.New("not allowed")
-	}
-	return nil
-}
 
 func (tp TestPolicy) CheckAccessHTTP(req *http.Request, role string) error {
 	if role == ADMIN {
@@ -48,43 +48,87 @@ func init() {
 
 func TestSimplePolicy(t *testing.T) {
 	currentPolicy = policies["test"]
-	err := CheckAccessActor("", ADMIN)
 	want := "not allowed"
-	if err == nil || err.Error() != want {
-		t.Errorf("got %v, want %s", err, want)
-	}
-	err = CheckAccessActor("", DEBUGGING)
-	if err != nil {
-		t.Errorf("got %v, want no error", err)
-	}
+	err := CheckAccessHTTP(nil, ADMIN)
+	assert.Equalf(t, err.Error(), want, "got %v, want %s", err, want)
 
-	err = CheckAccessHTTP(nil, ADMIN)
-	if err == nil || err.Error() != want {
-		t.Errorf("got %v, want %s", err, want)
-	}
 	err = CheckAccessHTTP(nil, DEBUGGING)
-	if err != nil {
-		t.Errorf("got %v, want no error", err)
-	}
+	assert.Equalf(t, err, nil, "got %v, want no error", err)
+
+	err = CheckAccessHTTP(nil, MONITORING)
+	assert.Equalf(t, err, nil, "got %v, want no error", err)
 }
 
 func TestEmptyPolicy(t *testing.T) {
 	currentPolicy = nil
-	err := CheckAccessActor("", ADMIN)
-	if err != nil {
-		t.Errorf("got %v, want no error", err)
-	}
-	err = CheckAccessActor("", DEBUGGING)
-	if err != nil {
-		t.Errorf("got %v, want no error", err)
+	err := CheckAccessHTTP(nil, ADMIN)
+	assert.Equalf(t, err, nil, "got %v, want no error", err)
+
+	err = CheckAccessHTTP(nil, DEBUGGING)
+	assert.Equalf(t, err, nil, "got %v, want no error", err)
+
+	err = CheckAccessHTTP(nil, MONITORING)
+	assert.Equalf(t, err, nil, "got %v, want no error", err)
+}
+
+func TestValidSecurityPolicy(t *testing.T) {
+	securityPolicy = "test"
+	savePolicy()
+
+	assert.Equalf(t, TestPolicy{}, currentPolicy, "got %v, expected %v", currentPolicy, TestPolicy{})
+}
+
+func TestInvalidSecurityPolicy(t *testing.T) {
+	securityPolicy = "invalidSecurityPolicy"
+	savePolicy()
+
+	assert.Equalf(t, denyAllPolicy{}, currentPolicy, "got %v, expected %v", currentPolicy, denyAllPolicy{})
+}
+
+func TestSendError(t *testing.T) {
+	testW := httptest.NewRecorder()
+
+	testErr := errors.New("Testing error message")
+	SendError(testW, testErr)
+
+	// Check the status code
+	assert.Equalf(t, testW.Code, http.StatusForbidden, "got %v; want %v", testW.Code, http.StatusForbidden)
+
+	// Check the writer body
+	want := fmt.Sprintf("Access denied: %v\n", testErr)
+	got := testW.Body.String()
+	assert.Equalf(t, got, want, "got %v; want %v", got, want)
+}
+
+func TestRegisterFlags(t *testing.T) {
+	testFs := pflag.NewFlagSet("test", pflag.ExitOnError)
+	securityPolicy = "test"
+
+	RegisterFlags(testFs)
+
+	securityPolicyFlag := testFs.Lookup("security-policy")
+	assert.NotNil(t, securityPolicyFlag, "no security-policy flag is registered")
+
+	// Check the default value of the flag
+	want := "test"
+	got := securityPolicyFlag.DefValue
+	assert.Equalf(t, got, want, "got %v; want %v", got, want)
+}
+
+func TestAlreadyRegisteredPolicy(t *testing.T) {
+	if os.Getenv("TEST_ACL") == "1" {
+		RegisterPolicy("test", nil)
+		return
 	}
 
-	err = CheckAccessHTTP(nil, ADMIN)
-	if err != nil {
-		t.Errorf("got %v, want no error", err)
+	// Run subprocess to test os.Exit which is called by log.fatalf
+	// os.Exit should be called if we try to re-register a policy
+	cmd := exec.Command(os.Args[0], "-test.run=TestAlreadyRegisteredPolicy")
+	cmd.Env = append(os.Environ(), "TEST_ACL=1")
+	err := cmd.Run()
+	if e, ok := err.(*exec.ExitError); ok && !e.Success() {
+		return
 	}
-	err = CheckAccessHTTP(nil, DEBUGGING)
-	if err != nil {
-		t.Errorf("got %v, want no error", err)
-	}
+
+	t.Errorf("process ran with err %v, want exit status 1", err)
 }

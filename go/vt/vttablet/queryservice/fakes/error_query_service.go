@@ -17,9 +17,9 @@ limitations under the License.
 package fakes
 
 import (
-	"fmt"
+	"context"
+	"errors"
 
-	"golang.org/x/net/context"
 	"vitess.io/vitess/go/vt/vttablet/queryservice"
 
 	querypb "vitess.io/vitess/go/vt/proto/query"
@@ -28,7 +28,7 @@ import (
 // ErrorQueryService is an object that returns an error for all methods.
 var ErrorQueryService = queryservice.Wrap(
 	nil,
-	func(ctx context.Context, target *querypb.Target, conn queryservice.QueryService, name string, inTransaction bool, inner func(context.Context, *querypb.Target, queryservice.QueryService) (bool, error)) error {
-		return fmt.Errorf("ErrorQueryService does not implement any method")
+	func(ctx context.Context, target *querypb.Target, conn queryservice.QueryService, name string, opts queryservice.WrapOpts, inner func(context.Context, *querypb.Target, queryservice.QueryService) (bool, error)) error {
+		return errors.New("ErrorQueryService does not implement any method")
 	},
 )

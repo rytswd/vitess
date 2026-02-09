@@ -17,13 +17,9 @@
 package io.vitess.jdbc;
 
 import com.google.common.annotations.VisibleForTesting;
-
 import io.vitess.proto.Query;
 import io.vitess.util.Constants;
 import io.vitess.util.MysqlDefs;
-
-import org.apache.commons.lang.StringUtils;
-
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.ResultSet;
@@ -41,7 +37,7 @@ import java.util.Map;
 import java.util.SortedMap;
 import java.util.StringTokenizer;
 import java.util.TreeMap;
-import java.util.logging.Logger;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * Created by ashudeep.sharma on 15/02/16.
@@ -50,7 +46,6 @@ public class VitessMySQLDatabaseMetadata extends VitessDatabaseMetaData implemen
     DatabaseMetaData {
 
   private static final String DRIVER_NAME = "Vitess MySQL JDBC Driver";
-  private static Logger logger = Logger.getLogger(VitessMySQLDatabaseMetadata.class.getName());
   private static String mysqlKeywordsThatArentSQL92;
 
   static {
@@ -69,18 +64,19 @@ public class VitessMySQLDatabaseMetadata extends VitessDatabaseMetaData implemen
         "INNER", "INOUT", "INSENSITIVE", "INSERT", "INT", "INT1", "INT2", "INT3", "INT4", "INT8",
         "INTEGER", "INTERVAL", "INTO", "IS", "ITERATE", "JOIN", "KEY", "KEYS", "KILL", "LEADING",
         "LEAVE", "LEFT", "LIKE", "LIMIT", "LINEAR", "LINES", "LOAD", "LOCALTIME", "LOCALTIMESTAMP",
-        "LOCK", "LONG", "LONGBLOB", "LONGTEXT", "LOOP", "LOW_PRIORITY", "MATCH", "MEDIUMBLOB",
-        "MEDIUMINT", "MEDIUMTEXT", "MIDDLEINT", "MINUTE_MICROSECOND", "MINUTE_SECOND", "MOD",
-        "MODIFIES", "NATURAL", "NOT", "NO_WRITE_TO_BINLOG", "NULL", "NUMERIC", "ON", "OPTIMIZE",
-        "OPTION", "OPTIONALLY", "OR", "ORDER", "OUT", "OUTER", "OUTFILE", "PRECISION", "PRIMARY",
-        "PROCEDURE", "PURGE", "RANGE", "READ", "READS", "READ_ONLY", "READ_WRITE", "REAL",
-        "REFERENCES", "REGEXP", "RELEASE", "RENAME", "REPEAT", "REPLACE", "REQUIRE", "RESTRICT",
-        "RETURN", "REVOKE", "RIGHT", "RLIKE", "SCHEMA", "SCHEMAS", "SECOND_MICROSECOND", "SELECT",
-        "SENSITIVE", "SEPARATOR", "SET", "SHOW", "SMALLINT", "SPATIAL", "SPECIFIC", "SQL",
-        "SQLEXCEPTION", "SQLSTATE", "SQLWARNING", "SQL_BIG_RESULT", "SQL_CALC_FOUND_ROWS",
-        "SQL_SMALL_RESULT", "SSL", "STARTING", "STRAIGHT_JOIN", "TABLE", "TERMINATED", "THEN",
-        "TINYBLOB", "TINYINT", "TINYTEXT", "TO", "TRAILING", "TRIGGER", "TRUE", "UNDO", "UNION",
-        "UNIQUE", "UNLOCK", "UNSIGNED", "UPDATE", "USAGE", "USE", "USING", "UTC_DATE", "UTC_TIME",
+        "LOCK", "LONG", "LONGBLOB", "LONGTEXT", "LOOP", "LOW_PRIORITY", "MANUAL", "MATCH",
+        "MEDIUMBLOB", "MEDIUMINT", "MEDIUMTEXT", "MIDDLEINT", "MINUTE_MICROSECOND",
+        "MINUTE_SECOND", "MOD", "MODIFIES", "NATURAL", "NOT", "NO_WRITE_TO_BINLOG", "NULL",
+        "NUMERIC", "ON", "OPTIMIZE", "OPTION", "OPTIONALLY", "OR", "ORDER", "OUT", "OUTER",
+        "OUTFILE", "PARALLEL", "PRECISION", "PRIMARY", "PROCEDURE", "PURGE", "QUALIFY", "RANGE",
+        "READ", "READS", "READ_ONLY", "READ_WRITE", "REAL", "REFERENCES", "REGEXP", "RELEASE",
+        "RENAME", "REPEAT", "REPLACE", "REQUIRE", "RESTRICT", "RETURN", "REVOKE", "RIGHT",
+        "RLIKE", "SCHEMA", "SCHEMAS", "SECOND_MICROSECOND", "SELECT", "SENSITIVE", "SEPARATOR",
+        "SET", "SHOW", "SMALLINT", "SPATIAL", "SPECIFIC", "SQL", "SQLEXCEPTION", "SQLSTATE",
+        "SQLWARNING", "SQL_BIG_RESULT", "SQL_CALC_FOUND_ROWS", "SQL_SMALL_RESULT", "SSL",
+        "STARTING", "STRAIGHT_JOIN", "TABLE", "TABLESAMPLE", "TERMINATED", "THEN", "TINYBLOB",
+        "TINYINT", "TINYTEXT", "TO", "TRAILING", "TRIGGER", "TRUE", "UNDO", "UNION", "UNIQUE",
+        "UNLOCK", "UNSIGNED", "UPDATE", "USAGE", "USE", "USING", "UTC_DATE", "UTC_TIME",
         "UTC_TIMESTAMP", "VALUES", "VARBINARY", "VARCHAR", "VARCHARACTER", "VARYING", "WHEN",
         "WHERE", "WHILE", "WITH", "WRITE", "X509", "XOR", "YEAR_MONTH", "ZEROFILL"};
     String[] sql92Keywords = new String[]{"ABSOLUTE", "EXEC", "OVERLAPS", "ACTION", "EXECUTE",
@@ -614,8 +610,8 @@ public class VitessMySQLDatabaseMetadata extends VitessDatabaseMetaData implemen
             row.add(12,
                 resultSet.getString("Default") == null ? null : resultSet.getString("Default"));
 
-            row.add(13, Integer.toString(0));// SQL_DATA_TYPE
-            row.add(14, Integer.toString(0));// SQL_DATE_TIME_SUB
+            row.add(13, Integer.toString(0)); // SQL_DATA_TYPE
+            row.add(14, Integer.toString(0)); // SQL_DATE_TIME_SUB
 
             if (StringUtils.indexOfIgnoreCase(typeDesc.typeName, "CHAR") != -1
                 || StringUtils.indexOfIgnoreCase(typeDesc.typeName, "BLOB") != -1

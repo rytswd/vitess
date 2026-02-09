@@ -17,6 +17,7 @@ limitations under the License.
 package zk2topo
 
 import (
+	"context"
 	"fmt"
 	"path"
 	"sort"
@@ -24,11 +25,10 @@ import (
 	"sync"
 
 	"github.com/z-division/go-zookeeper/zk"
-	"golang.org/x/net/context"
-	"vitess.io/vitess/go/vt/log"
-	"vitess.io/vitess/go/vt/vterrors"
 
 	"vitess.io/vitess/go/fileutil"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/vterrors"
 )
 
 // CreateRecursive is a helper function on top of Create. It will
@@ -146,7 +146,7 @@ func ResolveWildcards(ctx context.Context, zconn *ZkConn, zkPaths []string) ([]s
 	}
 
 	result := make([]string, 0, 32)
-	for i := 0; i < len(zkPaths); i++ {
+	for i := range zkPaths {
 		subResult := results[i]
 		if subResult != nil {
 			result = append(result, subResult...)

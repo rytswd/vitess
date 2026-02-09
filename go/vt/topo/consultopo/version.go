@@ -16,11 +16,7 @@ limitations under the License.
 
 package consultopo
 
-import (
-	"fmt"
-
-	"vitess.io/vitess/go/vt/topo"
-)
+import "strconv"
 
 // ConsulVersion is consul's idea of a version.
 // It implements topo.Version.
@@ -29,15 +25,5 @@ type ConsulVersion uint64
 
 // String is part of the topo.Version interface.
 func (v ConsulVersion) String() string {
-	return fmt.Sprintf("%v", uint64(v))
-}
-
-// VersionFromInt is used by old-style functions to create a proper
-// Version: if version is -1, returns nil. Otherwise returns the
-// ConsulVersion object.
-func VersionFromInt(version int64) topo.Version {
-	if version == -1 {
-		return nil
-	}
-	return ConsulVersion(version)
+	return strconv.FormatUint(uint64(v), 10)
 }

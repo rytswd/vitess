@@ -17,11 +17,11 @@ limitations under the License.
 package zk2topo
 
 import (
+	"context"
 	"path"
 	"sort"
 	"sync"
 
-	"golang.org/x/net/context"
 	"vitess.io/vitess/go/vt/topo"
 )
 
@@ -29,10 +29,7 @@ import (
 func (zs *Server) ListDir(ctx context.Context, dirPath string, full bool) ([]topo.DirEntry, error) {
 	zkPath := path.Join(zs.root, dirPath)
 
-	isRoot := false
-	if dirPath == "" || dirPath == "/" {
-		isRoot = true
-	}
+	isRoot := dirPath == "" || dirPath == "/"
 
 	children, _, err := zs.conn.Children(ctx, zkPath)
 	if err != nil {

@@ -17,16 +17,23 @@ limitations under the License.
 package tabletmanager
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"time"
 
-	"golang.org/x/net/context"
+	"vitess.io/vitess/go/protoutil"
+	"vitess.io/vitess/go/vt/proto/vttime"
+	"vitess.io/vitess/go/vt/topotools"
+	"vitess.io/vitess/go/vt/vtctl/reparentutil/policy"
+
 	"vitess.io/vitess/go/vt/logutil"
 	"vitess.io/vitess/go/vt/mysqlctl"
+	"vitess.io/vitess/go/vt/mysqlctl/backupstats"
 	"vitess.io/vitess/go/vt/topo/topoproto"
-	"vitess.io/vitess/go/vt/topotools"
 	"vitess.io/vitess/go/vt/vterrors"
 
+	tabletmanagerdatapb "vitess.io/vitess/go/vt/proto/tabletmanagerdata"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
@@ -35,165 +42,217 @@ const (
 	backupModeOffline = "offline"
 )
 
-// Backup takes a db backup and sends it to the BackupStorage
-func (agent *ActionAgent) Backup(ctx context.Context, concurrency int, logger logutil.Logger, allowMaster bool) error {
-	if agent.Cnf == nil {
-		return fmt.Errorf("cannot perform backup without my.cnf, please restart vttablet with a my.cnf file specified")
+// Backup takes a db backup and sends it to the BackupStorage.
+func (tm *TabletManager) Backup(ctx context.Context, logger logutil.Logger, req *tabletmanagerdatapb.BackupRequest) error {
+	if tm.Cnf == nil {
+		return errors.New("cannot perform backup without my.cnf, please restart vttablet with a my.cnf file specified")
 	}
 
 	// Check tablet type current process has.
-	// During a network partition it is possible that from the topology perspective this is no longer the master,
+	// During a network partition it is possible that from the topology perspective this is no longer the primary,
 	// but the process didn't find out about this.
 	// It is not safe to take backups from tablet in this state
-	currentTablet := agent.Tablet()
-	if !allowMaster && currentTablet.Type == topodatapb.TabletType_MASTER {
-		return fmt.Errorf("type MASTER cannot take backup. if you really need to do this, rerun the backup command with -allow_master")
+	currentTablet := tm.Tablet()
+	if !req.AllowPrimary && currentTablet.Type == topodatapb.TabletType_PRIMARY {
+		return errors.New("type PRIMARY cannot take backup. if you really need to do this, rerun the backup command with --allow_primary")
 	}
-	engine, err := mysqlctl.GetBackupEngine()
+
+	backupEngine := ""
+	if req.BackupEngine != nil {
+		backupEngine = *req.BackupEngine
+	}
+
+	engine, err := mysqlctl.GetBackupEngine(backupEngine)
 	if err != nil {
 		return vterrors.Wrap(err, "failed to find backup engine")
 	}
-	// get Tablet info from topo so that it is up to date
-	tablet, err := agent.TopoServer.GetTablet(ctx, agent.TabletAlias)
+	// Get Tablet info from topo so that it is up to date
+	tablet, err := tm.TopoServer.GetTablet(ctx, tm.tabletAlias)
 	if err != nil {
 		return err
 	}
-	if !allowMaster && tablet.Type == topodatapb.TabletType_MASTER {
-		return fmt.Errorf("type MASTER cannot take backup. if you really need to do this, rerun the backup command with -allow_master")
+	if !req.AllowPrimary && tablet.Type == topodatapb.TabletType_PRIMARY {
+		return errors.New("type PRIMARY cannot take backup. if you really need to do this, rerun the backup command with --allow_primary")
 	}
 
-	// prevent concurrent backups, and record stats
+	// Create the logger: tee to console and source.
+	l := logutil.NewTeeLogger(logutil.NewConsoleLogger(), logger)
+
+	backupParams := mysqlctl.BackupParams{
+		Cnf:                  tm.Cnf,
+		Mysqld:               tm.MysqlDaemon,
+		Logger:               l,
+		Concurrency:          int(req.Concurrency),
+		IncrementalFromPos:   req.IncrementalFromPos,
+		HookExtraEnv:         tm.hookExtraEnv(),
+		TopoServer:           tm.TopoServer,
+		Keyspace:             tablet.Keyspace,
+		Shard:                tablet.Shard,
+		TabletAlias:          topoproto.TabletAliasString(tablet.Alias),
+		TabletType:           tablet.Type,
+		Stats:                backupstats.BackupStats(),
+		UpgradeSafe:          req.UpgradeSafe,
+		MysqlShutdownTimeout: shutdownTimeout(l, req.MysqlShutdownTimeout),
+		BackupEngine:         backupEngine,
+		InitSQL:              req.InitSql.CloneVT(),
+	}
+
+	// Perform any requested pre backup initialization queries.
+	if err := mysqlctl.ExecuteBackupInitSQL(ctx, &backupParams); err != nil {
+		return vterrors.Wrap(err, "failed to execute backup init SQL queries")
+	}
+
+	// Prevent concurrent backups, and record stats
 	backupMode := backupModeOnline
-	if engine.ShouldDrainForBackup() {
+	if engine.ShouldDrainForBackup(req) {
 		backupMode = backupModeOffline
 	}
-	if err := agent.beginBackup(backupMode); err != nil {
+	if err := tm.beginBackup(backupMode); err != nil {
 		return err
 	}
-	defer agent.endBackup(backupMode)
+	defer tm.endBackup(backupMode)
 
 	var originalType topodatapb.TabletType
-	if engine.ShouldDrainForBackup() {
-		if err := agent.lock(ctx); err != nil {
+	if engine.ShouldDrainForBackup(req) {
+		if err := tm.lock(ctx); err != nil {
 			return err
 		}
-		defer agent.unlock()
-		tablet, err := agent.TopoServer.GetTablet(ctx, agent.TabletAlias)
+		defer tm.unlock()
+
+		tablet, err := tm.TopoServer.GetTablet(ctx, tm.tabletAlias)
 		if err != nil {
 			return err
 		}
 		originalType = tablet.Type
-		// update our type to BACKUP
-		if _, err := topotools.ChangeType(ctx, agent.TopoServer, tablet.Alias, topodatapb.TabletType_BACKUP, nil); err != nil {
+		// Update our type to `BACKUP`.
+		if err := tm.changeTypeLocked(ctx, topodatapb.TabletType_BACKUP, DBActionNone, SemiSyncActionUnset); err != nil {
 			return err
 		}
 
-		// let's update our internal state (stop query service and other things)
-		if err := agent.refreshTablet(ctx, "before backup"); err != nil {
-			return err
-		}
-	}
-	// create the loggers: tee to console and source
-	l := logutil.NewTeeLogger(logutil.NewConsoleLogger(), logger)
-
-	// now we can run the backup
-	backupParams := mysqlctl.BackupParams{
-		Cnf:          agent.Cnf,
-		Mysqld:       agent.MysqlDaemon,
-		Logger:       l,
-		Concurrency:  concurrency,
-		HookExtraEnv: agent.hookExtraEnv(),
-		TopoServer:   agent.TopoServer,
-		Keyspace:     tablet.Keyspace,
-		Shard:        tablet.Shard,
-		TabletAlias:  topoproto.TabletAliasString(tablet.Alias),
-		BackupTime:   time.Now(),
-	}
-
-	returnErr := mysqlctl.Backup(ctx, backupParams)
-
-	if engine.ShouldDrainForBackup() {
-		bgCtx := context.Background()
-		// Starting from here we won't be able to recover if we get stopped by a cancelled
-		// context. It is also possible that the context already timed out during the
-		// above call to Backup. Thus we use the background context to get through to the finish.
-
-		// Change our type back to the original value.
-		// Original type could be master so pass in a real value for masterTermStartTime
-		_, err = topotools.ChangeType(bgCtx, agent.TopoServer, tablet.Alias, originalType, tablet.Tablet.MasterTermStartTime)
-		if err != nil {
-			// failure in changing the topology type is probably worse,
-			// so returning that (we logged the snapshot error anyway)
-			if returnErr != nil {
-				l.Errorf("mysql backup command returned error: %v", returnErr)
+		// Adding defer to original value in case of any failures.
+		defer func() {
+			bgCtx := context.Background()
+			// Change our type back to the original value.
+			// Original type could be primary so pass in a real value for PrimaryTermStartTime
+			if err := tm.changeTypeLocked(bgCtx, originalType, DBActionNone, SemiSyncActionNone); err != nil {
+				l.Errorf("Failed to change tablet type from %v to %v, error: %v", topodatapb.TabletType_BACKUP, originalType, err)
+				return
 			}
-			returnErr = err
-		}
 
-		// let's update our internal state (start query service and other things)
-		if err := agent.refreshTablet(bgCtx, "after backup"); err != nil {
-			return err
-		}
-		// and re-run health check to be sure to capture any replication delay
-		// not needed for online backups because it will continue to run per schedule
-		agent.runHealthCheckLocked()
+			// Find the correct primary tablet and set the replication source,
+			// since the primary could have changed while we executed the backup which can
+			// also affect whether we want to send semi sync acks or not.
+			tabletInfo, err := tm.TopoServer.GetTablet(bgCtx, tablet.Alias)
+			if err != nil {
+				l.Errorf("Failed to fetch updated tablet info, error: %v", err)
+				return
+			}
+
+			// Do not do anything for primary tablets or when active reparenting is disabled
+			if mysqlctl.DisableActiveReparents || tabletInfo.Type == topodatapb.TabletType_PRIMARY {
+				return
+			}
+
+			shardPrimary, err := topotools.GetShardPrimaryForTablet(bgCtx, tm.TopoServer, tablet.Tablet)
+			if err != nil {
+				return
+			}
+
+			durabilityName, err := tm.TopoServer.GetKeyspaceDurability(bgCtx, tablet.Keyspace)
+			if err != nil {
+				l.Errorf("Failed to get durability policy, error: %v", err)
+				return
+			}
+			durability, err := policy.GetDurabilityPolicy(durabilityName)
+			if err != nil {
+				l.Errorf("Failed to get durability with name %v, error: %v", durabilityName, err)
+			}
+
+			isSemiSync := policy.IsReplicaSemiSync(durability, shardPrimary.Tablet, tabletInfo.Tablet)
+			semiSyncAction, err := tm.convertBoolToSemiSyncAction(bgCtx, isSemiSync)
+			if err != nil {
+				l.Errorf("Failed to convert bool to semisync action, error: %v", err)
+				return
+			}
+			if err := tm.setReplicationSourceLocked(bgCtx, shardPrimary.Alias, 0, "", false, semiSyncAction, 0); err != nil {
+				l.Errorf("Failed to set replication source, error: %v", err)
+			}
+		}()
 	}
+
+	// Now we can run the backup.
+	backupParams.BackupTime = time.Now()
+	returnErr := mysqlctl.Backup(ctx, backupParams)
 
 	return returnErr
 }
 
-// RestoreFromBackup deletes all local data and restores anew from the latest backup.
-func (agent *ActionAgent) RestoreFromBackup(ctx context.Context, logger logutil.Logger) error {
-	if err := agent.lock(ctx); err != nil {
+// RestoreFromBackup deletes all local data and then restores the data from the latest backup [at
+// or before the backupTime value if specified]
+func (tm *TabletManager) RestoreFromBackup(ctx context.Context, logger logutil.Logger, request *tabletmanagerdatapb.RestoreFromBackupRequest) error {
+	if err := tm.lock(ctx); err != nil {
 		return err
 	}
-	defer agent.unlock()
+	defer tm.unlock()
 
-	tablet, err := agent.TopoServer.GetTablet(ctx, agent.TabletAlias)
+	tablet, err := tm.TopoServer.GetTablet(ctx, tm.tabletAlias)
 	if err != nil {
 		return err
 	}
-	if tablet.Type == topodatapb.TabletType_MASTER {
-		return fmt.Errorf("type MASTER cannot restore from backup, if you really need to do this, restart vttablet in replica mode")
+	if tablet.Type == topodatapb.TabletType_PRIMARY {
+		return errors.New("type PRIMARY cannot restore from backup, if you really need to do this, restart vttablet in replica mode")
 	}
 
-	// create the loggers: tee to console and source
+	// Create the logger: tee to console and source.
 	l := logutil.NewTeeLogger(logutil.NewConsoleLogger(), logger)
 
-	// now we can run restore
-	err = agent.restoreDataLocked(ctx, l, 0 /* waitForBackupInterval */, true /* deleteBeforeRestore */)
+	// Now we can run restore.
+	err = tm.restoreBackupLocked(ctx, l, 0 /* waitForBackupInterval */, true /* deleteBeforeRestore */, request, mysqlShutdownTimeout)
 
-	// re-run health check to be sure to capture any replication delay
-	agent.runHealthCheckLocked()
+	// Re-run health check to be sure to capture any replication delay.
+	tm.QueryServiceControl.BroadcastHealth()
 
 	return err
 }
 
-func (agent *ActionAgent) beginBackup(backupMode string) error {
-	agent.mutex.Lock()
-	defer agent.mutex.Unlock()
-	if agent._isBackupRunning {
-		return fmt.Errorf("a backup is already running on tablet: %v", agent.TabletAlias)
+func (tm *TabletManager) IsBackupRunning() bool {
+	return tm._isBackupRunning
+}
+
+func (tm *TabletManager) beginBackup(backupMode string) error {
+	tm.mutex.Lock()
+	defer tm.mutex.Unlock()
+	if tm._isBackupRunning {
+		return fmt.Errorf("a backup is already running on tablet: %v", tm.tabletAlias)
 	}
-	// when mode is online we don't take the action lock, so we continue to serve,
-	// but let's set _isBackupRunning to true
-	// so that we only allow one online backup at a time
-	// offline backups also run only one at a time because we take the action lock
+	// When mode is online we don't take the action lock, so we continue to serve,
+	// but let's set _isBackupRunning to true.
+	// So that we only allow one online backup at a time.
+	// Offline backups also run only one at a time because we take the action lock
 	// so this is not really needed in that case, however we are using it to record the state
-	agent._isBackupRunning = true
-	if agent.exportStats {
-		agent.statsBackupIsRunning.Set([]string{backupMode}, 1)
-	}
+	tm._isBackupRunning = true
+	statsBackupIsRunning.Set([]string{backupMode}, 1)
 	return nil
 }
 
-func (agent *ActionAgent) endBackup(backupMode string) {
-	// now we set _isBackupRunning back to false
-	// have to take the mutex lock before writing to _ fields
-	agent.mutex.Lock()
-	defer agent.mutex.Unlock()
-	agent._isBackupRunning = false
-	if agent.exportStats {
-		agent.statsBackupIsRunning.Set([]string{backupMode}, 0)
+func (tm *TabletManager) endBackup(backupMode string) {
+	// Now we set _isBackupRunning back to false.
+	// Have to take the mutex lock before writing to _ fields.
+	tm.mutex.Lock()
+	defer tm.mutex.Unlock()
+	tm._isBackupRunning = false
+	statsBackupIsRunning.Set([]string{backupMode}, 0)
+}
+
+func shutdownTimeout(l logutil.Logger, tm *vttime.Duration) time.Duration {
+	timeout, ok, err := protoutil.DurationFromProto(tm)
+	if err != nil {
+		l.Errorf("failed to parse mysql shutdown timeout, falling back to default: %v", err)
+		return mysqlShutdownTimeout
 	}
+	if !ok {
+		// Nothing configured, fallback to default
+		return mysqlShutdownTimeout
+	}
+	return timeout
 }

@@ -17,9 +17,10 @@ limitations under the License.
 package vtgateconn
 
 import (
+	"context"
 	"testing"
 
-	"golang.org/x/net/context"
+	"github.com/stretchr/testify/require"
 )
 
 func TestRegisterDialer(t *testing.T) {
@@ -43,4 +44,53 @@ func TestGetDialerWithProtocol(t *testing.T) {
 	if err != nil || c == nil {
 		t.Fatalf("dialerFunc has been registered, should not get nil: %v %v", err, c)
 	}
+}
+
+func TestDeregisterDialer(t *testing.T) {
+	const protocol = "test3"
+
+	RegisterDialer(protocol, func(context.Context, string) (Impl, error) {
+		return nil, nil
+	})
+
+	DeregisterDialer(protocol)
+
+	_, err := DialProtocol(context.Background(), protocol, "")
+	if err == nil || err.Error() != "no dialer registered for VTGate protocol "+protocol {
+		t.Fatalf("protocol: %s is not registered, should return error: %v", protocol, err)
+	}
+}
+
+func TestDialCustom(t *testing.T) {
+	const protocol = "test4"
+	var dialer string
+
+	defaultDialerFunc := func(context.Context, string) (Impl, error) {
+		dialer = "default"
+		return nil, nil
+	}
+
+	customDialerFunc := func(context.Context, string) (Impl, error) {
+		dialer = "custom"
+		return nil, nil
+	}
+
+	customDialerFunc2 := func(context.Context, string) (Impl, error) {
+		dialer = "custom2"
+		return nil, nil
+	}
+
+	RegisterDialer(protocol, defaultDialerFunc)
+
+	_, err := DialProtocol(context.Background(), protocol, "")
+	require.NoError(t, err)
+	require.Equal(t, "default", dialer)
+
+	_, err = DialCustom(context.Background(), customDialerFunc, protocol)
+	require.NoError(t, err)
+	require.Equal(t, "custom", dialer)
+
+	_, err = DialCustom(context.Background(), customDialerFunc2, protocol)
+	require.NoError(t, err)
+	require.Equal(t, "custom2", dialer)
 }

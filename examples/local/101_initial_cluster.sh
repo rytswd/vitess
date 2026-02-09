@@ -1,13 +1,13 @@
 #!/bin/bash
 
 # Copyright 2019 The Vitess Authors.
-# 
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-# 
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-# 
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -17,39 +17,77 @@
 # this script brings up zookeeper and all the vitess components
 # required for a single shard deployment.
 
-set -e
+source ../common/env.sh
 
-# shellcheck disable=SC2128
-script_root=$(dirname "${BASH_SOURCE}")
-
-if [[ $EUID -eq 0 ]]; then
-   echo "This script refuses to be run as root. Please switch to a regular user."
-   exit 1
-fi
+# This is done here as a means to support testing the experimental
+# custom sidecar database name work in a wide variety of scenarios
+# as the local examples are used to test many features locally.
+# This is NOT here to indicate that you should normally use a
+# non-default (_vt) value or that it is somehow a best practice
+# to do so. In production, you should ONLY use a non-default
+# sidecar database name when it's truly needed.
+SIDECAR_DB_NAME=${SIDECAR_DB_NAME:-"_vt"}
 
 # start topo server
 if [ "${TOPO}" = "zk2" ]; then
-    CELL=zone1 "$script_root/zk-up.sh"
+	CELL=zone1 ../common/scripts/zk-up.sh
+elif [ "${TOPO}" = "consul" ]; then
+	CELL=zone1 ../common/scripts/consul-up.sh
 else
-    CELL=zone1 "$script_root/etcd-up.sh"
+	CELL=zone1 ../common/scripts/etcd-up.sh
 fi
 
 # start vtctld
-CELL=zone1 "$script_root/vtctld-up.sh"
+CELL=zone1 ../common/scripts/vtctld-up.sh
+
+if vtctldclient GetKeyspace commerce > /dev/null 2>&1 ; then
+	# Keyspace already exists: we could be running this 101 example on an non-empty VTDATAROOT
+	vtctldclient SetKeyspaceDurabilityPolicy --durability-policy=semi_sync commerce || fail "Failed to set keyspace durability policy on the commerce keyspace"
+else
+	# Create the keyspace with the sidecar database name and set the
+	# correct durability policy. Please see the comment above for
+	# more context on using a custom sidecar database name in your
+	# Vitess clusters.
+	vtctldclient CreateKeyspace --sidecar-db-name="${SIDECAR_DB_NAME}" --durability-policy=semi_sync commerce || fail "Failed to create and configure the commerce keyspace"
+fi
+
+# start mysqlctls for keyspace commerce
+# because MySQL takes time to start, we do this in parallel
+for i in 100 101 102; do
+	CELL=zone1 TABLET_UID=$i ../common/scripts/mysqlctl-up.sh &
+done
+
+# without a sleep, we can have below echo happen before the echo of mysqlctl-up.sh
+sleep 2
+echo "Waiting for mysqlctls to start..."
+wait
+echo "mysqlctls are running!"
 
 # start vttablets for keyspace commerce
-CELL=zone1 KEYSPACE=commerce UID_BASE=100 "$script_root/vttablet-up.sh"
+for i in 100 101 102; do
+	CELL=zone1 KEYSPACE=commerce TABLET_UID=$i ../common/scripts/vttablet-up.sh
+done
 
-# set one of the replicas to master
-./lvtctl.sh InitShardMaster -force commerce/0 zone1-100
+# start vtorc
+CELL=zone1 ../common/scripts/vtorc-up.sh
+
+# Wait for all the tablets to be up and registered in the topology server
+# and for a primary tablet to be elected in the shard and become healthy/serving.
+wait_for_healthy_shard commerce 0 || exit 1
 
 # create the schema
-./lvtctl.sh ApplySchema -sql-file create_commerce_schema.sql commerce
+vtctldclient ApplySchema --sql-file create_commerce_schema.sql commerce || fail "Failed to apply schema for the commerce keyspace"
 
 # create the vschema
-./lvtctl.sh ApplyVSchema -vschema_file vschema_commerce_initial.json commerce
+vtctldclient ApplyVSchema --vschema-file vschema_commerce_initial.json commerce || fail "Failed to apply vschema for the commerce keyspace"
 
 # start vtgate
-CELL=zone1 "$script_root/vtgate-up.sh"
+CELL=zone1 ../common/scripts/vtgate-up.sh
 
-disown -a
+# start vtadmin
+if [[ -n ${SKIP_VTADMIN} ]]; then
+	echo -e "\nSkipping VTAdmin! If this is not what you want then please unset the SKIP_VTADMIN env variable in your shell."
+else
+	../common/scripts/vtadmin-up.sh
+fi
+

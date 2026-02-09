@@ -19,8 +19,7 @@ package topotests
 import (
 	"testing"
 
-	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
+	"google.golang.org/protobuf/proto"
 
 	"vitess.io/vitess/go/vt/topo/memorytopo"
 
@@ -34,8 +33,9 @@ func TestCreateTablet(t *testing.T) {
 	cell := "cell1"
 	keyspace := "ks1"
 	shard := "shard1"
-	ctx := context.Background()
-	ts := memorytopo.NewServer(cell)
+	ctx := t.Context()
+	ts := memorytopo.NewServer(ctx, cell)
+	defer ts.Close()
 
 	// Create a tablet.
 	alias := &topodatapb.TabletAlias{

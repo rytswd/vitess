@@ -18,21 +18,29 @@ limitations under the License.
 package filelogger
 
 import (
-	"flag"
+	"github.com/spf13/pflag"
 
 	"vitess.io/vitess/go/streamlog"
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/servenv"
+	"vitess.io/vitess/go/vt/utils"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
 )
 
-// logQueriesToFile is the vttablet startup flag that must be set for this plugin to be active.
-var logQueriesToFile = flag.String("log_queries_to_file", "", "Enable query logging to the specified file")
+var logQueriesToFile string
+
+func registerFlags(fs *pflag.FlagSet) {
+	// logQueriesToFile is the vttablet startup flag that must be set for this plugin to be active.
+	utils.SetFlagStringVar(fs, &logQueriesToFile, "log-queries-to-file", logQueriesToFile, "Enable query logging to the specified file")
+}
 
 func init() {
+	servenv.OnParseFor("vtcombo", registerFlags)
+	servenv.OnParseFor("vttablet", registerFlags)
+
 	servenv.OnRun(func() {
-		if *logQueriesToFile != "" {
-			Init(*logQueriesToFile)
+		if logQueriesToFile != "" {
+			Init(logQueriesToFile)
 		}
 	})
 }
@@ -44,7 +52,7 @@ type FileLogger interface {
 }
 
 type fileLogger struct {
-	logChan chan interface{}
+	logChan chan *tabletenv.LogStats
 }
 
 func (l *fileLogger) Stop() {
@@ -53,7 +61,7 @@ func (l *fileLogger) Stop() {
 
 // Init starts logging to the given file path.
 func Init(path string) (FileLogger, error) {
-	log.Info("Logging queries to file %s", path)
+	log.Infof("Logging queries to file %s", path)
 	logChan, err := tabletenv.StatsLogger.LogToFile(path, streamlog.GetFormatter(tabletenv.StatsLogger))
 	if err != nil {
 		return nil, err

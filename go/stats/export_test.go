@@ -18,16 +18,24 @@ package stats
 
 import (
 	"expvar"
+	"reflect"
+	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
-func clear() {
+func clearStats() {
 	defaultVarGroup.vars = make(map[string]expvar.Var)
 	defaultVarGroup.newVarHook = nil
+	combineDimensions = ""
+	dropVariables = ""
+	combinedDimensions = nil
+	droppedVars = nil
 }
 
 func TestNoHook(t *testing.T) {
-	clear()
+	clearStats()
 	v := NewCounter("plainint", "help")
 	v.Add(1)
 	if v.String() != "1" {
@@ -38,7 +46,7 @@ func TestNoHook(t *testing.T) {
 func TestString(t *testing.T) {
 	var gotname string
 	var gotv *String
-	clear()
+	clearStats()
 	Register(func(name string, v expvar.Var) {
 		gotname = name
 		gotv = v.(*String)
@@ -75,7 +83,7 @@ func (m *Mystr) String() string {
 func TestPublish(t *testing.T) {
 	var gotname string
 	var gotv expvar.Var
-	clear()
+	clearStats()
 	Register(func(name string, v expvar.Var) {
 		gotname = name
 		gotv = v.(*Mystr)
@@ -103,7 +111,7 @@ func (f expvarFunc) String() string {
 func TestPublishFunc(t *testing.T) {
 	var gotname string
 	var gotv expvarFunc
-	clear()
+	clearStats()
 	Register(func(name string, v expvar.Var) {
 		gotname = name
 		gotv = v.(expvarFunc)
@@ -115,4 +123,141 @@ func TestPublishFunc(t *testing.T) {
 	if gotv.String() != f() {
 		t.Errorf("want %v, got %#v", f(), gotv())
 	}
+}
+
+func TestDropVariable(t *testing.T) {
+	clearStats()
+	dropVariables = "dropTest"
+
+	// This should not panic.
+	_ = NewGaugesWithSingleLabel("dropTest", "help", "label")
+	_ = NewGaugesWithSingleLabel("dropTest", "help", "label")
+}
+
+func TestStringMapToString(t *testing.T) {
+	expected1 := "{\"aaa\": \"111\", \"bbb\": \"222\"}"
+	expected2 := "{\"bbb\": \"222\", \"aaa\": \"111\"}"
+	got := stringMapToString(map[string]string{"aaa": "111", "bbb": "222"})
+
+	if got != expected1 && got != expected2 {
+		t.Errorf("expected %v or %v, got  %v", expected1, expected2, got)
+	}
+}
+
+func TestParseCommonTags(t *testing.T) {
+	res := ParseCommonTags([]string{""})
+	if len(res) != 0 {
+		t.Errorf("expected empty result, got %v", res)
+	}
+	res = ParseCommonTags([]string{"s", "a:b"})
+	expected1 := map[string]string{"a": "b"}
+	if !reflect.DeepEqual(expected1, res) {
+		t.Errorf("expected %v, got %v", expected1, res)
+	}
+	res = ParseCommonTags([]string{"a:b", "c:d"})
+	expected2 := map[string]string{"a": "b", "c": "d"}
+	if !reflect.DeepEqual(expected2, res) {
+		t.Errorf("expected %v, got %v", expected2, res)
+	}
+}
+
+func TestStringMapWithMultiLabels(t *testing.T) {
+	clearStats()
+	c := NewStringMapFuncWithMultiLabels("stringMap1", "help", []string{"aaa", "bbb"}, "ccc", func() map[string]string {
+		m := make(map[string]string)
+		m["c1a.c1b"] = "1"
+		m["c2a.c2b"] = "1"
+		return m
+	})
+
+	want1 := `{"c1a.c1b": "1", "c2a.c2b": "1"}`
+	want2 := `{"c2a.c2b": "1", "c1a.c1b": "1"}`
+	if s := c.String(); s != want1 && s != want2 {
+		t.Errorf("want %s or %s, got %s", want1, want2, s)
+	}
+
+	m := c.StringMapFunc()
+	require.Len(t, m, 2)
+	require.Contains(t, m, "c1a.c1b")
+	require.Equal(t, m["c1a.c1b"], "1")
+	require.Contains(t, m, "c2a.c2b")
+	require.Equal(t, m["c2a.c2b"], "1")
+
+	keyLabels := c.KeyLabels()
+	require.Len(t, keyLabels, 2)
+	require.Equal(t, keyLabels[0], "aaa")
+	require.Equal(t, keyLabels[1], "bbb")
+
+	require.Equal(t, c.ValueLabel(), "ccc")
+}
+
+func TestSafeJoinLabels(t *testing.T) {
+	cases := []struct {
+		labels   []string
+		combined []bool
+		want     string
+	}{
+		{
+			labels: []string{},
+			want:   "",
+		},
+		{
+			labels: []string{"foo"},
+			want:   "foo",
+		},
+		{
+			labels: []string{"foo.bar"},
+			want:   "foo_bar",
+		},
+		{
+			labels:   []string{"foo"},
+			combined: []bool{true},
+			want:     "all",
+		},
+		{
+			labels: []string{"foo", "bar"},
+			want:   "foo.bar",
+		},
+		{
+			labels:   []string{"foo", "bar"},
+			combined: []bool{true, false},
+			want:     "all.bar",
+		},
+		{
+			labels:   []string{"foo", "bar"},
+			combined: []bool{true, true},
+			want:     "all.all",
+		},
+		{
+			labels:   []string{"foo", "bar"},
+			combined: []bool{false, true},
+			want:     "foo.all",
+		},
+		{
+			labels: []string{"foo.bar", "bar.baz"},
+			want:   "foo_bar.bar_baz",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(strings.Join(tc.labels, ","), func(t *testing.T) {
+			require.Equal(t, tc.want, safeJoinLabels(tc.labels, tc.combined))
+		})
+	}
+}
+
+func BenchmarkSafeJoinLabels(b *testing.B) {
+	labels := [5]string{"foo:bar", "foo.bar", "c1a", "testing", "testing.a.b"}
+	combined := [5]bool{true, true, true, true, true}
+	b.Run("no combined", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_ = safeJoinLabels(labels[:], nil)
+		}
+	})
+	b.Run("combined", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_ = safeJoinLabels(labels[:], combined[:])
+		}
+	})
 }

@@ -4,6 +4,12 @@ create table t1 (
 	floatval float not null default 0,
 	primary key (id)
 );
+create table t2 (
+	id bigint(20) unsigned not null,
+	t1_id bigint(20) unsigned not null default 0,
+	c2 bigint(20) null,
+	primary key (id)
+);
 
 create table user (
 	id bigint,
@@ -60,10 +66,72 @@ create table test_partitioned (
 	date_create int,
 	primary key(id)
 ) Engine=InnoDB
-/*!50100 PARTITION BY RANGE (date_create)
-(PARTITION p2018_06_14 VALUES LESS THAN (1528959600) ENGINE = InnoDB,
- PARTITION p2018_06_15 VALUES LESS THAN (1529046000) ENGINE = InnoDB,
- PARTITION p2018_06_16 VALUES LESS THAN (1529132400) ENGINE = InnoDB,
- PARTITION p2018_06_17 VALUES LESS THAN (1529218800) ENGINE = InnoDB)
-*/
 ;
+
+create table customer (
+  id bigint,
+  email varchar(64),
+  primary key (id)
+) Engine=InnoDB;
+
+create table email_customer_map (
+   email varchar(64),
+   user_id bigint,
+   primary key (email, user_id)
+) Engine=InnoDB;
+
+create table user_region (
+   regionId bigint,
+   userId bigint,
+   name varchar(64),
+   email varchar(64),
+   primary key (regionId,userId)
+) Engine=InnoDB;
+
+create table member (
+    id bigint,
+    lkp binary(16) NOT NULL,
+    more_id int not null,
+    primary key (id)
+) Engine=InnoDB;
+
+create table lkp_idx (
+    lkp binary(16) NOT NULL,
+    id bigint,
+    primary key (lkp)
+) Engine=InnoDB;
+
+CREATE TABLE orders (
+  id bigint,
+	customer_id bigint
+);
+
+CREATE TABLE orders_id_lookup (
+  id int NOT NULL,
+  keyspace_id varbinary(128),
+  primary key(id)
+);
+
+CREATE TABLE orders_id_lookup_exclusive_read_lock (
+  id int NOT NULL,
+  keyspace_id varbinary(128),
+  primary key(id)
+);
+
+CREATE TABLE orders_id_lookup_shared_read_lock (
+  id int NOT NULL,
+  keyspace_id varbinary(128),
+  primary key(id)
+);
+
+CREATE TABLE orders_id_lookup_no_read_lock (
+  id int NOT NULL,
+  keyspace_id varbinary(128),
+  primary key(id)
+);
+
+CREATE TABLE orders_id_lookup_no_verify (
+  id int NOT NULL,
+  keyspace_id varbinary(128),
+  primary key(id)
+);

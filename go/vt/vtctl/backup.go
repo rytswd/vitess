@@ -17,80 +17,115 @@ limitations under the License.
 package vtctl
 
 import (
+	"context"
 	"errors"
-	"flag"
 	"fmt"
-	"io"
+	"time"
 
-	"golang.org/x/net/context"
+	"github.com/spf13/pflag"
+	"google.golang.org/grpc"
+
+	"vitess.io/vitess/go/protoutil"
 	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/vt/mysqlctl"
 	"vitess.io/vitess/go/vt/mysqlctl/backupstorage"
-	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	"vitess.io/vitess/go/vt/topo/topoproto"
+	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/wrangler"
+
+	vtctldatapb "vitess.io/vitess/go/vt/proto/vtctldata"
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 )
 
 func init() {
 	addCommand("Shards", command{
-		"ListBackups",
-		commandListBackups,
-		"<keyspace/shard>",
-		"Lists all the backups for a shard."})
+		name:   "ListBackups",
+		method: commandListBackups,
+		params: "<keyspace/shard>",
+		help:   "Lists all the backups for a shard.",
+	})
 	addCommand("Shards", command{
-		"BackupShard",
-		commandBackupShard,
-		"[-allow_master=false] <keyspace/shard>",
-		"Chooses a tablet and creates a backup for a shard."})
+		name:   "BackupShard",
+		method: commandBackupShard,
+		params: "[--allow_primary=false] <keyspace/shard>",
+		help:   "Chooses a tablet and creates a backup for a shard.",
+	})
 	addCommand("Shards", command{
-		"RemoveBackup",
-		commandRemoveBackup,
-		"<keyspace/shard> <backup name>",
-		"Removes a backup for the BackupStorage."})
-
+		name:   "RemoveBackup",
+		method: commandRemoveBackup,
+		params: "<keyspace/shard> <backup name>",
+		help:   "Removes a backup for the BackupStorage.",
+	})
 	addCommand("Tablets", command{
-		"Backup",
-		commandBackup,
-		"[-concurrency=4] [-allow_master=false] <tablet alias>",
-		"Stops mysqld and uses the BackupStorage service to store a new backup. This function also remembers if the tablet was replicating so that it can restore the same state after the backup completes."})
+		name:   "Backup",
+		method: commandBackup,
+		params: "[--concurrency=4] [--allow_primary=false] [--incremental_from_pos=<pos>] <tablet alias>",
+		help:   "Run a full or an incremental backup. Uses the BackupStorage service to store a new backup. With full backup, stops mysqld, takes the backup, starts mysqld and resumes replication. With incremental backup (indicated by '--incremental_from_pos', rotate and copy binary logs without disrupting the mysqld service).",
+	})
 	addCommand("Tablets", command{
-		"RestoreFromBackup",
-		commandRestoreFromBackup,
-		"<tablet alias>",
-		"Stops mysqld and restores the data from the latest backup."})
+		name:   "RestoreFromBackup",
+		method: commandRestoreFromBackup,
+		params: "[--backup_timestamp=yyyy-MM-dd.HHmmss] [--restore_to_pos=<pos>] [--dry_run] <tablet alias>",
+		help:   "Stops mysqld and restores the data from the latest backup or if a timestamp is specified then the most recent backup at or before that time. If '--restore_to_pos' is given, then a point in time restore based on one full backup followed by zero or more incremental backups. dry-run only validates restore steps without actually restoring data",
+	})
 }
 
-func commandBackup(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
-	concurrency := subFlags.Int("concurrency", 4, "Specifies the number of compression/checksum jobs to run simultaneously")
-	allowMaster := subFlags.Bool("allow_master", false, "Allows backups to be taken on master. Warning!! If you are using the builtin backup engine, this will shutdown your master mysql for as long as it takes to create a backup ")
+func commandBackup(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
+	concurrency := subFlags.Int32("concurrency", 4, "Specifies the number of compression/checksum jobs to run simultaneously")
+	allowPrimary := subFlags.Bool("allow_primary", false, "Allows backups to be taken on primary. Warning!! If you are using the builtin backup engine, this will shutdown your primary mysql for as long as it takes to create a backup.")
+	incrementalFromPos := subFlags.String("incremental_from_pos", "", "Position, or name of backup from which to create an incremental backup. Default: empty. If given, then this backup becomes an incremental backup from given position or given backup. If value is 'auto', this backup will be taken from the last successful backup position.")
+	upgradeSafe := subFlags.Bool("upgrade-safe", false, "Whether to use innodb_fast_shutdown=0 for the backup so it is safe to use for MySQL upgrades.")
+	mysqlShutdownTimeout := subFlags.Duration("mysql-shutdown-timeout", mysqlctl.DefaultShutdownTimeout, "Timeout to use when MySQL is being shut down.")
 
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
 	if subFlags.NArg() != 1 {
-		return fmt.Errorf("the Backup command requires the <tablet alias> argument")
+		return errors.New("the Backup command requires the <tablet alias> argument")
 	}
 
 	tabletAlias, err := topoproto.ParseTabletAlias(subFlags.Arg(0))
 	if err != nil {
 		return err
 	}
-	tabletInfo, err := wr.TopoServer().GetTablet(ctx, tabletAlias)
-	if err != nil {
-		return err
-	}
 
-	return execBackup(ctx, wr, tabletInfo.Tablet, *concurrency, *allowMaster)
+	return wr.VtctldServer().Backup(&vtctldatapb.BackupRequest{
+		TabletAlias:          tabletAlias,
+		Concurrency:          *concurrency,
+		AllowPrimary:         *allowPrimary,
+		IncrementalFromPos:   *incrementalFromPos,
+		UpgradeSafe:          *upgradeSafe,
+		MysqlShutdownTimeout: protoutil.DurationToProto(*mysqlShutdownTimeout),
+	}, &backupEventStreamLogger{logger: wr.Logger(), ctx: ctx})
 }
 
-func commandBackupShard(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
-	concurrency := subFlags.Int("concurrency", 4, "Specifies the number of compression/checksum jobs to run simultaneously")
-	allowMaster := subFlags.Bool("allow_master", false, "Whether to use master tablet for backup. Warning!! If you are using the builtin backup engine, this will shutdown your master mysql for as long as it takes to create a backup ")
+// backupEventStreamLogger takes backup events from the vtctldserver and emits
+// them via logutil.LogEvent, preserving legacy behavior.
+type backupEventStreamLogger struct {
+	grpc.ServerStream
+	logger logutil.Logger
+	ctx    context.Context
+}
+
+func (b *backupEventStreamLogger) Context() context.Context { return b.ctx }
+
+func (b *backupEventStreamLogger) Send(resp *vtctldatapb.BackupResponse) error {
+	logutil.LogEvent(b.logger, resp.Event)
+	return nil
+}
+
+func commandBackupShard(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
+	concurrency := subFlags.Int32("concurrency", 4, "Specifies the number of compression/checksum jobs to run simultaneously")
+	allowPrimary := subFlags.Bool("allow_primary", false, "Whether to use primary tablet for backup. Warning!! If you are using the builtin backup engine, this will shutdown your primary mysql for as long as it takes to create a backup.")
+	incrementalFromPos := subFlags.String("incremental_from_pos", "", "Position, or name of backup from which to create an incremental backup. Default: empty. If given, then this backup becomes an incremental backup from given position or given backup. If value is 'auto', this backup will be taken from the last successful backup position.")
+	upgradeSafe := subFlags.Bool("upgrade-safe", false, "Whether to use innodb_fast_shutdown=0 for the backup so it is safe to use for MySQL upgrades.")
+	mysqlShutdownTimeout := subFlags.Duration("mysql-shutdown-timeout", mysqlctl.DefaultShutdownTimeout, "Timeout to use when MySQL is being shut down.")
 
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
 	if subFlags.NArg() != 1 {
-		return fmt.Errorf("action BackupShard requires <keyspace/shard>")
+		return errors.New("action BackupShard requires <keyspace/shard>")
 	}
 
 	keyspace, shard, err := topoproto.ParseKeyspaceShard(subFlags.Arg(0))
@@ -98,82 +133,23 @@ func commandBackupShard(ctx context.Context, wr *wrangler.Wrangler, subFlags *fl
 		return err
 	}
 
-	tablets, stats, err := wr.ShardReplicationStatuses(ctx, keyspace, shard)
-	if tablets == nil {
-		return err
-	}
-
-	var tabletForBackup *topodatapb.Tablet
-	var secondsBehind uint32
-
-	for i := range tablets {
-		// find a replica, rdonly or spare tablet type to run the backup on
-		switch tablets[i].Type {
-		case topodatapb.TabletType_REPLICA, topodatapb.TabletType_RDONLY, topodatapb.TabletType_SPARE:
-		default:
-			continue
-		}
-		// choose the first tablet as the baseline
-		if tabletForBackup == nil {
-			tabletForBackup = tablets[i].Tablet
-			secondsBehind = stats[i].SecondsBehindMaster
-			continue
-		}
-
-		// choose a new tablet if it is more up to date
-		if stats[i].SecondsBehindMaster < secondsBehind {
-			tabletForBackup = tablets[i].Tablet
-			secondsBehind = stats[i].SecondsBehindMaster
-		}
-	}
-
-	// if no other tablet is available and allowMaster is set to true
-	if tabletForBackup == nil && *allowMaster {
-	ChooseMaster:
-		for i := range tablets {
-			switch tablets[i].Type {
-			case topodatapb.TabletType_MASTER:
-				tabletForBackup = tablets[i].Tablet
-				secondsBehind = 0
-				break ChooseMaster
-			default:
-				continue
-			}
-		}
-	}
-
-	if tabletForBackup == nil {
-		return errors.New("no tablet available for backup")
-	}
-
-	return execBackup(ctx, wr, tabletForBackup, *concurrency, *allowMaster)
+	return wr.VtctldServer().BackupShard(&vtctldatapb.BackupShardRequest{
+		Keyspace:             keyspace,
+		Shard:                shard,
+		Concurrency:          *concurrency,
+		AllowPrimary:         *allowPrimary,
+		IncrementalFromPos:   *incrementalFromPos,
+		UpgradeSafe:          *upgradeSafe,
+		MysqlShutdownTimeout: protoutil.DurationToProto(*mysqlShutdownTimeout),
+	}, &backupEventStreamLogger{logger: wr.Logger(), ctx: ctx})
 }
 
-// execBackup is shared by Backup and BackupShard
-func execBackup(ctx context.Context, wr *wrangler.Wrangler, tablet *topodatapb.Tablet, concurrency int, allowMaster bool) error {
-	stream, err := wr.TabletManagerClient().Backup(ctx, tablet, concurrency, allowMaster)
-	if err != nil {
-		return err
-	}
-	for {
-		e, err := stream.Recv()
-		switch err {
-		case nil:
-			logutil.LogEvent(wr.Logger(), e)
-		case io.EOF:
-			return nil
-		default:
-			return err
-		}
-	}
-}
-
-func commandListBackups(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandListBackups(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
 	if subFlags.NArg() != 1 {
-		return fmt.Errorf("action ListBackups requires <keyspace/shard>")
+		return errors.New("action ListBackups requires <keyspace/shard>")
 	}
 
 	keyspace, shard, err := topoproto.ParseKeyspaceShard(subFlags.Arg(0))
@@ -197,58 +173,90 @@ func commandListBackups(ctx context.Context, wr *wrangler.Wrangler, subFlags *fl
 	return nil
 }
 
-func commandRemoveBackup(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandRemoveBackup(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
 	if subFlags.NArg() != 2 {
-		return fmt.Errorf("action RemoveBackup requires <keyspace/shard> <backup name>")
+		return errors.New("action RemoveBackup requires <keyspace/shard> <backup name>")
 	}
 
 	keyspace, shard, err := topoproto.ParseKeyspaceShard(subFlags.Arg(0))
 	if err != nil {
 		return err
 	}
-	bucket := fmt.Sprintf("%v/%v", keyspace, shard)
 	name := subFlags.Arg(1)
 
-	bs, err := backupstorage.GetBackupStorage()
-	if err != nil {
-		return err
-	}
-	defer bs.Close()
-	return bs.RemoveBackup(ctx, bucket, name)
+	_, err = wr.VtctldServer().RemoveBackup(ctx, &vtctldatapb.RemoveBackupRequest{
+		Keyspace: keyspace,
+		Shard:    shard,
+		Name:     name,
+	})
+	return err
 }
 
-func commandRestoreFromBackup(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+// backupRestoreEventStreamLogger takes backup restore events from the
+// vtctldserver and emits them via logutil.LogEvent, preserving legacy behavior.
+type backupRestoreEventStreamLogger struct {
+	grpc.ServerStream
+	logger logutil.Logger
+	ctx    context.Context
+}
+
+func (b *backupRestoreEventStreamLogger) Context() context.Context { return b.ctx }
+
+func (b *backupRestoreEventStreamLogger) Send(resp *vtctldatapb.RestoreFromBackupResponse) error {
+	logutil.LogEvent(b.logger, resp.Event)
+	return nil
+}
+
+func commandRestoreFromBackup(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
+	backupTimestampStr := subFlags.String("backup_timestamp", "", "Use the backup taken at or before this timestamp rather than using the latest backup.")
+	restoreToPos := subFlags.String("restore_to_pos", "", "Run a point in time recovery that ends with the given position. This will attempt to use one full backup followed by zero or more incremental backups")
+	restoreToTimestampStr := subFlags.String("restore_to_timestamp", "", "Run a point in time recovery that restores up to, and excluding, given timestamp in RFC3339 format (`2006-01-02T15:04:05Z07:00`). This will attempt to use one full backup followed by zero or more incremental backups")
+
+	dryRun := subFlags.Bool("dry_run", false, "Only validate restore steps, do not actually restore data")
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
 	if subFlags.NArg() != 1 {
-		return fmt.Errorf("the RestoreFromBackup command requires the <tablet alias> argument")
+		return errors.New("the RestoreFromBackup command requires the <tablet alias> argument")
+	}
+
+	// Zero date will cause us to use the latest, which is the default
+	backupTime := time.Time{}
+
+	// Or if a backup timestamp was specified then we use the last backup taken at or before that time
+	if *backupTimestampStr != "" {
+		var err error
+		backupTime, err = time.Parse(mysqlctl.BackupTimestampFormat, *backupTimestampStr)
+		if err != nil {
+			return vterrors.New(vtrpcpb.Code_INVALID_ARGUMENT, fmt.Sprintf("unable to parse the backup timestamp value provided of '%s'", *backupTimestampStr))
+		}
 	}
 
 	tabletAlias, err := topoproto.ParseTabletAlias(subFlags.Arg(0))
 	if err != nil {
 		return err
 	}
-	tabletInfo, err := wr.TopoServer().GetTablet(ctx, tabletAlias)
-	if err != nil {
-		return err
-	}
-	stream, err := wr.TabletManagerClient().RestoreFromBackup(ctx, tabletInfo.Tablet)
-	if err != nil {
-		return err
-	}
-	for {
-		e, err := stream.Recv()
-		switch err {
-		case nil:
-			logutil.LogEvent(wr.Logger(), e)
-		case io.EOF:
-			return nil
-		default:
-			return err
+
+	var restoreToTimestamp time.Time
+	if *restoreToTimestampStr != "" {
+		restoreToTimestamp, err = mysqlctl.ParseRFC3339(*restoreToTimestampStr)
+		if err != nil {
+			return vterrors.Wrapf(err, "parsing --restore_to_timestamp args")
 		}
 	}
+	req := &vtctldatapb.RestoreFromBackupRequest{
+		TabletAlias:        tabletAlias,
+		RestoreToPos:       *restoreToPos,
+		RestoreToTimestamp: protoutil.TimeToProto(restoreToTimestamp),
+		DryRun:             *dryRun,
+	}
+
+	if !backupTime.IsZero() {
+		req.BackupTime = protoutil.TimeToProto(backupTime)
+	}
+
+	return wr.VtctldServer().RestoreFromBackup(req, &backupRestoreEventStreamLogger{logger: wr.Logger(), ctx: ctx})
 }

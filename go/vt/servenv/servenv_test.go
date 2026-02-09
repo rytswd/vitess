@@ -57,3 +57,15 @@ func TestFireOnTermSyncHooksTimeout(t *testing.T) {
 		t.Errorf("finished = %v, want %v", finished, want)
 	}
 }
+
+func TestFireOnCloseHooksTimeout(t *testing.T) {
+	onCloseHooks = event.Hooks{}
+
+	OnClose(func() {
+		time.Sleep(1 * time.Second)
+	})
+
+	if finished, want := fireOnCloseHooks(1*time.Nanosecond), false; finished != want {
+		t.Errorf("finished = %v, want %v", finished, want)
+	}
+}

@@ -18,16 +18,18 @@ package mysql
 
 import (
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
-func TestMariadbSetMasterCommands(t *testing.T) {
+func TestMariadbSetReplicationSourceCommand(t *testing.T) {
 	params := &ConnParams{
 		Uname: "username",
 		Pass:  "password",
 	}
-	masterHost := "localhost"
-	masterPort := 123
-	masterConnectRetry := 1234
+	host := "localhost"
+	port := int32(123)
+	connectRetry := 1234
 	want := `CHANGE MASTER TO
   MASTER_HOST = 'localhost',
   MASTER_PORT = 123,
@@ -36,14 +38,25 @@ func TestMariadbSetMasterCommands(t *testing.T) {
   MASTER_CONNECT_RETRY = 1234,
   MASTER_USE_GTID = current_pos`
 
-	conn := &Conn{flavor: mariadbFlavor{}}
-	got := conn.SetMasterCommand(params, masterHost, masterPort, masterConnectRetry)
-	if got != want {
-		t.Errorf("mariadbFlavor.SetMasterCommands(%#v, %#v, %#v, %#v) = %#v, want %#v", params, masterHost, masterPort, masterConnectRetry, got, want)
-	}
+	conn := &Conn{flavor: mariadbFlavor101{}}
+	got := conn.SetReplicationSourceCommand(params, host, port, 0, connectRetry)
+	assert.Equal(t, want, got, "mariadbFlavor.SetReplicationSourceCommand(%#v, %#v, %#v, %#v) = %#v, want %#v", params, host, port, connectRetry, got, want)
+
+	heartbeatInterval := 5.4
+	want = `CHANGE MASTER TO
+  MASTER_HOST = 'localhost',
+  MASTER_PORT = 123,
+  MASTER_USER = 'username',
+  MASTER_PASSWORD = 'password',
+  MASTER_CONNECT_RETRY = 1234,
+  MASTER_HEARTBEAT_PERIOD = 5.4,
+  MASTER_USE_GTID = current_pos`
+
+	got = conn.SetReplicationSourceCommand(params, host, port, heartbeatInterval, connectRetry)
+	assert.Equal(t, want, got, "mariadbFlavor.SetReplicationSourceCommand(%#v, %#v, %#v, %#v, %#v) = %#v, want %#v", params, host, port, heartbeatInterval, connectRetry, got, want)
 }
 
-func TestMariadbSetMasterCommandsSSL(t *testing.T) {
+func TestMariadbSetReplicationSourceCommandSSL(t *testing.T) {
 	params := &ConnParams{
 		Uname:     "username",
 		Pass:      "password",
@@ -53,9 +66,9 @@ func TestMariadbSetMasterCommandsSSL(t *testing.T) {
 		SslKey:    "ssl-key",
 	}
 	params.EnableSSL()
-	masterHost := "localhost"
-	masterPort := 123
-	masterConnectRetry := 1234
+	host := "localhost"
+	port := int32(123)
+	connectRetry := 1234
 	want := `CHANGE MASTER TO
   MASTER_HOST = 'localhost',
   MASTER_PORT = 123,
@@ -69,9 +82,7 @@ func TestMariadbSetMasterCommandsSSL(t *testing.T) {
   MASTER_SSL_KEY = 'ssl-key',
   MASTER_USE_GTID = current_pos`
 
-	conn := &Conn{flavor: mariadbFlavor{}}
-	got := conn.SetMasterCommand(params, masterHost, masterPort, masterConnectRetry)
-	if got != want {
-		t.Errorf("mariadbFlavor.SetMasterCommands(%#v, %#v, %#v, %#v) = %#v, want %#v", params, masterHost, masterPort, masterConnectRetry, got, want)
-	}
+	conn := &Conn{flavor: mariadbFlavor101{}}
+	got := conn.SetReplicationSourceCommand(params, host, port, 0, connectRetry)
+	assert.Equal(t, want, got, "mariadbFlavor.SetReplicationSourceCommand(%#v, %#v, %#v, %#v) = %#v, want %#v", params, host, port, connectRetry, got, want)
 }

@@ -17,8 +17,12 @@ limitations under the License.
 package engine
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/sqltypes"
 
@@ -66,7 +70,7 @@ func TestJoinExecute(t *testing.T) {
 
 	// Normal join
 	jn := &Join{
-		Opcode: NormalJoin,
+		Opcode: InnerJoin,
 		Left:   leftPrim,
 		Right:  rightPrim,
 		Cols:   []int{-1, -2, 1, 2},
@@ -74,19 +78,19 @@ func TestJoinExecute(t *testing.T) {
 			"bv": 1,
 		},
 	}
-	r, err := jn.Execute(noopVCursor{}, bv, true)
+	r, err := jn.TryExecute(context.Background(), &noopVCursor{}, bv, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	leftPrim.ExpectLog(t, []string{
-		`Execute a: type:INT64 value:"10"  true`,
+		fmt.Sprintf(`Execute %v true`, printBindVars(map[string]*querypb.BindVariable{"a": sqltypes.Int64BindVariable(10)})),
 	})
 	rightPrim.ExpectLog(t, []string{
-		`Execute a: type:INT64 value:"10" bv: type:VARCHAR value:"a"  true`,
-		`Execute a: type:INT64 value:"10" bv: type:VARCHAR value:"b"  false`,
-		`Execute a: type:INT64 value:"10" bv: type:VARCHAR value:"c"  false`,
+		fmt.Sprintf(`Execute %v true`, printBindVars(map[string]*querypb.BindVariable{"a": sqltypes.Int64BindVariable(10), "bv": sqltypes.StringBindVariable("a")})),
+		fmt.Sprintf(`Execute %v false`, printBindVars(map[string]*querypb.BindVariable{"a": sqltypes.Int64BindVariable(10), "bv": sqltypes.StringBindVariable("b")})),
+		fmt.Sprintf(`Execute %v false`, printBindVars(map[string]*querypb.BindVariable{"a": sqltypes.Int64BindVariable(10), "bv": sqltypes.StringBindVariable("c")})),
 	})
-	expectResult(t, "jn.Execute", r, sqltypes.MakeTestResult(
+	expectResult(t, r, sqltypes.MakeTestResult(
 		sqltypes.MakeTestFields(
 			"col1|col2|col4|col5",
 			"int64|varchar|int64|varchar",
@@ -101,19 +105,19 @@ func TestJoinExecute(t *testing.T) {
 	leftPrim.rewind()
 	rightPrim.rewind()
 	jn.Opcode = LeftJoin
-	r, err = jn.Execute(noopVCursor{}, bv, true)
+	r, err = jn.TryExecute(context.Background(), &noopVCursor{}, bv, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	leftPrim.ExpectLog(t, []string{
-		`Execute a: type:INT64 value:"10"  true`,
+		fmt.Sprintf(`Execute %v true`, printBindVars(map[string]*querypb.BindVariable{"a": sqltypes.Int64BindVariable(10)})),
 	})
 	rightPrim.ExpectLog(t, []string{
-		`Execute a: type:INT64 value:"10" bv: type:VARCHAR value:"a"  true`,
-		`Execute a: type:INT64 value:"10" bv: type:VARCHAR value:"b"  false`,
-		`Execute a: type:INT64 value:"10" bv: type:VARCHAR value:"c"  false`,
+		fmt.Sprintf(`Execute %v true`, printBindVars(map[string]*querypb.BindVariable{"a": sqltypes.Int64BindVariable(10), "bv": sqltypes.StringBindVariable("a")})),
+		fmt.Sprintf(`Execute %v false`, printBindVars(map[string]*querypb.BindVariable{"a": sqltypes.Int64BindVariable(10), "bv": sqltypes.StringBindVariable("b")})),
+		fmt.Sprintf(`Execute %v false`, printBindVars(map[string]*querypb.BindVariable{"a": sqltypes.Int64BindVariable(10), "bv": sqltypes.StringBindVariable("c")})),
 	})
-	expectResult(t, "jn.Execute", r, sqltypes.MakeTestResult(
+	expectResult(t, r, sqltypes.MakeTestResult(
 		sqltypes.MakeTestFields(
 			"col1|col2|col4|col5",
 			"int64|varchar|int64|varchar",
@@ -127,62 +131,77 @@ func TestJoinExecute(t *testing.T) {
 }
 
 func TestJoinExecuteMaxMemoryRows(t *testing.T) {
-	save := testMaxMemoryRows
+	saveMax := testMaxMemoryRows
+	saveIgnore := testIgnoreMaxMemoryRows
 	testMaxMemoryRows = 3
-	defer func() { testMaxMemoryRows = save }()
+	defer func() {
+		testMaxMemoryRows = saveMax
+		testIgnoreMaxMemoryRows = saveIgnore
+	}()
 
-	leftPrim := &fakePrimitive{
-		results: []*sqltypes.Result{
-			sqltypes.MakeTestResult(
-				sqltypes.MakeTestFields(
-					"col1|col2|col3",
-					"int64|varchar|varchar",
+	testCases := []struct {
+		ignoreMaxMemoryRows bool
+		err                 string
+	}{
+		{true, ""},
+		{false, "in-memory row count exceeded allowed limit of 3"},
+	}
+	for _, test := range testCases {
+		leftPrim := &fakePrimitive{
+			results: []*sqltypes.Result{
+				sqltypes.MakeTestResult(
+					sqltypes.MakeTestFields(
+						"col1|col2|col3",
+						"int64|varchar|varchar",
+					),
+					"1|a|aa",
+					"2|b|bb",
+					"3|c|cc",
 				),
-				"1|a|aa",
-				"2|b|bb",
-				"3|c|cc",
-			),
-		},
-	}
-	rightFields := sqltypes.MakeTestFields(
-		"col4|col5|col6",
-		"int64|varchar|varchar",
-	)
-	rightPrim := &fakePrimitive{
-		results: []*sqltypes.Result{
-			sqltypes.MakeTestResult(
-				rightFields,
-				"4|d|dd",
-			),
-			sqltypes.MakeTestResult(
-				rightFields,
-			),
-			sqltypes.MakeTestResult(
-				rightFields,
-				"5|e|ee",
-				"6|f|ff",
-				"7|g|gg",
-			),
-		},
-	}
-	bv := map[string]*querypb.BindVariable{
-		"a": sqltypes.Int64BindVariable(10),
-	}
+			},
+		}
+		rightFields := sqltypes.MakeTestFields(
+			"col4|col5|col6",
+			"int64|varchar|varchar",
+		)
+		rightPrim := &fakePrimitive{
+			results: []*sqltypes.Result{
+				sqltypes.MakeTestResult(
+					rightFields,
+					"4|d|dd",
+				),
+				sqltypes.MakeTestResult(
+					rightFields,
+				),
+				sqltypes.MakeTestResult(
+					rightFields,
+					"5|e|ee",
+					"6|f|ff",
+					"7|g|gg",
+				),
+			},
+		}
+		bv := map[string]*querypb.BindVariable{
+			"a": sqltypes.Int64BindVariable(10),
+		}
 
-	// Normal join
-	jn := &Join{
-		Opcode: NormalJoin,
-		Left:   leftPrim,
-		Right:  rightPrim,
-		Cols:   []int{-1, -2, 1, 2},
-		Vars: map[string]int{
-			"bv": 1,
-		},
-	}
-	_, err := jn.Execute(noopVCursor{}, bv, true)
-	want := "in-memory row count exceeded allowed limit of 3"
-	if err == nil || err.Error() != want {
-		t.Errorf("Execute(): %v, want %v", err, want)
+		// Normal join
+		jn := &Join{
+			Opcode: InnerJoin,
+			Left:   leftPrim,
+			Right:  rightPrim,
+			Cols:   []int{-1, -2, 1, 2},
+			Vars: map[string]int{
+				"bv": 1,
+			},
+		}
+		testIgnoreMaxMemoryRows = test.ignoreMaxMemoryRows
+		_, err := jn.TryExecute(context.Background(), &noopVCursor{}, bv, true)
+		if testIgnoreMaxMemoryRows {
+			require.NoError(t, err)
+		} else {
+			require.EqualError(t, err, test.err)
+		}
 	}
 }
 
@@ -210,7 +229,7 @@ func TestJoinExecuteNoResult(t *testing.T) {
 	}
 
 	jn := &Join{
-		Opcode: NormalJoin,
+		Opcode: InnerJoin,
 		Left:   leftPrim,
 		Right:  rightPrim,
 		Cols:   []int{-1, -2, 1, 2},
@@ -218,10 +237,8 @@ func TestJoinExecuteNoResult(t *testing.T) {
 			"bv": 1,
 		},
 	}
-	r, err := jn.Execute(noopVCursor{}, map[string]*querypb.BindVariable{}, true)
-	if err != nil {
-		t.Fatal(err)
-	}
+	r, err := jn.TryExecute(context.Background(), &noopVCursor{}, map[string]*querypb.BindVariable{}, true)
+	require.NoError(t, err)
 	leftPrim.ExpectLog(t, []string{
 		`Execute  true`,
 	})
@@ -235,7 +252,7 @@ func TestJoinExecuteNoResult(t *testing.T) {
 			"int64|varchar|int64|varchar",
 		),
 	)
-	expectResult(t, "jn.Execute", r, wantResult)
+	expectResult(t, r, wantResult)
 }
 
 func TestJoinExecuteErrors(t *testing.T) {
@@ -245,11 +262,11 @@ func TestJoinExecuteErrors(t *testing.T) {
 	}
 
 	jn := &Join{
-		Opcode: NormalJoin,
+		Opcode: InnerJoin,
 		Left:   leftPrim,
 	}
-	_, err := jn.Execute(noopVCursor{}, map[string]*querypb.BindVariable{}, true)
-	expectError(t, "jn.Execute", err, "left err")
+	_, err := jn.TryExecute(context.Background(), &noopVCursor{}, map[string]*querypb.BindVariable{}, true)
+	require.EqualError(t, err, "left err")
 
 	// Error on right query
 	leftPrim = &fakePrimitive{
@@ -270,7 +287,7 @@ func TestJoinExecuteErrors(t *testing.T) {
 	}
 
 	jn = &Join{
-		Opcode: NormalJoin,
+		Opcode: InnerJoin,
 		Left:   leftPrim,
 		Right:  rightPrim,
 		Cols:   []int{-1, -2, 1, 2},
@@ -278,8 +295,8 @@ func TestJoinExecuteErrors(t *testing.T) {
 			"bv": 1,
 		},
 	}
-	_, err = jn.Execute(noopVCursor{}, map[string]*querypb.BindVariable{}, true)
-	expectError(t, "jn.Execute", err, "right err")
+	_, err = jn.TryExecute(context.Background(), &noopVCursor{}, map[string]*querypb.BindVariable{}, true)
+	require.EqualError(t, err, "right err")
 
 	// Error on right getfields
 	leftPrim = &fakePrimitive{
@@ -297,7 +314,7 @@ func TestJoinExecuteErrors(t *testing.T) {
 	}
 
 	jn = &Join{
-		Opcode: NormalJoin,
+		Opcode: InnerJoin,
 		Left:   leftPrim,
 		Right:  rightPrim,
 		Cols:   []int{-1, -2, 1, 2},
@@ -305,8 +322,8 @@ func TestJoinExecuteErrors(t *testing.T) {
 			"bv": 1,
 		},
 	}
-	_, err = jn.Execute(noopVCursor{}, map[string]*querypb.BindVariable{}, true)
-	expectError(t, "jn.Execute", err, "right err")
+	_, err = jn.TryExecute(context.Background(), &noopVCursor{}, map[string]*querypb.BindVariable{}, true)
+	require.EqualError(t, err, "right err")
 }
 
 func TestJoinStreamExecute(t *testing.T) {
@@ -351,7 +368,7 @@ func TestJoinStreamExecute(t *testing.T) {
 
 	// Normal join
 	jn := &Join{
-		Opcode: NormalJoin,
+		Opcode: InnerJoin,
 		Left:   leftPrim,
 		Right:  rightPrim,
 		Cols:   []int{-1, -2, 1, 2},
@@ -359,7 +376,7 @@ func TestJoinStreamExecute(t *testing.T) {
 			"bv": 1,
 		},
 	}
-	r, err := wrapStreamExecute(jn, nil, map[string]*querypb.BindVariable{}, true)
+	r, err := wrapStreamExecute(jn, &noopVCursor{}, map[string]*querypb.BindVariable{}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -369,11 +386,11 @@ func TestJoinStreamExecute(t *testing.T) {
 	rightPrim.ExpectLog(t, []string{
 		`GetFields bv: `,
 		`Execute bv:  true`,
-		`StreamExecute bv: type:VARCHAR value:"a"  false`,
-		`StreamExecute bv: type:VARCHAR value:"b"  false`,
-		`StreamExecute bv: type:VARCHAR value:"c"  false`,
+		fmt.Sprintf(`StreamExecute %v false`, printBindVars(map[string]*querypb.BindVariable{"bv": sqltypes.StringBindVariable("a")})),
+		fmt.Sprintf(`StreamExecute %v false`, printBindVars(map[string]*querypb.BindVariable{"bv": sqltypes.StringBindVariable("b")})),
+		fmt.Sprintf(`StreamExecute %v false`, printBindVars(map[string]*querypb.BindVariable{"bv": sqltypes.StringBindVariable("c")})),
 	})
-	expectResult(t, "jn.Execute", r, sqltypes.MakeTestResult(
+	expectResult(t, r, sqltypes.MakeTestResult(
 		sqltypes.MakeTestFields(
 			"col1|col2|col4|col5",
 			"int64|varchar|int64|varchar",
@@ -388,7 +405,7 @@ func TestJoinStreamExecute(t *testing.T) {
 	leftPrim.rewind()
 	rightPrim.rewind()
 	jn.Opcode = LeftJoin
-	r, err = wrapStreamExecute(jn, nil, map[string]*querypb.BindVariable{}, true)
+	r, err = wrapStreamExecute(jn, &noopVCursor{}, map[string]*querypb.BindVariable{}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -398,11 +415,11 @@ func TestJoinStreamExecute(t *testing.T) {
 	rightPrim.ExpectLog(t, []string{
 		`GetFields bv: `,
 		`Execute bv:  true`,
-		`StreamExecute bv: type:VARCHAR value:"a"  false`,
-		`StreamExecute bv: type:VARCHAR value:"b"  false`,
-		`StreamExecute bv: type:VARCHAR value:"c"  false`,
+		fmt.Sprintf(`StreamExecute %v false`, printBindVars(map[string]*querypb.BindVariable{"bv": sqltypes.StringBindVariable("a")})),
+		fmt.Sprintf(`StreamExecute %v false`, printBindVars(map[string]*querypb.BindVariable{"bv": sqltypes.StringBindVariable("b")})),
+		fmt.Sprintf(`StreamExecute %v false`, printBindVars(map[string]*querypb.BindVariable{"bv": sqltypes.StringBindVariable("c")})),
 	})
-	expectResult(t, "jn.Execute", r, sqltypes.MakeTestResult(
+	expectResult(t, r, sqltypes.MakeTestResult(
 		sqltypes.MakeTestFields(
 			"col1|col2|col4|col5",
 			"int64|varchar|int64|varchar",
@@ -439,7 +456,7 @@ func TestGetFields(t *testing.T) {
 	}
 
 	jn := &Join{
-		Opcode: NormalJoin,
+		Opcode: InnerJoin,
 		Left:   leftPrim,
 		Right:  rightPrim,
 		Cols:   []int{-1, -2, 1, 2},
@@ -447,7 +464,7 @@ func TestGetFields(t *testing.T) {
 			"bv": 1,
 		},
 	}
-	r, err := jn.GetFields(nil, map[string]*querypb.BindVariable{})
+	r, err := jn.GetFields(context.Background(), nil, map[string]*querypb.BindVariable{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -459,7 +476,7 @@ func TestGetFields(t *testing.T) {
 		`GetFields bv: `,
 		`Execute bv:  true`,
 	})
-	expectResult(t, "jn.Execute", r, sqltypes.MakeTestResult(
+	expectResult(t, r, sqltypes.MakeTestResult(
 		sqltypes.MakeTestFields(
 			"col1|col2|col4|col5",
 			"int64|varchar|int64|varchar",
@@ -476,7 +493,7 @@ func TestGetFieldsErrors(t *testing.T) {
 	}
 
 	jn := &Join{
-		Opcode: NormalJoin,
+		Opcode: InnerJoin,
 		Left:   leftPrim,
 		Right:  rightPrim,
 		Cols:   []int{-1, -2, 1, 2},
@@ -484,8 +501,8 @@ func TestGetFieldsErrors(t *testing.T) {
 			"bv": 1,
 		},
 	}
-	_, err := jn.GetFields(nil, map[string]*querypb.BindVariable{})
-	expectError(t, "jn.GetFields", err, "left err")
+	_, err := jn.GetFields(context.Background(), nil, map[string]*querypb.BindVariable{})
+	require.EqualError(t, err, "left err")
 
 	jn.Left = &fakePrimitive{
 		results: []*sqltypes.Result{
@@ -497,6 +514,6 @@ func TestGetFieldsErrors(t *testing.T) {
 			),
 		},
 	}
-	_, err = jn.GetFields(nil, map[string]*querypb.BindVariable{})
-	expectError(t, "jn.GetFields", err, "right err")
+	_, err = jn.GetFields(context.Background(), nil, map[string]*querypb.BindVariable{})
+	require.EqualError(t, err, "right err")
 }

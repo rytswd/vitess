@@ -17,11 +17,11 @@ limitations under the License.
 package test
 
 import (
+	"context"
 	"path"
 	"testing"
 	"time"
 
-	"golang.org/x/net/context"
 	"vitess.io/vitess/go/vt/topo"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
@@ -34,8 +34,7 @@ var timeUntilLockIsTaken = 10 * time.Millisecond
 
 // checkLock checks we can lock / unlock as expected. It's using a keyspace
 // as the lock target.
-func checkLock(t *testing.T, ts *topo.Server) {
-	ctx := context.Background()
+func checkLock(t *testing.T, ctx context.Context, ts *topo.Server) {
 	if err := ts.CreateKeyspace(ctx, "test_keyspace", &topodatapb.Keyspace{}); err != nil {
 		t.Fatalf("CreateKeyspace: %v", err)
 	}
@@ -47,9 +46,6 @@ func checkLock(t *testing.T, ts *topo.Server) {
 
 	t.Log("===      checkLockTimeout")
 	checkLockTimeout(ctx, t, conn)
-
-	t.Log("===      checkLockMissing")
-	checkLockMissing(ctx, t, conn)
 
 	t.Log("===      checkLockUnblocks")
 	checkLockUnblocks(ctx, t, conn)
@@ -122,14 +118,6 @@ func checkLockTimeout(ctx context.Context, t *testing.T, conn topo.Conn) {
 	}
 }
 
-// checkLockMissing makes sure we can't lock a non-existing directory.
-func checkLockMissing(ctx context.Context, t *testing.T, conn topo.Conn) {
-	keyspacePath := path.Join(topo.KeyspacesPath, "test_keyspace_666")
-	if _, err := conn.Lock(ctx, keyspacePath, "missing"); err == nil {
-		t.Fatalf("Lock(test_keyspace_666) worked for non-existing keyspace")
-	}
-}
-
 // checkLockUnblocks makes sure that a routine waiting on a lock
 // is unblocked when another routine frees the lock
 func checkLockUnblocks(ctx context.Context, t *testing.T, conn topo.Conn) {
@@ -170,6 +158,6 @@ func checkLockUnblocks(ctx context.Context, t *testing.T, conn topo.Conn) {
 	select {
 	case <-finished:
 	case <-timeout:
-		t.Fatalf("unlocking timed out")
+		t.Fatalf("Unlock(test_keyspace) timed out")
 	}
 }

@@ -35,8 +35,8 @@ type Factory struct{}
 // If so, it returns the voting server address, the observer address, and true.
 // Otherwise, it returns false.
 func hasObservers(serverAddr string) (string, string, bool) {
-	if i := strings.Index(serverAddr, "|"); i != -1 {
-		return serverAddr[:i], serverAddr[i+1:], true
+	if before, after, ok := strings.Cut(serverAddr, "|"); ok {
+		return before, after, true
 	}
 	return "", "", false
 }
@@ -46,14 +46,14 @@ func hasObservers(serverAddr string) (string, string, bool) {
 // Further implementation design note: Zookeeper supports Observers:
 // https://zookeeper.apache.org/doc/trunk/zookeeperObservers.html
 // To use them, follow these instructions:
-// * setup your observer servers as described in the previous link.
-// * specify a second set of servers in serverAddr, after a '|', like:
-//   global1:port1,global2:port2|observer1:port1,observer2:port2
-// * if HasGlobalReadOnlyCell detects that the serverAddr has both lists,
-//   it returns true.
-// * the Create method below also splits the values, and if
-//   cell is GlobalCell, use the left side, if cell is GlobalReadOnlyCell,
-//   use the right side.
+//   - setup your observer servers as described in the previous link.
+//   - specify a second set of servers in serverAddr, after a '|', like:
+//     global1:port1,global2:port2|observer1:port1,observer2:port2
+//   - if HasGlobalReadOnlyCell detects that the serverAddr has both lists,
+//     it returns true.
+//   - the Create method below also splits the values, and if
+//     cell is GlobalCell, use the left side, if cell is GlobalReadOnlyCell,
+//     use the right side.
 func (f Factory) HasGlobalReadOnlyCell(serverAddr, root string) bool {
 	_, _, ok := hasObservers(serverAddr)
 	return ok
@@ -95,6 +95,7 @@ func (zs *Server) Close() {
 	zs.conn.Close()
 	zs.conn = nil
 }
+
 func init() {
 	topo.RegisterFactory("zk2", Factory{})
 }

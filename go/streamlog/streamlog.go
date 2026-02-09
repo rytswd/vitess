@@ -18,32 +18,26 @@ limitations under the License.
 package streamlog
 
 import (
-	"flag"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"os"
-	"os/signal"
+	"sort"
 	"strings"
 	"sync"
-	"syscall"
+	"time"
+
+	"github.com/spf13/pflag"
 
 	"vitess.io/vitess/go/acl"
 	"vitess.io/vitess/go/stats"
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/servenv"
 )
 
 var (
-	// RedactDebugUIQueries controls whether full queries and bind variables are suppressed from debug UIs.
-	RedactDebugUIQueries = flag.Bool("redact-debug-ui-queries", false, "redact full queries and bind variables from debug UI")
-
-	// QueryLogFormat controls the format of the query log (either text or json)
-	QueryLogFormat = flag.String("querylog-format", "text", "format for query logs (\"text\" or \"json\")")
-
-	// QueryLogFilterTag contains an optional string that must be present in the query for it to be logged
-	QueryLogFilterTag = flag.String("querylog-filter-tag", "", "string that must be present in the query for it to be logged")
-
 	sendCount      = stats.NewCountersWithSingleLabel("StreamlogSend", "stream log send count", "logger_names")
 	deliveredCount = stats.NewCountersWithMultiLabels(
 		"StreamlogDelivered",
@@ -61,34 +55,109 @@ const (
 
 	// QueryLogFormatJSON is the format specifier for json querylog output
 	QueryLogFormatJSON = "json"
+
+	// QueryLogModeAll is the mode specifier for logging all queries
+	QueryLogModeAll = "all"
+
+	// QueryLogModeError is the mode specifier for logging only queries that return an error
+	QueryLogModeError = "error"
 )
+
+type QueryLogConfig struct {
+	RedactDebugUIQueries  bool
+	FilterTag             string
+	Format                string
+	Mode                  string
+	RowThreshold          uint64
+	TimeThreshold         time.Duration
+	sampleRate            float64
+	EmitOnAnyConditionMet bool
+}
+
+var queryLogConfigInstance = QueryLogConfig{
+	Format: QueryLogFormatText,
+	Mode:   QueryLogModeAll,
+}
+
+func GetQueryLogConfig() QueryLogConfig {
+	return queryLogConfigInstance
+}
+
+func NewQueryLogConfigForTest() QueryLogConfig {
+	return QueryLogConfig{
+		Format: QueryLogFormatText,
+	}
+}
+
+func init() {
+	servenv.OnParseFor("vtcombo", registerStreamLogFlags)
+	servenv.OnParseFor("vttablet", registerStreamLogFlags)
+	servenv.OnParseFor("vtgate", registerStreamLogFlags)
+}
+
+func registerStreamLogFlags(fs *pflag.FlagSet) {
+	// RedactDebugUIQueries controls whether full queries and bind variables are suppressed from debug UIs.
+	fs.BoolVar(&queryLogConfigInstance.RedactDebugUIQueries, "redact-debug-ui-queries", queryLogConfigInstance.RedactDebugUIQueries, "redact full queries and bind variables from debug UI")
+
+	// QueryLogFormat controls the format of the query log (either text or json)
+	fs.StringVar(&queryLogConfigInstance.Format, "querylog-format", queryLogConfigInstance.Format, "format for query logs (\"text\" or \"json\")")
+
+	// QueryLogFilterTag contains an optional string that must be present in the query for it to be logged
+	fs.StringVar(&queryLogConfigInstance.FilterTag, "querylog-filter-tag", queryLogConfigInstance.FilterTag, "string that must be present in the query for it to be logged; if using a value as the tag, you need to disable query normalization")
+
+	// QueryLogRowThreshold only log queries returning or affecting this many rows
+	fs.Uint64Var(&queryLogConfigInstance.RowThreshold, "querylog-row-threshold", queryLogConfigInstance.RowThreshold, "Number of rows a query has to return or affect before being logged; not useful for streaming queries. 0 means all queries will be logged.")
+
+	// QueryLogTimeThreshold only log queries with execution time over the time duration threshold
+	fs.DurationVar(&queryLogConfigInstance.TimeThreshold, "querylog-time-threshold", queryLogConfigInstance.TimeThreshold, "Execution time duration a query needs to run over before being logged; time duration expressed in the form recognized by time.ParseDuration; not useful for streaming queries.")
+
+	// QueryLogSampleRate causes a sample of queries to be logged
+	fs.Float64Var(&queryLogConfigInstance.sampleRate, "querylog-sample-rate", queryLogConfigInstance.sampleRate, "Sample rate for logging queries. Value must be between 0.0 (no logging) and 1.0 (all queries)")
+
+	// QueryLogMode controls the mode for logging queries (all or error)
+	fs.StringVar(&queryLogConfigInstance.Mode, "querylog-mode", queryLogConfigInstance.Mode, `Mode for logging queries. "error" will only log queries that return an error. Otherwise all queries will be logged.`)
+
+	// EmitOnAnyConditionMet logs queries on any condition met (time/row/filtertag)
+	fs.BoolVar(&queryLogConfigInstance.EmitOnAnyConditionMet, "querylog-emit-on-any-condition-met", queryLogConfigInstance.EmitOnAnyConditionMet, "Emit to query log when any of the conditions (row-threshold, time-threshold, filter-tag) is met (default false)")
+}
 
 // StreamLogger is a non-blocking broadcaster of messages.
 // Subscribers can use channels or HTTP.
-type StreamLogger struct {
+type StreamLogger[T any] struct {
 	name       string
 	size       int
 	mu         sync.Mutex
-	subscribed map[chan interface{}]string
+	subscribed map[chan T]string
 }
 
 // LogFormatter is the function signature used to format an arbitrary
 // message for the given output writer.
-type LogFormatter func(out io.Writer, params url.Values, message interface{}) error
+type LogFormatter func(out io.Writer, params url.Values, message any) error
 
 // New returns a new StreamLogger that can stream events to subscribers.
 // The size parameter defines the channel size for the subscribers.
-func New(name string, size int) *StreamLogger {
-	return &StreamLogger{
+func New[T any](name string, size int) *StreamLogger[T] {
+	return &StreamLogger[T]{
 		name:       name,
 		size:       size,
-		subscribed: make(map[chan interface{}]string),
+		subscribed: make(map[chan T]string),
+	}
+}
+
+// helper function to compose both aCond and its reason and aggregate the result inal allMatches and reasons variable
+func shouldEmitLogOnCondition(aCond bool, aReason string, allMatches bool, reasons []string) (bool, string, bool, []string) {
+	allMatches = allMatches || aCond
+	if aCond {
+		reasons = append(reasons, aReason)
+		return aCond, aReason, allMatches, reasons
+	} else {
+		return aCond, "", allMatches, reasons
 	}
 }
 
 // Send sends message to all the writers subscribed to logger. Calling
 // Send does not block.
-func (logger *StreamLogger) Send(message interface{}) {
+func (logger *StreamLogger[T]) Send(message T) {
 	logger.mu.Lock()
 	defer logger.mu.Unlock()
 
@@ -105,17 +174,17 @@ func (logger *StreamLogger) Send(message interface{}) {
 
 // Subscribe returns a channel which can be used to listen
 // for messages.
-func (logger *StreamLogger) Subscribe(name string) chan interface{} {
+func (logger *StreamLogger[T]) Subscribe(name string) chan T {
 	logger.mu.Lock()
 	defer logger.mu.Unlock()
 
-	ch := make(chan interface{}, logger.size)
+	ch := make(chan T, logger.size)
 	logger.subscribed[ch] = name
 	return ch
 }
 
 // Unsubscribe removes the channel from the subscription.
-func (logger *StreamLogger) Unsubscribe(ch chan interface{}) {
+func (logger *StreamLogger[T]) Unsubscribe(ch chan T) {
 	logger.mu.Lock()
 	defer logger.mu.Unlock()
 
@@ -123,14 +192,14 @@ func (logger *StreamLogger) Unsubscribe(ch chan interface{}) {
 }
 
 // Name returns the name of StreamLogger.
-func (logger *StreamLogger) Name() string {
+func (logger *StreamLogger[T]) Name() string {
 	return logger.name
 }
 
 // ServeLogs registers the URL on which messages will be broadcast.
 // It is safe to register multiple URLs for the same StreamLogger.
-func (logger *StreamLogger) ServeLogs(url string, logf LogFormatter) {
-	http.HandleFunc(url, func(w http.ResponseWriter, r *http.Request) {
+func (logger *StreamLogger[T]) ServeLogs(url string, logf LogFormatter) {
+	servenv.HTTPHandleFunc(url, func(w http.ResponseWriter, r *http.Request) {
 		if err := acl.CheckAccessHTTP(r, acl.DEBUGGING); err != nil {
 			acl.SendError(w, err)
 			return
@@ -160,14 +229,14 @@ func (logger *StreamLogger) ServeLogs(url string, logf LogFormatter) {
 //
 // Returns the channel used for the subscription which can be used to close
 // it.
-func (logger *StreamLogger) LogToFile(path string, logf LogFormatter) (chan interface{}, error) {
+func (logger *StreamLogger[T]) LogToFile(path string, logf LogFormatter) (chan T, error) {
 	rotateChan := make(chan os.Signal, 1)
-	signal.Notify(rotateChan, syscall.SIGUSR2)
+	setupRotate(rotateChan)
 
 	logChan := logger.Subscribe("FileLog")
 	formatParams := map[string][]string{"full": {}}
 
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
 	if err != nil {
 		return nil, err
 	}
@@ -176,10 +245,10 @@ func (logger *StreamLogger) LogToFile(path string, logf LogFormatter) (chan inte
 		for {
 			select {
 			case record := <-logChan:
-				logf(f, formatParams, record)
+				logf(f, formatParams, record) //nolint:errcheck
 			case <-rotateChan:
 				f.Close()
-				f, _ = os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
+				f, _ = os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
 			}
 		}
 	}()
@@ -195,8 +264,8 @@ type Formatter interface {
 
 // GetFormatter returns a formatter function for objects conforming to the
 // Formatter interface
-func GetFormatter(logger *StreamLogger) LogFormatter {
-	return func(w io.Writer, params url.Values, val interface{}) error {
+func GetFormatter[T any](logger *StreamLogger[T]) LogFormatter {
+	return func(w io.Writer, params url.Values, val any) error {
 		fmter, ok := val.(Formatter)
 		if !ok {
 			_, err := fmt.Fprintf(w, "Error: unexpected value of type %T in %s!", val, logger.Name())
@@ -206,11 +275,64 @@ func GetFormatter(logger *StreamLogger) LogFormatter {
 	}
 }
 
-// ShouldEmitLog returns whether the log with the given SQL query
-// should be emitted or filtered
-func ShouldEmitLog(sql string) bool {
-	if *QueryLogFilterTag == "" {
+// shouldSampleQuery returns true if a query should be sampled based on sampleRate
+func (qlConfig QueryLogConfig) shouldSampleQuery() bool {
+	if qlConfig.sampleRate <= 0 {
+		return false
+	} else if qlConfig.sampleRate >= 1 {
 		return true
 	}
-	return strings.Contains(sql, *QueryLogFilterTag)
+	return rand.Float64() <= qlConfig.sampleRate
+}
+
+// ShouldEmitLog returns whether the log with the given SQL query
+// should be emitted or filtered
+// It also returns an EmitReason which is a comma-separated-string to indicate all the conditions triggered for log emit.
+// If both TimeThreshold and FilterTag condition are met, EmitReason will be time,filtertag
+func (qlConfig QueryLogConfig) ShouldEmitLog(sql string, rowsAffected, rowsReturned uint64, totalTime time.Duration, hasError bool) (bool, string) {
+	var aMatch, allMatches bool
+	var aReason string
+	reasons := []string{}
+
+	aMatch, aReason, allMatches, reasons = shouldEmitLogOnCondition(qlConfig.shouldSampleQuery(), "sample", allMatches, reasons)
+	if aMatch && !qlConfig.EmitOnAnyConditionMet {
+		return aMatch, aReason
+	}
+
+	if qlConfig.RowThreshold > 0 {
+		aMatch, _, allMatches, reasons = shouldEmitLogOnCondition(qlConfig.RowThreshold <= max(rowsAffected, rowsReturned), "row", allMatches, reasons)
+		if !aMatch && !qlConfig.EmitOnAnyConditionMet && qlConfig.FilterTag == "" {
+			return false, ""
+		}
+	}
+
+	if qlConfig.TimeThreshold > 0 {
+		aMatch, _, allMatches, reasons = shouldEmitLogOnCondition(qlConfig.TimeThreshold <= totalTime, "time", allMatches, reasons)
+		if !aMatch && !qlConfig.EmitOnAnyConditionMet && qlConfig.FilterTag == "" {
+			return false, ""
+		}
+	}
+
+	if qlConfig.FilterTag != "" {
+		aMatch, aReason, allMatches, reasons = shouldEmitLogOnCondition(strings.Contains(sql, qlConfig.FilterTag), "filtertag", allMatches, reasons)
+		if !qlConfig.EmitOnAnyConditionMet {
+			return aMatch, aReason
+		}
+	}
+
+	if qlConfig.Mode == QueryLogModeError {
+		aMatch, aReason, allMatches, reasons = shouldEmitLogOnCondition(hasError, "error", allMatches, reasons)
+		if !qlConfig.EmitOnAnyConditionMet {
+			return aMatch, aReason
+		}
+	}
+
+	// sort the array to make the reason string content deterministic
+	sort.Strings(reasons)
+	reasonStr := strings.Join(reasons, ",")
+	if qlConfig.EmitOnAnyConditionMet {
+		return allMatches, reasonStr
+	} else {
+		return true, reasonStr
+	}
 }

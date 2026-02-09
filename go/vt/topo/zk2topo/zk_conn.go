@@ -17,22 +17,24 @@ limitations under the License.
 package zk2topo
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"flag"
-	"fmt"
-	"io/ioutil"
-	"math/rand"
+	"errors"
+	"math/rand/v2"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/spf13/pflag"
 	"github.com/z-division/go-zookeeper/zk"
-	"golang.org/x/net/context"
+	"golang.org/x/sync/semaphore"
 
-	"vitess.io/vitess/go/sync2"
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/servenv"
+	"vitess.io/vitess/go/vt/utils"
 )
 
 const (
@@ -50,40 +52,44 @@ const (
 )
 
 var (
-	maxConcurrency = flag.Int("topo_zk_max_concurrency", 64, "maximum number of pending requests to send to a Zookeeper server.")
+	maxConcurrency = 64
+	baseTimeout    = 30 * time.Second
 
-	baseTimeout = flag.Duration("topo_zk_base_timeout", 30*time.Second, "zk base timeout (see zk.Connect)")
-
-	certPath = flag.String("topo_zk_tls_cert", "", "the cert to use to connect to the zk topo server, requires topo_zk_tls_key, enables TLS")
-	keyPath  = flag.String("topo_zk_tls_key", "", "the key to use to connect to the zk topo server, enables TLS")
-	caPath   = flag.String("topo_zk_tls_ca", "", "the server ca to use to validate servers when connecting to the zk topo server")
-	authFile = flag.String("topo_zk_auth_file", "", "auth to use when connecting to the zk topo server, file contents should be <scheme>:<auth>, e.g., digest:user:pass")
+	certPath, keyPath, caPath, authFile string
 )
+
+func init() {
+	servenv.RegisterFlagsForTopoBinaries(registerFlags)
+}
+
+func registerFlags(fs *pflag.FlagSet) {
+	utils.SetFlagIntVar(fs, &maxConcurrency, "topo-zk-max-concurrency", maxConcurrency, "maximum number of pending requests to send to a Zookeeper server.")
+	utils.SetFlagDurationVar(fs, &baseTimeout, "topo-zk-base-timeout", baseTimeout, "zk base timeout (see zk.Connect)")
+	utils.SetFlagStringVar(fs, &certPath, "topo-zk-tls-cert", certPath, "the cert to use to connect to the zk topo server, requires topo-zk-tls-key, enables TLS")
+	utils.SetFlagStringVar(fs, &keyPath, "topo-zk-tls-key", keyPath, "the key to use to connect to the zk topo server, enables TLS")
+	utils.SetFlagStringVar(fs, &caPath, "topo-zk-tls-ca", caPath, "the server ca to use to validate servers when connecting to the zk topo server")
+	utils.SetFlagStringVar(fs, &authFile, "topo-zk-auth-file", authFile, "auth to use when connecting to the zk topo server, file contents should be <scheme>:<auth>, e.g., digest:user:pass")
+}
 
 // Time returns a time.Time from a ZK int64 milliseconds since Epoch time.
 func Time(i int64) time.Time {
 	return time.Unix(i/1000, i%1000*1000000)
 }
 
-// ZkTime returns a ZK time (int64) from a time.Time
-func ZkTime(t time.Time) int64 {
-	return t.Unix()*1000 + int64(t.Nanosecond()/1000000)
-}
-
 // ZkConn is a wrapper class on top of a zk.Conn.
 // It will do a few things for us:
-// - add the context parameter. However, we do not enforce its deadlines
-//   necessarily.
-// - enforce a max concurrency of access to Zookeeper. We just don't
-//   want to make too many calls concurrently, to not take too many resources.
-// - retry some calls to Zookeeper. If we were disconnected from the
-//   server, we want to try connecting again before failing.
+//   - add the context parameter. However, we do not enforce its deadlines
+//     necessarily.
+//   - enforce a max concurrency of access to Zookeeper. We just don't
+//     want to make too many calls concurrently, to not take too many resources.
+//   - retry some calls to Zookeeper. If we were disconnected from the
+//     server, we want to try connecting again before failing.
 type ZkConn struct {
 	// addr is set at construction time, and immutable.
 	addr string
 
 	// sem protects concurrent calls to Zookeeper.
-	sem *sync2.Semaphore
+	sem *semaphore.Weighted
 
 	// mu protects the following fields.
 	mu   sync.Mutex
@@ -96,7 +102,7 @@ type ZkConn struct {
 func Connect(addr string) *ZkConn {
 	return &ZkConn{
 		addr: addr,
-		sem:  sync2.NewSemaphore(*maxConcurrency, 0),
+		sem:  semaphore.NewWeighted(int64(maxConcurrency)),
 	}
 }
 
@@ -228,16 +234,18 @@ func (c *ZkConn) Close() error {
 //
 // https://issues.apache.org/jira/browse/ZOOKEEPER-22
 func (c *ZkConn) withRetry(ctx context.Context, action func(conn *zk.Conn) error) (err error) {
-
 	// Handle concurrent access to a Zookeeper server here.
-	c.sem.Acquire()
-	defer c.sem.Release()
+	err = c.sem.Acquire(ctx, 1)
+	if err != nil {
+		return err
+	}
+	defer c.sem.Release(1)
 
-	for i := 0; i < maxAttempts; i++ {
+	for i := range maxAttempts {
 		if i > 0 {
 			// Add a bit of backoff time before retrying:
 			// 1 second base + up to 5 seconds.
-			time.Sleep(1*time.Second + time.Duration(rand.Int63n(5e9)))
+			time.Sleep(1*time.Second + time.Duration(rand.Int64N(5e9)))
 		}
 
 		// Get the current connection, or connect.
@@ -263,6 +271,8 @@ func (c *ZkConn) withRetry(ctx context.Context, action func(conn *zk.Conn) error
 			c.conn = nil
 		}
 		c.mu.Unlock()
+		log.Infof("zk conn: got ErrConnectionClosed for addr %v: closing", c.addr)
+		conn.Close()
 	}
 	return
 }
@@ -285,25 +295,25 @@ func (c *ZkConn) getConn(ctx context.Context) (*zk.Conn, error) {
 	return c.conn, nil
 }
 
-// maybeAddAuth calls AddAuth if the `-topo_zk_auth_file` flag was specified
+// maybeAddAuth calls AddAuth if the `-topo-zk-auth-file` flag was specified
 func (c *ZkConn) maybeAddAuth(ctx context.Context) {
-	if *authFile == "" {
+	if authFile == "" {
 		return
 	}
-	authInfoBytes, err := ioutil.ReadFile(*authFile)
+	authInfoBytes, err := os.ReadFile(authFile)
 	if err != nil {
-		log.Errorf("failed to read topo_zk_auth_file: %v", err)
+		log.Errorf("failed to read topo-zk-auth-file: %v", err)
 		return
 	}
-	authInfo := string(authInfoBytes)
+	authInfo := strings.TrimRight(string(authInfoBytes), "\n")
 	authInfoParts := strings.SplitN(authInfo, ":", 2)
 	if len(authInfoParts) != 2 {
-		log.Errorf("failed to parse topo_zk_auth_file contents, expected format <scheme>:<auth> but saw: %s", authInfo)
+		log.Errorf("failed to parse topo-zk-auth-file contents, expected format <scheme>:<auth> but saw: %s", authInfo)
 		return
 	}
 	err = c.conn.AddAuth(authInfoParts[0], []byte(authInfoParts[1]))
 	if err != nil {
-		log.Errorf("failed to add auth from topo_zk_auth_file: %v", err)
+		log.Errorf("failed to add auth from topo-zk-auth-file: %v", err)
 		return
 	}
 }
@@ -313,13 +323,8 @@ func (c *ZkConn) maybeAddAuth(ctx context.Context) {
 // clears out the connection record.
 func (c *ZkConn) handleSessionEvents(conn *zk.Conn, session <-chan zk.Event) {
 	for event := range session {
-		closeRequired := false
-
 		switch event.State {
-		case zk.StateExpired, zk.StateConnecting:
-			closeRequired = true
-			fallthrough
-		case zk.StateDisconnected:
+		case zk.StateDisconnected, zk.StateExpired, zk.StateConnecting:
 			c.mu.Lock()
 			if c.conn == conn {
 				// The ZkConn still references this
@@ -327,9 +332,7 @@ func (c *ZkConn) handleSessionEvents(conn *zk.Conn, session <-chan zk.Event) {
 				c.conn = nil
 			}
 			c.mu.Unlock()
-			if closeRequired {
-				conn.Close()
-			}
+			conn.Close()
 			log.Infof("zk conn: session for addr %v ended: %v", c.addr, event)
 			return
 		}
@@ -341,8 +344,10 @@ func (c *ZkConn) handleSessionEvents(conn *zk.Conn, session <-chan zk.Event) {
 func dialZk(ctx context.Context, addr string) (*zk.Conn, <-chan zk.Event, error) {
 	servers := strings.Split(addr, ",")
 	dialer := zk.WithDialer(net.DialTimeout)
+	ctx, cancel := context.WithTimeout(ctx, baseTimeout)
+	defer cancel()
 	// If TLS is enabled use a TLS enabled dialer option
-	if *certPath != "" && *keyPath != "" {
+	if certPath != "" && keyPath != "" {
 		if strings.Contains(addr, ",") {
 			log.Fatalf("This TLS zk code requires that the all the zk servers validate to a single server name.")
 		}
@@ -350,14 +355,14 @@ func dialZk(ctx context.Context, addr string) (*zk.Conn, <-chan zk.Event, error)
 		serverName := strings.Split(addr, ":")[0]
 
 		log.Infof("Using TLS ZK, connecting to %v server name %v", addr, serverName)
-		cert, err := tls.LoadX509KeyPair(*certPath, *keyPath)
+		cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 		if err != nil {
-			log.Fatalf("Unable to load cert %v and key %v, err %v", *certPath, *keyPath, err)
+			log.Fatalf("Unable to load cert %v and key %v, err %v", certPath, keyPath, err)
 		}
 
-		clientCACert, err := ioutil.ReadFile(*caPath)
+		clientCACert, err := os.ReadFile(caPath)
 		if err != nil {
-			log.Fatalf("Unable to open ca cert %v, err %v", *caPath, err)
+			log.Fatalf("Unable to open ca cert %v, err %v", caPath, err)
 		}
 
 		clientCertPool := x509.NewCertPool()
@@ -368,8 +373,6 @@ func dialZk(ctx context.Context, addr string) (*zk.Conn, <-chan zk.Event, error)
 			RootCAs:      clientCertPool,
 			ServerName:   serverName,
 		}
-
-		tlsConfig.BuildNameToCertificate()
 
 		dialer = zk.WithDialer(func(network, address string, timeout time.Duration) (net.Conn, error) {
 			d := net.Dialer{Timeout: timeout}
@@ -382,7 +385,7 @@ func dialZk(ctx context.Context, addr string) (*zk.Conn, <-chan zk.Event, error)
 	hostProvider := zk.WithHostProvider(&zk.SimpleDNSHostProvider{})
 
 	// zk.Connect automatically shuffles the servers
-	zconn, session, err := zk.Connect(servers, *baseTimeout, dialer, hostProvider)
+	zconn, session, err := zk.Connect(servers, baseTimeout, dialer, hostProvider)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -402,7 +405,7 @@ func dialZk(ctx context.Context, addr string) (*zk.Conn, <-chan zk.Event, error)
 			case zk.StateAuthFailed:
 				// fast fail this one
 				zconn.Close()
-				return nil, nil, fmt.Errorf("zk connect failed: StateAuthFailed")
+				return nil, nil, errors.New("zk connect failed: StateAuthFailed")
 			}
 		}
 	}

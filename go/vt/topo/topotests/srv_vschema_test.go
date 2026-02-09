@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+	http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -18,9 +18,9 @@ package topotests
 import (
 	"testing"
 
-	"golang.org/x/net/context"
+	"google.golang.org/protobuf/proto"
 
-	"github.com/golang/protobuf/proto"
+	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/memorytopo"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
@@ -28,14 +28,17 @@ import (
 )
 
 func TestRebuildVSchema(t *testing.T) {
-	ctx := context.Background()
 	emptySrvVSchema := &vschemapb.SrvVSchema{
-		RoutingRules: &vschemapb.RoutingRules{},
+		MirrorRules:       &vschemapb.MirrorRules{},
+		RoutingRules:      &vschemapb.RoutingRules{},
+		ShardRoutingRules: &vschemapb.ShardRoutingRules{},
 	}
 
 	// Set up topology.
 	cells := []string{"cell1", "cell2"}
-	ts := memorytopo.NewServer(cells...)
+	ctx := t.Context()
+	ts := memorytopo.NewServer(ctx, cells...)
+	defer ts.Close()
 
 	// Rebuild with no keyspace / no vschema
 	if err := ts.RebuildSrvVSchema(ctx, cells); err != nil {
@@ -49,7 +52,9 @@ func TestRebuildVSchema(t *testing.T) {
 
 	// create a keyspace, rebuild, should see an empty entry
 	emptyKs1SrvVSchema := &vschemapb.SrvVSchema{
-		RoutingRules: &vschemapb.RoutingRules{},
+		MirrorRules:       &vschemapb.MirrorRules{},
+		RoutingRules:      &vschemapb.RoutingRules{},
+		ShardRoutingRules: &vschemapb.ShardRoutingRules{},
 		Keyspaces: map[string]*vschemapb.Keyspace{
 			"ks1": {},
 		},
@@ -70,14 +75,19 @@ func TestRebuildVSchema(t *testing.T) {
 	keyspace1 := &vschemapb.Keyspace{
 		Sharded: true,
 	}
-	if err := ts.SaveVSchema(ctx, "ks1", keyspace1); err != nil {
+	if err := ts.SaveVSchema(ctx, &topo.KeyspaceVSchemaInfo{
+		Name:     "ks1",
+		Keyspace: keyspace1,
+	}); err != nil {
 		t.Fatalf("SaveVSchema(ks1) failed: %v", err)
 	}
 	if err := ts.RebuildSrvVSchema(ctx, cells); err != nil {
 		t.Errorf("RebuildVSchema failed: %v", err)
 	}
 	wanted1 := &vschemapb.SrvVSchema{
-		RoutingRules: &vschemapb.RoutingRules{},
+		MirrorRules:       &vschemapb.MirrorRules{},
+		RoutingRules:      &vschemapb.RoutingRules{},
+		ShardRoutingRules: &vschemapb.ShardRoutingRules{},
 		Keyspaces: map[string]*vschemapb.Keyspace{
 			"ks1": keyspace1,
 		},
@@ -110,14 +120,19 @@ func TestRebuildVSchema(t *testing.T) {
 			},
 		},
 	}
-	if err := ts.SaveVSchema(ctx, "ks2", keyspace2); err != nil {
+	if err := ts.SaveVSchema(ctx, &topo.KeyspaceVSchemaInfo{
+		Name:     "ks2",
+		Keyspace: keyspace2,
+	}); err != nil {
 		t.Fatalf("SaveVSchema(ks1) failed: %v", err)
 	}
 	if err := ts.RebuildSrvVSchema(ctx, []string{"cell1"}); err != nil {
 		t.Errorf("RebuildVSchema failed: %v", err)
 	}
 	wanted2 := &vschemapb.SrvVSchema{
-		RoutingRules: &vschemapb.RoutingRules{},
+		MirrorRules:       &vschemapb.MirrorRules{},
+		RoutingRules:      &vschemapb.RoutingRules{},
+		ShardRoutingRules: &vschemapb.ShardRoutingRules{},
 		Keyspaces: map[string]*vschemapb.Keyspace{
 			"ks1": keyspace1,
 			"ks2": keyspace2,
@@ -154,7 +169,9 @@ func TestRebuildVSchema(t *testing.T) {
 		t.Errorf("RebuildVSchema failed: %v", err)
 	}
 	wanted3 := &vschemapb.SrvVSchema{
-		RoutingRules: rr,
+		MirrorRules:       &vschemapb.MirrorRules{},
+		RoutingRules:      rr,
+		ShardRoutingRules: &vschemapb.ShardRoutingRules{},
 		Keyspaces: map[string]*vschemapb.Keyspace{
 			"ks1": keyspace1,
 			"ks2": keyspace2,
@@ -170,7 +187,10 @@ func TestRebuildVSchema(t *testing.T) {
 	wanted4.RoutingRules = rr
 
 	// Delete a keyspace, checks vschema entry in map goes away.
-	if err := ts.SaveVSchema(ctx, "ks2", &vschemapb.Keyspace{}); err != nil {
+	if err := ts.SaveVSchema(ctx, &topo.KeyspaceVSchemaInfo{
+		Name:     "ks2",
+		Keyspace: &vschemapb.Keyspace{},
+	}); err != nil {
 		t.Fatalf("SaveVSchema(ks1) failed: %v", err)
 	}
 	if err := ts.DeleteKeyspace(ctx, "ks2"); err != nil {

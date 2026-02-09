@@ -18,7 +18,6 @@ package io.vitess.jdbc;
 
 import io.vitess.util.Constants;
 import io.vitess.util.StringUtils;
-
 import java.io.UnsupportedEncodingException;
 import java.net.URLDecoder;
 import java.sql.SQLException;
@@ -46,9 +45,10 @@ public class VitessJDBCUrl {
   private final List<HostInfo> hostInfos;
   private final Properties info;
 
-  /*
-   Assuming List of vtGate ips could be given in url, separated by ","
-  */
+  /**
+   * HostInfo represents a single VTGate host with its hostname and port.
+   * Multiple hosts can be specified in the JDBC URL, separated by commas.
+   */
   public static class HostInfo {
 
     private String hostname;
@@ -93,7 +93,6 @@ public class VitessJDBCUrl {
    * <li><code>trustAlias</code>=alias_under_which_certificate_chain_is_stored (if not set,
    * then the first valid <code>X509Certificate</code> found in the trustStore will be used)</li>
    * </ul>
-   * </p>
    * <p>
    * <p>If <code>useSSL=true</code>, and any of these additional properties are not set on the JDBC
    * URL, then the driver will look to see if these corresponding property was set at JVM startup
@@ -109,7 +108,6 @@ public class VitessJDBCUrl {
    * <li><code>-Djavax.net.ssl.trustStorePassword</code></li>
    * <li><code>-Djavax.net.ssl.trustStoreAlias</code></li>
    * </ul>
-   * </p>
    * <p>
    * <p>See:</p>
    * <p>https://mariadb.com/kb/en/mariadb/about-mariadb-connector-j/#tls-ssl</p>
@@ -220,7 +218,7 @@ public class VitessJDBCUrl {
           }
         }
 
-        // Per the mysql-connector-java docs, passed in Properties values should take precedence
+        // Per the mysql-connector-j docs, passed in Properties values should take precedence
         // over
         // those in the URL. See javadoc for NonRegisteringDriver#connect
         if ((null != value && value.length() > 0) && (parameter.length() > 0) && null == info

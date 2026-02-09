@@ -17,40 +17,41 @@ limitations under the License.
 package schemamanager
 
 import (
+	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path"
 	"strings"
 	"time"
 
-	"golang.org/x/net/context"
 	"vitess.io/vitess/go/vt/log"
 )
 
 // LocalController listens to the specified schema change dir and applies schema changes.
 // schema change dir lay out
-//            |
-//            |----keyspace_01
-//                 |----input
-//                      |---- create_test_table.sql
-//                      |---- alter_test_table_02.sql
-//                      |---- ...
-//                 |----complete // contains completed schema changes in yyyy/MM/dd
-//                      |----2015
-//                           |----01
-//                                |----01
-//                                     |--- create_table_table_02.sql
-//                 |----log // contains detailed execution information about schema changes
-//                      |----2015
-//                           |----01
-//                                |----01
-//                                     |--- create_table_table_02.sql
-//                 |----error // contains failed schema changes
-//                      |----2015
-//                           |----01
-//                                |----01
-//                                     |--- create_table_table_03.sql
+//
+//	|
+//	|----keyspace_01
+//	     |----input
+//	          |---- create_test_table.sql
+//	          |---- alter_test_table_02.sql
+//	          |---- ...
+//	     |----complete // contains completed schema changes in yyyy/MM/dd
+//	          |----2015
+//	               |----01
+//	                    |----01
+//	                         |--- create_table_table_02.sql
+//	     |----log // contains detailed execution information about schema changes
+//	          |----2015
+//	               |----01
+//	                    |----01
+//	                         |--- create_table_table_02.sql
+//	     |----error // contains failed schema changes
+//	          |----2015
+//	               |----01
+//	                    |----01
+//	                         |--- create_table_table_03.sql
+//
 // Schema Change Files: ${keyspace}/input/*.sql
 // Error Files:         ${keyspace}/error/${YYYY}/${MM}/${DD}/*.sql
 // Log Files:           ${keyspace}/log/${YYYY}/${MM}/${DD}/*.sql
@@ -76,7 +77,7 @@ func NewLocalController(schemaChangeDir string) *LocalController {
 // schema change.
 func (controller *LocalController) Open(ctx context.Context) error {
 	// find all keyspace directories.
-	fileInfos, err := ioutil.ReadDir(controller.schemaChangeDir)
+	fileInfos, err := os.ReadDir(controller.schemaChangeDir)
 	if err != nil {
 		return err
 	}
@@ -85,7 +86,7 @@ func (controller *LocalController) Open(ctx context.Context) error {
 			continue
 		}
 		dirpath := path.Join(controller.schemaChangeDir, fileinfo.Name())
-		schemaChanges, err := ioutil.ReadDir(path.Join(dirpath, "input"))
+		schemaChanges, err := os.ReadDir(path.Join(dirpath, "input"))
 		if err != nil {
 			log.Warningf("there is no input dir in %s", dirpath)
 			continue
@@ -118,7 +119,7 @@ func (controller *LocalController) Read(ctx context.Context) ([]string, error) {
 	if controller.keyspace == "" || controller.sqlPath == "" {
 		return []string{}, nil
 	}
-	data, err := ioutil.ReadFile(controller.sqlPath)
+	data, err := os.ReadFile(controller.sqlPath)
 	if err != nil {
 		return nil, err
 	}
@@ -198,7 +199,7 @@ func (controller *LocalController) writeToLogDir(ctx context.Context, result *Ex
 	}
 	defer logFile.Close()
 
-	logFile.WriteString(fmt.Sprintf("-- new file: %s\n", controller.sqlPath))
+	fmt.Fprintf(logFile, "-- new file: %s\n", controller.sqlPath)
 	for _, sql := range result.Sqls {
 		logFile.WriteString(sql)
 		logFile.WriteString(";\n")
@@ -206,13 +207,15 @@ func (controller *LocalController) writeToLogDir(ctx context.Context, result *Ex
 	rowsReturned := uint64(0)
 	rowsAffected := uint64(0)
 	for _, queryResult := range result.SuccessShards {
-		rowsReturned += uint64(len(queryResult.Result.Rows))
-		rowsAffected += queryResult.Result.RowsAffected
+		for _, result := range queryResult.Results {
+			rowsReturned += uint64(len(result.Rows))
+			rowsAffected += result.RowsAffected
+		}
 	}
-	logFile.WriteString(fmt.Sprintf("-- Rows returned: %d\n", rowsReturned))
-	logFile.WriteString(fmt.Sprintf("-- Rows affected: %d\n", rowsAffected))
+	fmt.Fprintf(logFile, "-- Rows returned: %d\n", rowsReturned)
+	fmt.Fprintf(logFile, "-- Rows affected: %d\n", rowsAffected)
 	logFile.WriteString("-- \n")
-	logFile.WriteString(fmt.Sprintf("-- ran in %fs\n", result.TotalTimeSpent.Seconds()))
+	fmt.Fprintf(logFile, "-- ran in %fs\n", result.TotalTimeSpent.Seconds())
 	logFile.WriteString("-- Execution succeeded\n")
 	return nil
 }

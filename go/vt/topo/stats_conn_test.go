@@ -17,40 +17,62 @@ limitations under the License.
 package topo
 
 import (
-	"fmt"
+	"context"
+	"errors"
 	"testing"
+	"time"
 
-	"golang.org/x/net/context"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/semaphore"
+
+	"vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/vterrors"
 )
+
+// testStatsConnReadSem is a semaphore for unit tests.
+// It intentionally has a concurrency limit of '1' to
+// allow semaphore contention in tests.
+var testStatsConnReadSem = semaphore.NewWeighted(1)
+
+// testStatsConnStatsReset resets StatsConn-based stats.
+func testStatsConnStatsReset() {
+	topoStatsConnErrors.ResetAll()
+	topoStatsConnReadWaitTimings.Reset()
+	topoStatsConnTimings.Reset()
+}
 
 // The fakeConn is a wrapper for a Conn that emits stats for every operation
 type fakeConn struct {
-	v Version
+	v        Version
+	readOnly bool
 }
 
 // ListDir is part of the Conn interface
 func (st *fakeConn) ListDir(ctx context.Context, dirPath string, full bool) (res []DirEntry, err error) {
 	if dirPath == "error" {
-		return res, fmt.Errorf("Dummy error")
-
+		return res, errors.New("Dummy error")
 	}
 	return res, err
 }
 
 // Create is part of the Conn interface
 func (st *fakeConn) Create(ctx context.Context, filePath string, contents []byte) (ver Version, err error) {
+	if st.readOnly {
+		return nil, vterrors.Errorf(vtrpc.Code_READ_ONLY, "topo server connection is read-only")
+	}
 	if filePath == "error" {
-		return ver, fmt.Errorf("Dummy error")
-
+		return ver, errors.New("Dummy error")
 	}
 	return ver, err
 }
 
 // Update is part of the Conn interface
 func (st *fakeConn) Update(ctx context.Context, filePath string, contents []byte, version Version) (ver Version, err error) {
+	if st.readOnly {
+		return nil, vterrors.Errorf(vtrpc.Code_READ_ONLY, "topo server connection is read-only")
+	}
 	if filePath == "error" {
-		return ver, fmt.Errorf("Dummy error")
-
+		return ver, errors.New("Dummy error")
 	}
 	return ver, err
 }
@@ -58,39 +80,97 @@ func (st *fakeConn) Update(ctx context.Context, filePath string, contents []byte
 // Get is part of the Conn interface
 func (st *fakeConn) Get(ctx context.Context, filePath string) (bytes []byte, ver Version, err error) {
 	if filePath == "error" {
-		return bytes, ver, fmt.Errorf("Dummy error")
-
+		return bytes, ver, errors.New("Dummy error")
 	}
 	return bytes, ver, err
 }
 
+// GetVersion is part of the Conn interface
+func (st *fakeConn) GetVersion(ctx context.Context, filePath string, version int64) (bytes []byte, err error) {
+	if filePath == "error" {
+		return bytes, errors.New("Dummy error")
+	}
+	return bytes, err
+}
+
+// List is part of the Conn interface
+func (st *fakeConn) List(ctx context.Context, filePathPrefix string) (bytes []KVInfo, err error) {
+	if filePathPrefix == "error" {
+		return bytes, errors.New("Dummy error")
+	}
+	return bytes, err
+}
+
 // Delete is part of the Conn interface
 func (st *fakeConn) Delete(ctx context.Context, filePath string, version Version) (err error) {
+	if st.readOnly {
+		return vterrors.Errorf(vtrpc.Code_READ_ONLY, "topo server connection is read-only")
+	}
 	if filePath == "error" {
-		return fmt.Errorf("dummy error")
+		return errors.New("dummy error")
 	}
 	return err
 }
 
 // Lock is part of the Conn interface
 func (st *fakeConn) Lock(ctx context.Context, dirPath, contents string) (lock LockDescriptor, err error) {
+	if st.readOnly {
+		return nil, vterrors.Errorf(vtrpc.Code_READ_ONLY, "topo server connection is read-only")
+	}
 	if dirPath == "error" {
-		return lock, fmt.Errorf("dummy error")
+		return lock, errors.New("dummy error")
+	}
+	return lock, err
+}
 
+// LockWithTTL is part of the Conn interface.
+func (st *fakeConn) LockWithTTL(ctx context.Context, dirPath, contents string, _ time.Duration) (lock LockDescriptor, err error) {
+	if st.readOnly {
+		return nil, vterrors.Errorf(vtrpc.Code_READ_ONLY, "topo server connection is read-only")
+	}
+	if dirPath == "error" {
+		return lock, errors.New("dummy error")
+	}
+	return lock, err
+}
+
+// LockName is part of the Conn interface.
+func (st *fakeConn) LockName(ctx context.Context, dirPath, contents string) (lock LockDescriptor, err error) {
+	if st.readOnly {
+		return nil, vterrors.Errorf(vtrpc.Code_READ_ONLY, "topo server connection is read-only")
+	}
+	if dirPath == "error" {
+		return lock, errors.New("dummy error")
+	}
+	return lock, err
+}
+
+// TryLock is part of the topo.Conn interface.
+// As of today it provides same functionality as Lock
+func (st *fakeConn) TryLock(ctx context.Context, dirPath, contents string) (lock LockDescriptor, err error) {
+	if st.readOnly {
+		return nil, vterrors.Errorf(vtrpc.Code_READ_ONLY, "topo server connection is read-only")
+	}
+	if dirPath == "error" {
+		return lock, errors.New("dummy error")
 	}
 	return lock, err
 }
 
 // Watch is part of the Conn interface
-func (st *fakeConn) Watch(ctx context.Context, filePath string) (current *WatchData, changes <-chan *WatchData, cancel CancelFunc) {
-	return current, changes, cancel
+func (st *fakeConn) Watch(ctx context.Context, filePath string) (current *WatchData, changes <-chan *WatchData, err error) {
+	return current, changes, err
 }
 
-// NewMasterParticipation is part of the Conn interface
-func (st *fakeConn) NewMasterParticipation(name, id string) (mp MasterParticipation, err error) {
-	if name == "error" {
-		return mp, fmt.Errorf("dummy error")
+// WatchRecursive is part of the Conn interface
+func (st *fakeConn) WatchRecursive(ctx context.Context, path string) (current []*WatchDataRecursive, changes <-chan *WatchDataRecursive, err error) {
+	return current, changes, err
+}
 
+// NewLeaderParticipation is part of the Conn interface
+func (st *fakeConn) NewLeaderParticipation(name, id string) (mp LeaderParticipation, err error) {
+	if name == "error" {
+		return mp, errors.New("dummy error")
 	}
 	return mp, err
 }
@@ -99,216 +179,227 @@ func (st *fakeConn) NewMasterParticipation(name, id string) (mp MasterParticipat
 func (st *fakeConn) Close() {
 }
 
-//TestStatsConnTopoListDir emits stats on ListDir
+// SetReadOnly with true prevents any write operations from being made on the topo connection
+func (st *fakeConn) SetReadOnly(readOnly bool) {
+	st.readOnly = readOnly
+}
+
+// IsReadOnly allows you to check the access type for the topo connection
+func (st *fakeConn) IsReadOnly() bool {
+	return st.readOnly
+}
+
+// createTestReadSemaphoreContention simulates semaphore contention on the test read semaphore.
+func createTestReadSemaphoreContention(ctx context.Context, duration time.Duration, semAcquiredChan chan struct{}) {
+	if err := testStatsConnReadSem.Acquire(ctx, 1); err != nil {
+		panic(err)
+	}
+	defer testStatsConnReadSem.Release(1)
+	semAcquiredChan <- struct{}{}
+	time.Sleep(duration)
+}
+
+// TestStatsConnTopoListDir emits stats on ListDir
 func TestStatsConnTopoListDir(t *testing.T) {
+	testStatsConnStatsReset()
+	defer testStatsConnStatsReset()
+
 	conn := &fakeConn{}
-	statsConn := NewStatsConn("global", conn)
+	statsConn := NewStatsConn("global", conn, testStatsConnReadSem)
 	ctx := context.Background()
 
+	semAcquiredChan := make(chan struct{})
+	go createTestReadSemaphoreContention(ctx, 100*time.Millisecond, semAcquiredChan)
+	<-semAcquiredChan
 	statsConn.ListDir(ctx, "", true)
-	timingCounts := topoStatsConnTimings.Counts()["ListDir.global"]
-	if got, want := timingCounts, int64(1); got != want {
-		t.Errorf("stats were not properly recorded: got = %d, want = %d", got, want)
-	}
+	require.Equal(t, int64(1), topoStatsConnTimings.Counts()["ListDir.global"])
+	require.NotZero(t, topoStatsConnTimings.Time())
+
+	require.Equal(t, int64(1), topoStatsConnReadWaitTimings.Counts()["ListDir.global"])
+	require.NotZero(t, topoStatsConnReadWaitTimings.Time())
 
 	// error is zero before getting an error
-	errorCount := topoStatsConnErrors.Counts()["ListDir.global"]
-	if got, want := errorCount, int64(0); got != want {
-		t.Errorf("stats were not properly recorded: got = %d, want = %d", got, want)
-	}
+	require.Zero(t, topoStatsConnErrors.Counts()["ListDir.global"])
 
 	statsConn.ListDir(ctx, "error", true)
 
 	// error stats gets emitted
-	errorCount = topoStatsConnErrors.Counts()["ListDir.global"]
-	if got, want := errorCount, int64(1); got != want {
-		t.Errorf("stats were not properly recorded: got = %d, want = %d", got, want)
-	}
+	require.Equal(t, int64(1), topoStatsConnErrors.Counts()["ListDir.global"])
 }
 
-//TestStatsConnTopoCreate emits stats on Create
+// TestStatsConnTopoCreate emits stats on Create
 func TestStatsConnTopoCreate(t *testing.T) {
+	testStatsConnStatsReset()
+	defer testStatsConnStatsReset()
+
 	conn := &fakeConn{}
-	statsConn := NewStatsConn("global", conn)
+	statsConn := NewStatsConn("global", conn, testStatsConnReadSem)
 	ctx := context.Background()
 
 	statsConn.Create(ctx, "", []byte{})
-	timingCounts := topoStatsConnTimings.Counts()["Create.global"]
-	if got, want := timingCounts, int64(1); got != want {
-		t.Errorf("stats were not properly recorded: got = %d, want = %d", got, want)
-	}
+	require.Equal(t, int64(1), topoStatsConnTimings.Counts()["Create.global"])
+	require.NotZero(t, topoStatsConnTimings.Time())
+	require.Zero(t, topoStatsConnReadWaitTimings.Time())
 
 	// error is zero before getting an error
-	errorCount := topoStatsConnErrors.Counts()["Create.global"]
-	if got, want := errorCount, int64(0); got != want {
-		t.Errorf("stats were not properly recorded: got = %d, want = %d", got, want)
-	}
+	require.Zero(t, topoStatsConnErrors.Counts()["Create.global"])
 
 	statsConn.Create(ctx, "error", []byte{})
 
 	// error stats gets emitted
-	errorCount = topoStatsConnErrors.Counts()["Create.global"]
-	if got, want := errorCount, int64(1); got != want {
-		t.Errorf("stats were not properly recorded: got = %d, want = %d", got, want)
-	}
+	require.Equal(t, int64(1), topoStatsConnErrors.Counts()["Create.global"])
 }
 
-//TestStatsConnTopoUpdate emits stats on Update
+// TestStatsConnTopoUpdate emits stats on Update
 func TestStatsConnTopoUpdate(t *testing.T) {
+	testStatsConnStatsReset()
+	defer testStatsConnStatsReset()
+
 	conn := &fakeConn{}
-	statsConn := NewStatsConn("global", conn)
+	statsConn := NewStatsConn("global", conn, testStatsConnReadSem)
 	ctx := context.Background()
 
 	statsConn.Update(ctx, "", []byte{}, conn.v)
-	timingCounts := topoStatsConnTimings.Counts()["Update.global"]
-	if got, want := timingCounts, int64(1); got != want {
-		t.Errorf("stats were not properly recorded: got = %d, want = %d", got, want)
-	}
+	require.Equal(t, int64(1), topoStatsConnTimings.Counts()["Update.global"])
+	require.NotZero(t, topoStatsConnTimings.Time())
+	require.Zero(t, topoStatsConnReadWaitTimings.Time())
 
 	// error is zero before getting an error
-	errorCount := topoStatsConnErrors.Counts()["Update.global"]
-	if got, want := errorCount, int64(0); got != want {
-		t.Errorf("stats were not properly recorded: got = %d, want = %d", got, want)
-	}
+	require.Zero(t, topoStatsConnErrors.Counts()["Update.global"])
 
 	statsConn.Update(ctx, "error", []byte{}, conn.v)
 
 	// error stats gets emitted
-	errorCount = topoStatsConnErrors.Counts()["Update.global"]
-	if got, want := errorCount, int64(1); got != want {
-		t.Errorf("stats were not properly recorded: got = %d, want = %d", got, want)
-	}
+	require.Equal(t, int64(1), topoStatsConnErrors.Counts()["Update.global"])
 }
 
-//TestStatsConnTopoGet emits stats on Get
+// TestStatsConnTopoGet emits stats on Get
 func TestStatsConnTopoGet(t *testing.T) {
+	testStatsConnStatsReset()
+	defer testStatsConnStatsReset()
+
 	conn := &fakeConn{}
-	statsConn := NewStatsConn("global", conn)
+	statsConn := NewStatsConn("global", conn, testStatsConnReadSem)
 	ctx := context.Background()
 
+	semAcquiredChan := make(chan struct{})
+	go createTestReadSemaphoreContention(ctx, time.Millisecond*100, semAcquiredChan)
+	<-semAcquiredChan
 	statsConn.Get(ctx, "")
-	timingCounts := topoStatsConnTimings.Counts()["Get.global"]
-	if got, want := timingCounts, int64(1); got != want {
-		t.Errorf("stats were not properly recorded: got = %d, want = %d", got, want)
-	}
+	require.Equal(t, int64(1), topoStatsConnTimings.Counts()["Get.global"])
+	require.NotZero(t, topoStatsConnTimings.Time())
+
+	require.Equal(t, int64(1), topoStatsConnReadWaitTimings.Counts()["Get.global"])
+	require.NotZero(t, topoStatsConnReadWaitTimings.Time())
 
 	// error is zero before getting an error
-	errorCount := topoStatsConnErrors.Counts()["Get.global"]
-	if got, want := errorCount, int64(0); got != want {
-		t.Errorf("stats were not properly recorded: got = %d, want = %d", got, want)
-	}
+	require.Zero(t, topoStatsConnErrors.Counts()["Get.global"])
 
 	statsConn.Get(ctx, "error")
 
 	// error stats gets emitted
-	errorCount = topoStatsConnErrors.Counts()["Get.global"]
-	if got, want := errorCount, int64(1); got != want {
-		t.Errorf("stats were not properly recorded: got = %d, want = %d", got, want)
-	}
+	require.Equal(t, int64(1), topoStatsConnErrors.Counts()["Get.global"])
 }
 
-//TestStatsConnTopoDelete emits stats on Delete
+// TestStatsConnTopoDelete emits stats on Delete
 func TestStatsConnTopoDelete(t *testing.T) {
+	testStatsConnStatsReset()
+	defer testStatsConnStatsReset()
+
 	conn := &fakeConn{}
-	statsConn := NewStatsConn("global", conn)
+	statsConn := NewStatsConn("global", conn, testStatsConnReadSem)
 	ctx := context.Background()
 
 	statsConn.Delete(ctx, "", conn.v)
-	timingCounts := topoStatsConnTimings.Counts()["Delete.global"]
-	if got, want := timingCounts, int64(1); got != want {
-		t.Errorf("stats were not properly recorded: got = %d, want = %d", got, want)
-	}
+	require.Equal(t, int64(1), topoStatsConnTimings.Counts()["Delete.global"])
+	require.NotZero(t, topoStatsConnTimings.Time())
+	require.Zero(t, topoStatsConnReadWaitTimings.Time())
 
 	// error is zero before getting an error
-	errorCount := topoStatsConnErrors.Counts()["Delete.global"]
-	if got, want := errorCount, int64(0); got != want {
-		t.Errorf("stats were not properly recorded: got = %d, want = %d", got, want)
-	}
+	require.Zero(t, topoStatsConnErrors.Counts()["Delete.global"])
 
 	statsConn.Delete(ctx, "error", conn.v)
 
 	// error stats gets emitted
-	errorCount = topoStatsConnErrors.Counts()["Delete.global"]
-	if got, want := errorCount, int64(1); got != want {
-		t.Errorf("stats were not properly recorded: got = %d, want = %d", got, want)
-	}
+	require.Equal(t, int64(1), topoStatsConnErrors.Counts()["Delete.global"])
 }
 
-//TestStatsConnTopoLock emits stats on Lock
+// TestStatsConnTopoLock emits stats on Lock
 func TestStatsConnTopoLock(t *testing.T) {
+	testStatsConnStatsReset()
+	defer testStatsConnStatsReset()
+
 	conn := &fakeConn{}
-	statsConn := NewStatsConn("global", conn)
+	statsConn := NewStatsConn("global", conn, testStatsConnReadSem)
 	ctx := context.Background()
 
 	statsConn.Lock(ctx, "", "")
-	timingCounts := topoStatsConnTimings.Counts()["Lock.global"]
-	if got, want := timingCounts, int64(1); got != want {
-		t.Errorf("stats were not properly recorded: got = %d, want = %d", got, want)
-	}
+	require.Equal(t, int64(1), topoStatsConnTimings.Counts()["Lock.global"])
+	require.NotZero(t, topoStatsConnTimings.Time())
+	require.Zero(t, topoStatsConnReadWaitTimings.Time())
 
-	// error is zero before getting an error
-	errorCount := topoStatsConnErrors.Counts()["Lock.global"]
-	if got, want := errorCount, int64(0); got != want {
-		t.Errorf("stats were not properly recorded: got = %d, want = %d", got, want)
-	}
+	statsConn.LockWithTTL(ctx, "", "", time.Second)
+	require.Equal(t, int64(1), topoStatsConnTimings.Counts()["LockWithTTL.global"])
+
+	statsConn.LockName(ctx, "", "")
+	require.Equal(t, int64(1), topoStatsConnTimings.Counts()["LockName.global"])
+
+	// Error is zero before getting an error.
+	require.Zero(t, topoStatsConnErrors.Counts()["Lock.global"])
 
 	statsConn.Lock(ctx, "error", "")
 
-	// error stats gets emitted
-	errorCount = topoStatsConnErrors.Counts()["Lock.global"]
-	if got, want := errorCount, int64(1); got != want {
-		t.Errorf("stats were not properly recorded: got = %d, want = %d", got, want)
-	}
+	// Error stats gets emitted.
+	require.Equal(t, int64(1), topoStatsConnErrors.Counts()["Lock.global"])
 }
 
-//TestStatsConnTopoWatch emits stats on Watch
+// TestStatsConnTopoWatch emits stats on Watch
 func TestStatsConnTopoWatch(t *testing.T) {
+	testStatsConnStatsReset()
+	defer testStatsConnStatsReset()
+
 	conn := &fakeConn{}
-	statsConn := NewStatsConn("global", conn)
+	statsConn := NewStatsConn("global", conn, testStatsConnReadSem)
 	ctx := context.Background()
 
 	statsConn.Watch(ctx, "")
-	timingCounts := topoStatsConnTimings.Counts()["Watch.global"]
-	if got, want := timingCounts, int64(1); got != want {
-		t.Errorf("stats were not properly recorded: got = %d, want = %d", got, want)
-	}
-
+	require.Equal(t, int64(1), topoStatsConnTimings.Counts()["Watch.global"])
+	require.NotZero(t, topoStatsConnTimings.Time())
+	require.Zero(t, topoStatsConnReadWaitTimings.Time())
 }
 
-//TestStatsConnTopoNewMasterParticipation emits stats on NewMasterParticipation
-func TestStatsConnTopoNewMasterParticipation(t *testing.T) {
-	conn := &fakeConn{}
-	statsConn := NewStatsConn("global", conn)
+// TestStatsConnTopoNewLeaderParticipation emits stats on NewLeaderParticipation
+func TestStatsConnTopoNewLeaderParticipation(t *testing.T) {
+	testStatsConnStatsReset()
+	defer testStatsConnStatsReset()
 
-	statsConn.NewMasterParticipation("", "")
-	timingCounts := topoStatsConnTimings.Counts()["NewMasterParticipation.global"]
-	if got, want := timingCounts, int64(1); got != want {
-		t.Errorf("stats were not properly recorded: got = %d, want = %d", got, want)
-	}
+	conn := &fakeConn{}
+	statsConn := NewStatsConn("global", conn, testStatsConnReadSem)
+
+	_, _ = statsConn.NewLeaderParticipation("", "")
+	require.Equal(t, int64(1), topoStatsConnTimings.Counts()["NewLeaderParticipation.global"])
+	require.NotZero(t, topoStatsConnTimings.Time())
+	require.Zero(t, topoStatsConnReadWaitTimings.Time())
 
 	// error is zero before getting an error
-	errorCount := topoStatsConnErrors.Counts()["NewMasterParticipation.global"]
-	if got, want := errorCount, int64(0); got != want {
-		t.Errorf("stats were not properly recorded: got = %d, want = %d", got, want)
-	}
+	require.Zero(t, topoStatsConnErrors.Counts()["NewLeaderParticipation.global"])
 
-	statsConn.NewMasterParticipation("error", "")
+	_, _ = statsConn.NewLeaderParticipation("error", "")
 
 	// error stats gets emitted
-	errorCount = topoStatsConnErrors.Counts()["NewMasterParticipation.global"]
-	if got, want := errorCount, int64(1); got != want {
-		t.Errorf("stats were not properly recorded: got = %d, want = %d", got, want)
-	}
+	require.Equal(t, int64(1), topoStatsConnErrors.Counts()["NewLeaderParticipation.global"])
 }
 
-//TestStatsConnTopoClose emits stats on Close
+// TestStatsConnTopoClose emits stats on Close
 func TestStatsConnTopoClose(t *testing.T) {
+	testStatsConnStatsReset()
+	defer testStatsConnStatsReset()
+
 	conn := &fakeConn{}
-	statsConn := NewStatsConn("global", conn)
+	statsConn := NewStatsConn("global", conn, testStatsConnReadSem)
 
 	statsConn.Close()
-	timingCounts := topoStatsConnTimings.Counts()["Close.global"]
-	if got, want := timingCounts, int64(1); got != want {
-		t.Errorf("stats were not properly recorded: got = %d, want = %d", got, want)
-	}
+	require.Equal(t, int64(1), topoStatsConnTimings.Counts()["Close.global"])
+	require.NotZero(t, topoStatsConnTimings.Time())
+	require.Zero(t, topoStatsConnReadWaitTimings.Time())
 }

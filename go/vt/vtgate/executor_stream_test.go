@@ -17,28 +17,34 @@ limitations under the License.
 package vtgate
 
 import (
+	"context"
 	"testing"
 	"time"
 
-	"golang.org/x/net/context"
+	"github.com/stretchr/testify/require"
+
 	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/streamlog"
+	"vitess.io/vitess/go/test/utils"
 	"vitess.io/vitess/go/vt/discovery"
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	vtgatepb "vitess.io/vitess/go/vt/proto/vtgate"
+	"vitess.io/vitess/go/vt/vtenv"
+	econtext "vitess.io/vitess/go/vt/vtgate/executorcontext"
+	"vitess.io/vitess/go/vt/vtgate/logstats"
 	_ "vitess.io/vitess/go/vt/vtgate/vindexes"
 	"vitess.io/vitess/go/vt/vttablet/sandboxconn"
 )
 
 func TestStreamSQLUnsharded(t *testing.T) {
-	executor, _, _, _ := createExecutorEnv()
-	logChan := QueryLogger.Subscribe("Test")
-	defer QueryLogger.Unsubscribe(logChan)
+	executor, _, _, _, _ := createExecutorEnv(t)
+	logChan := executor.queryLogger.Subscribe("Test")
+	defer executor.queryLogger.Unsubscribe(logChan)
 
 	sql := "stream * from user_msgs"
 	result, err := executorStreamMessages(executor, sql)
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 	wantResult := sandboxconn.StreamRowResult
 	if !result.Equal(wantResult) {
 		t.Errorf("result: %+v, want %+v", result, wantResult)
@@ -46,25 +52,30 @@ func TestStreamSQLUnsharded(t *testing.T) {
 }
 
 func TestStreamSQLSharded(t *testing.T) {
-	// Special setup: Don't use createExecutorEnv.
+	ctx := utils.LeakCheckContext(t)
 	cell := "aa"
-	hc := discovery.NewFakeHealthCheck()
+	hc := discovery.NewFakeHealthCheck(nil)
+	u := createSandbox(KsTestUnsharded)
 	s := createSandbox("TestExecutor")
 	s.VSchema = executorVSchema
-	getSandbox(KsTestUnsharded).VSchema = unshardedVSchema
-	serv := new(sandboxTopo)
-	resolver := newTestResolver(hc, serv, cell)
+	u.VSchema = unshardedVSchema
+	serv := newSandboxForCells(ctx, []string{cell})
+	resolver := newTestResolver(ctx, hc, serv, cell)
 	shards := []string{"-20", "20-40", "40-60", "60-80", "80-a0", "a0-c0", "c0-e0", "e0-"}
 	for _, shard := range shards {
-		_ = hc.AddTestTablet(cell, shard, 1, "TestExecutor", shard, topodatapb.TabletType_MASTER, true, 1, nil)
+		_ = hc.AddTestTablet(cell, shard, 1, "TestExecutor", shard, topodatapb.TabletType_PRIMARY, true, 1, nil)
 	}
-	executor := NewExecutor(context.Background(), serv, cell, "", resolver, false, testBufferSize, testCacheSize)
+	queryLogger := streamlog.New[*logstats.LogStats]("VTGate", queryLogBufferSize)
+	plans := DefaultPlanCache()
+
+	executor := NewExecutor(ctx, vtenv.NewTestEnv(), serv, cell, resolver, createExecutorConfig(), false, plans, nil, querypb.ExecuteOptions_Gen4, NewDynamicViperConfig())
+	executor.SetQueryLogger(queryLogger)
+
+	defer executor.Close()
 
 	sql := "stream * from sharded_user_msgs"
 	result, err := executorStreamMessages(executor, sql)
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 	wantResult := &sqltypes.Result{
 		Fields: sandboxconn.SingleRowResult.Fields,
 		Rows: [][]sqltypes.Value{
@@ -87,15 +98,14 @@ func executorStreamMessages(executor *Executor, sql string) (qr *sqltypes.Result
 	results := make(chan *sqltypes.Result, 100)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
+	session := &vtgatepb.Session{TargetString: "@primary"}
 	err = executor.StreamExecute(
 		ctx,
+		nil,
 		"TestExecuteStream",
-		NewSafeSession(masterSession),
+		econtext.NewSafeSession(session),
 		sql,
 		nil,
-		querypb.Target{
-			TabletType: topodatapb.TabletType_MASTER,
-		},
 		func(qr *sqltypes.Result) error {
 			results <- qr
 			return nil

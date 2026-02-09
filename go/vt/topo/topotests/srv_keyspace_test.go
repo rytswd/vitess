@@ -17,15 +17,16 @@ limitations under the License.
 package topotests
 
 import (
+	"context"
 	"reflect"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
-	"golang.org/x/net/context"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 
-	"github.com/golang/protobuf/proto"
 	"vitess.io/vitess/go/json2"
 	"vitess.io/vitess/go/vt/key"
 	"vitess.io/vitess/go/vt/topo"
@@ -36,23 +37,24 @@ import (
 
 // waitForInitialSrvKeyspace waits for the initial SrvKeyspace to
 // appear, and match the provided srvKeyspace.
-func waitForInitialSrvKeyspace(t *testing.T, ts *topo.Server, cell, keyspace string) (current *topo.WatchSrvKeyspaceData, changes <-chan *topo.WatchSrvKeyspaceData, cancel topo.CancelFunc) {
-	ctx := context.Background()
+func waitForInitialSrvKeyspace(t *testing.T, ts *topo.Server, cell, keyspace string) (current *topo.WatchSrvKeyspaceData, changes <-chan *topo.WatchSrvKeyspaceData, cancel context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
 	start := time.Now()
+	var err error
 	for {
-		current, changes, cancel = ts.WatchSrvKeyspace(ctx, cell, keyspace)
+		current, changes, err = ts.WatchSrvKeyspace(ctx, cell, keyspace)
 		switch {
-		case topo.IsErrType(current.Err, topo.NoNode):
+		case topo.IsErrType(err, topo.NoNode):
 			// hasn't appeared yet
 			if time.Since(start) > 10*time.Second {
 				t.Fatalf("time out waiting for file to appear")
 			}
 			time.Sleep(10 * time.Millisecond)
 			continue
-		case current.Err == nil:
+		case err == nil:
 			return
 		default:
-			t.Fatalf("watch failed: %v", current.Err)
+			t.Fatalf("watch failed: %v", err)
 		}
 	}
 }
@@ -60,22 +62,24 @@ func waitForInitialSrvKeyspace(t *testing.T, ts *topo.Server, cell, keyspace str
 func TestWatchSrvKeyspaceNoNode(t *testing.T) {
 	cell := "cell1"
 	keyspace := "ks1"
-	ctx := context.Background()
-	ts := memorytopo.NewServer(cell)
+	ctx := t.Context()
+	ts := memorytopo.NewServer(ctx, cell)
+	defer ts.Close()
 
 	// No SrvKeyspace -> ErrNoNode
-	current, _, _ := ts.WatchSrvKeyspace(ctx, cell, keyspace)
-	if !topo.IsErrType(current.Err, topo.NoNode) {
-		t.Errorf("Got invalid result from WatchSrvKeyspace(not there): %v", current.Err)
+	_, _, err := ts.WatchSrvKeyspace(ctx, cell, keyspace)
+	if !topo.IsErrType(err, topo.NoNode) {
+		t.Errorf("Got invalid result from WatchSrvKeyspace(not there): %v", err)
 	}
 }
 
 func TestWatchSrvKeyspace(t *testing.T) {
-
 	cell := "cell1"
 	keyspace := "ks1"
-	ctx := context.Background()
-	ts := memorytopo.NewServer(cell)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ts := memorytopo.NewServer(ctx, cell)
+	defer ts.Close()
 
 	// Create initial value
 	if err := ts.UpdateSrvKeyspace(ctx, cell, keyspace, &topodatapb.SrvKeyspace{}); err != nil {
@@ -88,28 +92,6 @@ func TestWatchSrvKeyspace(t *testing.T) {
 	current, changes, cancel := waitForInitialSrvKeyspace(t, ts, cell, keyspace)
 	if !proto.Equal(current.Value, wanted) {
 		t.Fatalf("got bad data: %v expected: %v", current.Value, wanted)
-	}
-
-	// Update the value with good data, wait until we see it
-	wanted.ShardingColumnName = "scn1"
-	if err := ts.UpdateSrvKeyspace(ctx, cell, keyspace, wanted); err != nil {
-		t.Fatalf("Update(/keyspaces/ks1/SrvKeyspace) failed: %v", err)
-	}
-	for {
-		wd, ok := <-changes
-		if !ok {
-			t.Fatalf("watch channel unexpectedly closed")
-		}
-		if wd.Err != nil {
-			t.Fatalf("watch channel unexpectedly got error: %v", wd.Err)
-		}
-		if proto.Equal(wd.Value, wanted) {
-			break
-		}
-		if proto.Equal(wd.Value, &topodatapb.SrvKeyspace{}) {
-			t.Log("got duplicate empty value, skipping.")
-		}
-		t.Fatalf("got bad data: %v expected: %v", wd.Value, wanted)
 	}
 
 	// Update the value with bad data, wait until error.
@@ -141,9 +123,9 @@ func TestWatchSrvKeyspace(t *testing.T) {
 	cancel()
 
 	// Bad data in topo, setting the watch should now fail.
-	current, _, _ = ts.WatchSrvKeyspace(ctx, cell, keyspace)
-	if current.Err == nil || !strings.Contains(current.Err.Error(), "error unpacking initial SrvKeyspace object") {
-		t.Fatalf("expected an initial error setting watch on bad content, but got: %v", current.Err)
+	_, _, err = ts.WatchSrvKeyspace(ctx, cell, keyspace)
+	if err == nil || !strings.Contains(err.Error(), "error unpacking initial SrvKeyspace object") {
+		t.Fatalf("expected an initial error setting watch on bad content, but got: %v", err)
 	}
 
 	// Update content, wait until Watch works again
@@ -152,9 +134,9 @@ func TestWatchSrvKeyspace(t *testing.T) {
 	}
 	start := time.Now()
 	for {
-		current, changes, _ = ts.WatchSrvKeyspace(ctx, cell, keyspace)
-		if current.Err != nil {
-			if strings.Contains(current.Err.Error(), "error unpacking initial SrvKeyspace object") {
+		current, changes, err = ts.WatchSrvKeyspace(ctx, cell, keyspace)
+		if err != nil {
+			if strings.Contains(err.Error(), "error unpacking initial SrvKeyspace object") {
 				// hasn't changed yet
 				if time.Since(start) > 10*time.Second {
 					t.Fatalf("time out waiting for file to appear")
@@ -195,19 +177,19 @@ func TestWatchSrvKeyspace(t *testing.T) {
 func TestWatchSrvKeyspaceCancel(t *testing.T) {
 	cell := "cell1"
 	keyspace := "ks1"
-	ctx := context.Background()
-	ts := memorytopo.NewServer(cell)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ts := memorytopo.NewServer(ctx, cell)
+	defer ts.Close()
 
 	// No SrvKeyspace -> ErrNoNode
-	current, _, _ := ts.WatchSrvKeyspace(ctx, cell, keyspace)
-	if !topo.IsErrType(current.Err, topo.NoNode) {
-		t.Errorf("Got invalid result from WatchSrvKeyspace(not there): %v", current.Err)
+	_, _, err := ts.WatchSrvKeyspace(ctx, cell, keyspace)
+	if !topo.IsErrType(err, topo.NoNode) {
+		t.Errorf("Got invalid result from WatchSrvKeyspace(not there): %v", err)
 	}
 
 	// Create initial value
-	wanted := &topodatapb.SrvKeyspace{
-		ShardingColumnName: "scn2",
-	}
+	wanted := &topodatapb.SrvKeyspace{}
 	if err := ts.UpdateSrvKeyspace(ctx, cell, keyspace, wanted); err != nil {
 		t.Fatalf("UpdateSrvKeyspace() failed: %v", err)
 	}
@@ -245,8 +227,9 @@ func TestUpdateSrvKeyspacePartitions(t *testing.T) {
 	cell := "cell1"
 	cell2 := "cell2"
 	keyspace := "ks1"
-	ctx := context.Background()
-	ts := memorytopo.NewServer(cell, cell2)
+	ctx := t.Context()
+	ts := memorytopo.NewServer(ctx, cell, cell2)
+	defer ts.Close()
 
 	keyRange, err := key.ParseShardingSpec("-")
 	if err != nil || len(keyRange) != 1 {
@@ -256,7 +239,7 @@ func TestUpdateSrvKeyspacePartitions(t *testing.T) {
 	initial := &topodatapb.SrvKeyspace{
 		Partitions: []*topodatapb.SrvKeyspace_KeyspacePartition{
 			{
-				ServedType: topodatapb.TabletType_MASTER,
+				ServedType: topodatapb.TabletType_PRIMARY,
 				ShardReferences: []*topodatapb.ShardReference{
 					{
 						Name:     "-",
@@ -293,7 +276,7 @@ func TestUpdateSrvKeyspacePartitions(t *testing.T) {
 	targetKs := &topodatapb.SrvKeyspace{
 		Partitions: []*topodatapb.SrvKeyspace_KeyspacePartition{
 			{
-				ServedType: topodatapb.TabletType_MASTER,
+				ServedType: topodatapb.TabletType_PRIMARY,
 				ShardReferences: []*topodatapb.ShardReference{
 					{
 						Name:     "-",
@@ -323,7 +306,7 @@ func TestUpdateSrvKeyspacePartitions(t *testing.T) {
 	}
 	defer unlock(&err)
 
-	if err := ts.AddSrvKeyspacePartitions(ctx, keyspace, shards, topodatapb.TabletType_MASTER, []string{cell}); err != nil {
+	if err := ts.AddSrvKeyspacePartitions(ctx, keyspace, shards, topodatapb.TabletType_PRIMARY, []string{cell}); err != nil {
 		t.Fatalf("AddSrvKeyspacePartitions() failed: %v", err)
 	}
 
@@ -350,7 +333,7 @@ func TestUpdateSrvKeyspacePartitions(t *testing.T) {
 	targetKs = &topodatapb.SrvKeyspace{
 		Partitions: []*topodatapb.SrvKeyspace_KeyspacePartition{
 			{
-				ServedType: topodatapb.TabletType_MASTER,
+				ServedType: topodatapb.TabletType_PRIMARY,
 				ShardReferences: []*topodatapb.ShardReference{
 					{
 						Name:     "-",
@@ -361,7 +344,7 @@ func TestUpdateSrvKeyspacePartitions(t *testing.T) {
 		},
 	}
 
-	if err = ts.DeleteSrvKeyspacePartitions(ctx, keyspace, shards, topodatapb.TabletType_MASTER, []string{cell}); err != nil {
+	if err = ts.DeleteSrvKeyspacePartitions(ctx, keyspace, shards, topodatapb.TabletType_PRIMARY, []string{cell}); err != nil {
 		t.Fatalf("DeleteSrvKeyspacePartitions() failed: %v", err)
 	}
 
@@ -388,7 +371,7 @@ func TestUpdateSrvKeyspacePartitions(t *testing.T) {
 	targetKs = &topodatapb.SrvKeyspace{
 		Partitions: []*topodatapb.SrvKeyspace_KeyspacePartition{
 			{
-				ServedType: topodatapb.TabletType_MASTER,
+				ServedType: topodatapb.TabletType_PRIMARY,
 				ShardReferences: []*topodatapb.ShardReference{
 					{
 						Name:     "-",
@@ -479,15 +462,15 @@ func TestUpdateSrvKeyspacePartitions(t *testing.T) {
 	if string(got) != string(want) {
 		t.Errorf("GetSrvKeyspace() failure. Got %v, want: %v", string(got), string(want))
 	}
-
 }
 
 func TestUpdateUpdateDisableQueryService(t *testing.T) {
 	cell := "cell1"
 	cell2 := "cell2"
 	keyspace := "ks1"
-	ctx := context.Background()
-	ts := memorytopo.NewServer(cell, cell2)
+	ctx := t.Context()
+	ts := memorytopo.NewServer(ctx, cell, cell2)
+	defer ts.Close()
 
 	leftKeyRange, err := key.ParseShardingSpec("-80")
 	if err != nil || len(leftKeyRange) != 1 {
@@ -502,7 +485,7 @@ func TestUpdateUpdateDisableQueryService(t *testing.T) {
 	initial := &topodatapb.SrvKeyspace{
 		Partitions: []*topodatapb.SrvKeyspace_KeyspacePartition{
 			{
-				ServedType: topodatapb.TabletType_MASTER,
+				ServedType: topodatapb.TabletType_PRIMARY,
 				ShardReferences: []*topodatapb.ShardReference{
 					{
 						Name:     "-80",
@@ -533,7 +516,7 @@ func TestUpdateUpdateDisableQueryService(t *testing.T) {
 	targetKs := &topodatapb.SrvKeyspace{
 		Partitions: []*topodatapb.SrvKeyspace_KeyspacePartition{
 			{
-				ServedType: topodatapb.TabletType_MASTER,
+				ServedType: topodatapb.TabletType_PRIMARY,
 				ShardReferences: []*topodatapb.ShardReference{
 					{
 						Name:     "-80",
@@ -571,7 +554,7 @@ func TestUpdateUpdateDisableQueryService(t *testing.T) {
 	}
 	defer unlock(&err)
 
-	if err := ts.UpdateDisableQueryService(ctx, keyspace, shards, topodatapb.TabletType_MASTER, []string{cell}, true /* disableQueryService */); err != nil {
+	if err := ts.UpdateDisableQueryService(ctx, keyspace, shards, topodatapb.TabletType_PRIMARY, []string{cell}, true /* disableQueryService */); err != nil {
 		t.Fatalf("UpdateDisableQueryService() failed: %v", err)
 	}
 
@@ -618,7 +601,7 @@ func TestUpdateUpdateDisableQueryService(t *testing.T) {
 	targetKs = &topodatapb.SrvKeyspace{
 		Partitions: []*topodatapb.SrvKeyspace_KeyspacePartition{
 			{
-				ServedType: topodatapb.TabletType_MASTER,
+				ServedType: topodatapb.TabletType_PRIMARY,
 				ShardReferences: []*topodatapb.ShardReference{
 					{
 						Name:     "-80",
@@ -650,7 +633,7 @@ func TestUpdateUpdateDisableQueryService(t *testing.T) {
 		topo.NewShardInfo(keyspace, "80-", &topodatapb.Shard{KeyRange: rightKeyRange[0]}, nil),
 	}
 
-	if err := ts.UpdateDisableQueryService(ctx, keyspace, shards, topodatapb.TabletType_MASTER, []string{cell}, false /* disableQueryService */); err != nil {
+	if err := ts.UpdateDisableQueryService(ctx, keyspace, shards, topodatapb.TabletType_PRIMARY, []string{cell}, false /* disableQueryService */); err != nil {
 		t.Fatalf("UpdateDisableQueryService() failed: %v", err)
 	}
 
@@ -678,8 +661,9 @@ func TestGetShardServingTypes(t *testing.T) {
 	cell := "cell1"
 	cell2 := "cell2"
 	keyspace := "ks1"
-	ctx := context.Background()
-	ts := memorytopo.NewServer(cell, cell2)
+	ctx := t.Context()
+	ts := memorytopo.NewServer(ctx, cell, cell2)
+	defer ts.Close()
 
 	leftKeyRange, err := key.ParseShardingSpec("-80")
 	if err != nil || len(leftKeyRange) != 1 {
@@ -694,7 +678,7 @@ func TestGetShardServingTypes(t *testing.T) {
 	initial := &topodatapb.SrvKeyspace{
 		Partitions: []*topodatapb.SrvKeyspace_KeyspacePartition{
 			{
-				ServedType: topodatapb.TabletType_MASTER,
+				ServedType: topodatapb.TabletType_PRIMARY,
 				ShardReferences: []*topodatapb.ShardReference{
 					{
 						Name:     "-80",
@@ -747,7 +731,7 @@ func TestGetShardServingTypes(t *testing.T) {
 		t.Fatalf("GetShardServingTypes() failed: %v", err)
 	}
 
-	want := []topodatapb.TabletType{topodatapb.TabletType_MASTER, topodatapb.TabletType_RDONLY}
+	want := []topodatapb.TabletType{topodatapb.TabletType_PRIMARY, topodatapb.TabletType_RDONLY}
 
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("GetShardServingTypes() failure. Got %v, want: %v", got, want)
@@ -760,7 +744,7 @@ func TestGetShardServingTypes(t *testing.T) {
 		t.Fatalf("GetShardServingTypes() failed: %v", err)
 	}
 
-	want = []topodatapb.TabletType{topodatapb.TabletType_MASTER, topodatapb.TabletType_REPLICA}
+	want = []topodatapb.TabletType{topodatapb.TabletType_PRIMARY, topodatapb.TabletType_REPLICA}
 
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("GetShardServingTypes() failure. Got %v, want: %v", got, want)
@@ -786,8 +770,9 @@ func TestGetShardServingCells(t *testing.T) {
 	cell := "cell1"
 	cell2 := "cell2"
 	keyspace := "ks1"
-	ctx := context.Background()
-	ts := memorytopo.NewServer(cell, cell2)
+	ctx := t.Context()
+	ts := memorytopo.NewServer(ctx, cell, cell2)
+	defer ts.Close()
 
 	leftKeyRange, err := key.ParseShardingSpec("-80")
 	if err != nil || len(leftKeyRange) != 1 {
@@ -802,7 +787,7 @@ func TestGetShardServingCells(t *testing.T) {
 	initial := &topodatapb.SrvKeyspace{
 		Partitions: []*topodatapb.SrvKeyspace_KeyspacePartition{
 			{
-				ServedType: topodatapb.TabletType_MASTER,
+				ServedType: topodatapb.TabletType_PRIMARY,
 				ShardReferences: []*topodatapb.ShardReference{
 					{
 						Name:     "-80",
@@ -890,8 +875,9 @@ func TestMasterMigrateServedType(t *testing.T) {
 	cell := "cell1"
 	cell2 := "cell2"
 	keyspace := "ks1"
-	ctx := context.Background()
-	ts := memorytopo.NewServer(cell, cell2)
+	ctx := t.Context()
+	ts := memorytopo.NewServer(ctx, cell, cell2)
+	defer ts.Close()
 
 	initialKeyRange, err := key.ParseShardingSpec("-")
 	if err != nil || len(initialKeyRange) != 1 {
@@ -911,7 +897,7 @@ func TestMasterMigrateServedType(t *testing.T) {
 	initial := &topodatapb.SrvKeyspace{
 		Partitions: []*topodatapb.SrvKeyspace_KeyspacePartition{
 			{
-				ServedType: topodatapb.TabletType_MASTER,
+				ServedType: topodatapb.TabletType_PRIMARY,
 				ShardReferences: []*topodatapb.ShardReference{
 					{
 						Name:     "-",
@@ -992,7 +978,7 @@ func TestMasterMigrateServedType(t *testing.T) {
 	targetKs := &topodatapb.SrvKeyspace{
 		Partitions: []*topodatapb.SrvKeyspace_KeyspacePartition{
 			{
-				ServedType: topodatapb.TabletType_MASTER,
+				ServedType: topodatapb.TabletType_PRIMARY,
 				ShardReferences: []*topodatapb.ShardReference{
 					{
 						Name:     "-",
@@ -1103,12 +1089,12 @@ func TestMasterMigrateServedType(t *testing.T) {
 		t.Errorf("MigrateServedType() failure. Got %v, want: %v", string(got), string(want))
 	}
 
-	// migrating master type cleans up shard tablet controls records
+	// migrating primary type cleans up shard tablet controls records
 
 	targetKs = &topodatapb.SrvKeyspace{
 		Partitions: []*topodatapb.SrvKeyspace_KeyspacePartition{
 			{
-				ServedType: topodatapb.TabletType_MASTER,
+				ServedType: topodatapb.TabletType_PRIMARY,
 				ShardReferences: []*topodatapb.ShardReference{
 					{
 						Name:     "-80",
@@ -1145,7 +1131,7 @@ func TestMasterMigrateServedType(t *testing.T) {
 		},
 	}
 
-	err = ts.MigrateServedType(ctx, keyspace, destinationShards, sourceShards, topodatapb.TabletType_MASTER, nil)
+	err = ts.MigrateServedType(ctx, keyspace, destinationShards, sourceShards, topodatapb.TabletType_PRIMARY, nil)
 	if err != nil {
 		t.Fatalf("MigrateServedType() failed: %v", err)
 	}
@@ -1168,4 +1154,73 @@ func TestMasterMigrateServedType(t *testing.T) {
 	if string(got) != string(want) {
 		t.Errorf("MigrateServedType() failure. Got %v, want: %v", string(got), string(want))
 	}
+}
+
+func TestValidateSrvKeyspace(t *testing.T) {
+	cell := "cell1"
+	cell2 := "cell2"
+	keyspace := "ks1"
+	ctx := t.Context()
+	ts := memorytopo.NewServer(ctx, cell, cell2)
+	defer ts.Close()
+
+	leftKeyRange, err := key.ParseShardingSpec("-80")
+	if err != nil || len(leftKeyRange) != 1 {
+		t.Fatalf("ParseShardingSpec failed. Expected non error and only one element. Got err: %v, len(%v)", err, len(leftKeyRange))
+	}
+
+	rightKeyRange, err := key.ParseShardingSpec("80-")
+	if err != nil || len(rightKeyRange) != 1 {
+		t.Fatalf("ParseShardingSpec failed. Expected non error and only one element. Got err: %v, len(%v)", err, len(rightKeyRange))
+	}
+
+	correct := &topodatapb.SrvKeyspace{
+		Partitions: []*topodatapb.SrvKeyspace_KeyspacePartition{
+			{
+				ServedType: topodatapb.TabletType_PRIMARY,
+				ShardReferences: []*topodatapb.ShardReference{
+					{
+						Name:     "-80",
+						KeyRange: leftKeyRange[0],
+					},
+					{
+						Name:     "80-",
+						KeyRange: rightKeyRange[0],
+					},
+				},
+			},
+		},
+	}
+
+	incorrect := &topodatapb.SrvKeyspace{
+		Partitions: []*topodatapb.SrvKeyspace_KeyspacePartition{
+			{
+				ServedType: topodatapb.TabletType_PRIMARY,
+				ShardReferences: []*topodatapb.ShardReference{
+					{
+						Name:     "80-",
+						KeyRange: rightKeyRange[0],
+					},
+				},
+			},
+		},
+	}
+
+	if err := ts.UpdateSrvKeyspace(ctx, cell, keyspace, correct); err != nil {
+		t.Fatalf("UpdateSrvKeyspace() failed: %v", err)
+	}
+
+	if err := ts.UpdateSrvKeyspace(ctx, cell2, keyspace, incorrect); err != nil {
+		t.Fatalf("UpdateSrvKeyspace() failed: %v", err)
+	}
+	errMsg := "keyspace partition for PRIMARY in cell cell2 does not start with min key"
+	err = ts.ValidateSrvKeyspace(ctx, keyspace, "cell1,cell2")
+	require.EqualError(t, err, errMsg)
+
+	err = ts.ValidateSrvKeyspace(ctx, keyspace, "cell1")
+	require.NoError(t, err)
+	err = ts.ValidateSrvKeyspace(ctx, keyspace, "cell2")
+	require.EqualError(t, err, errMsg)
+	err = ts.ValidateSrvKeyspace(ctx, keyspace, "")
+	require.EqualError(t, err, errMsg)
 }

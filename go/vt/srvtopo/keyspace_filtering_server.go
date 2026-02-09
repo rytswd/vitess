@@ -17,30 +17,23 @@ limitations under the License.
 package srvtopo
 
 import (
-	"fmt"
-
-	"golang.org/x/net/context"
+	"context"
+	"errors"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
 	"vitess.io/vitess/go/vt/topo"
 )
 
-var (
-	// ErrNilUnderlyingServer is returned when attempting to create a new keyspace
-	// filtering server if a nil underlying server implementation is provided.
-	ErrNilUnderlyingServer = fmt.Errorf("unable to construct filtering server without an underlying server")
-
-	// ErrTopoServerNotAvailable is returned if a caller tries to access the
-	// topo.Server supporting this srvtopo.Server.
-	ErrTopoServerNotAvailable = fmt.Errorf("cannot access underlying topology server when keyspace filtering is enabled")
-)
+// ErrNilUnderlyingServer is returned when attempting to create a new keyspace
+// filtering server if a nil underlying server implementation is provided.
+var ErrNilUnderlyingServer = errors.New("unable to construct filtering server without an underlying server")
 
 // NewKeyspaceFilteringServer constructs a new server based on the provided
 // implementation that prevents the specified keyspaces from being exposed
 // to consumers of the new Server.
 //
-// A filtering server will not allow access to the topo.Server to prevent
+// A filtering server will only allow read-only access to the topo.Server to prevent
 // updates that may corrupt the global VSchema keyspace.
 func NewKeyspaceFilteringServer(underlying Server, selectedKeyspaces []string) (Server, error) {
 	if underlying == nil {
@@ -52,8 +45,13 @@ func NewKeyspaceFilteringServer(underlying Server, selectedKeyspaces []string) (
 		keyspaces[ks] = true
 	}
 
+	readOnlyServer, err := NewReadOnlyServer(underlying)
+	if err != nil {
+		return nil, err
+	}
+
 	return keyspaceFilteringServer{
-		server:          underlying,
+		server:          readOnlyServer,
 		selectKeyspaces: keyspaces,
 	}, nil
 }
@@ -63,17 +61,17 @@ type keyspaceFilteringServer struct {
 	selectKeyspaces map[string]bool
 }
 
-// GetTopoServer returns an error; filtering srvtopo.Server consumers may not
-// access the underlying topo.Server.
+// GetTopoServer returns a read-only topo server
 func (ksf keyspaceFilteringServer) GetTopoServer() (*topo.Server, error) {
-	return nil, ErrTopoServerNotAvailable
+	return ksf.server.GetTopoServer()
 }
 
 func (ksf keyspaceFilteringServer) GetSrvKeyspaceNames(
 	ctx context.Context,
 	cell string,
+	staleOK bool,
 ) ([]string, error) {
-	keyspaces, err := ksf.server.GetSrvKeyspaceNames(ctx, cell)
+	keyspaces, err := ksf.server.GetSrvKeyspaceNames(ctx, cell, staleOK)
 	ret := make([]string, 0, len(keyspaces))
 	for _, ks := range keyspaces {
 		if ksf.selectKeyspaces[ks] {
@@ -95,12 +93,29 @@ func (ksf keyspaceFilteringServer) GetSrvKeyspace(
 	return ksf.server.GetSrvKeyspace(ctx, cell, keyspace)
 }
 
+func (ksf keyspaceFilteringServer) WatchSrvKeyspace(
+	ctx context.Context,
+	cell, keyspace string,
+	callback func(*topodatapb.SrvKeyspace, error) bool,
+) {
+	filteringCallback := func(ks *topodatapb.SrvKeyspace, err error) bool {
+		if ks != nil {
+			if !ksf.selectKeyspaces[keyspace] {
+				return callback(nil, topo.NewError(topo.NoNode, keyspace))
+			}
+		}
+		return callback(ks, err)
+	}
+
+	ksf.server.WatchSrvKeyspace(ctx, cell, keyspace, filteringCallback)
+}
+
 func (ksf keyspaceFilteringServer) WatchSrvVSchema(
 	ctx context.Context,
 	cell string,
-	callback func(*vschemapb.SrvVSchema, error),
+	callback func(*vschemapb.SrvVSchema, error) bool,
 ) {
-	filteringCallback := func(schema *vschemapb.SrvVSchema, err error) {
+	filteringCallback := func(schema *vschemapb.SrvVSchema, err error) bool {
 		if schema != nil {
 			for ks := range schema.Keyspaces {
 				if !ksf.selectKeyspaces[ks] {
@@ -109,7 +124,7 @@ func (ksf keyspaceFilteringServer) WatchSrvVSchema(
 			}
 		}
 
-		callback(schema, err)
+		return callback(schema, err)
 	}
 
 	ksf.server.WatchSrvVSchema(ctx, cell, filteringCallback)

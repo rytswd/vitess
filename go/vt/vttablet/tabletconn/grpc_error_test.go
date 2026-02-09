@@ -19,6 +19,8 @@ package tabletconn
 import (
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/vterrors"
 )
@@ -29,15 +31,14 @@ func TestTabletErrorFromRPCError(t *testing.T) {
 		want vtrpcpb.Code
 	}{{
 		in: &vtrpcpb.RPCError{
-			LegacyCode: vtrpcpb.LegacyErrorCode_BAD_INPUT_LEGACY,
-			Message:    "bad input",
+			Code:    vtrpcpb.Code_INVALID_ARGUMENT,
+			Message: "bad input",
 		},
 		want: vtrpcpb.Code_INVALID_ARGUMENT,
 	}, {
 		in: &vtrpcpb.RPCError{
-			LegacyCode: vtrpcpb.LegacyErrorCode_BAD_INPUT_LEGACY,
-			Message:    "bad input",
-			Code:       vtrpcpb.Code_INVALID_ARGUMENT,
+			Message: "bad input",
+			Code:    vtrpcpb.Code_INVALID_ARGUMENT,
 		},
 		want: vtrpcpb.Code_INVALID_ARGUMENT,
 	}, {
@@ -49,8 +50,6 @@ func TestTabletErrorFromRPCError(t *testing.T) {
 	}}
 	for _, tcase := range testcases {
 		got := vterrors.Code(ErrorFromVTRPC(tcase.in))
-		if got != tcase.want {
-			t.Errorf("FromVtRPCError(%v):\n%v, want\n%v", tcase.in, got, tcase.want)
-		}
+		require.Equal(t, tcase.want, got)
 	}
 }

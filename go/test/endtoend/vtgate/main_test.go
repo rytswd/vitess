@@ -17,12 +17,16 @@ limitations under the License.
 package vtgate
 
 import (
+	_ "embed"
 	"flag"
 	"os"
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/test/endtoend/cluster"
+	"vitess.io/vitess/go/test/endtoend/utils"
 )
 
 var (
@@ -30,145 +34,27 @@ var (
 	vtParams        mysql.ConnParams
 	KeyspaceName    = "ks"
 	Cell            = "test"
-	SchemaSQL       = `create table t1(
-	id1 bigint,
-	id2 bigint,
-	primary key(id1)
-) Engine=InnoDB;
 
-create table t1_id2_idx(
-	id2 bigint,
-	keyspace_id varbinary(10),
-	primary key(id2)
-) Engine=InnoDB;
+	//go:embed schema.sql
+	SchemaSQL string
 
-create table vstream_test(
-	id bigint,
-	val bigint,
-	primary key(id)
-) Engine=InnoDB;
+	//go:embed vschema.json
+	VSchema string
 
-create table aggr_test(
-	id bigint,
-	val1 varchar(16),
-	val2 bigint,
-	primary key(id)
-) Engine=InnoDB;
-
-create table t2(
-	id3 bigint,
-	id4 bigint,
-	primary key(id3)
-) Engine=InnoDB;
-
-create table t2_id4_idx(
-	id bigint not null auto_increment,
-	id4 bigint,
-	id3 bigint,
-	primary key(id),
-	key idx_id4(id4)
-) Engine=InnoDB;
-`
-
-	VSchema = `
-	{
-  "sharded": true,
-  "vindexes": {
-    "hash": {
-      "type": "hash"
-    },
-    "t1_id2_vdx": {
-      "type": "consistent_lookup_unique",
-      "params": {
-        "table": "t1_id2_idx",
-        "from": "id2",
-        "to": "keyspace_id"
-      },
-      "owner": "t1"
-    },
-    "t2_id4_idx": {
-      "type": "lookup_hash",
-      "params": {
-        "table": "t2_id4_idx",
-        "from": "id4",
-        "to": "id3",
-        "autocommit": "true"
-      },
-      "owner": "t2"
-    }
-  },
-  "tables": {
-    "t1": {
-      "column_vindexes": [
-        {
-          "column": "id1",
-          "name": "hash"
-        },
-        {
-          "column": "id2",
-          "name": "t1_id2_vdx"
-        }
-      ]
-    },
-    "t1_id2_idx": {
-      "column_vindexes": [
-        {
-          "column": "id2",
-          "name": "hash"
-        }
-      ]
-    },
-    "t2": {
-      "column_vindexes": [
-        {
-          "column": "id3",
-          "name": "hash"
-        },
-        {
-          "column": "id4",
-          "name": "t2_id4_idx"
-        }
-      ]
-    },
-    "t2_id4_idx": {
-      "column_vindexes": [
-        {
-          "column": "id4",
-          "name": "hash"
-        }
-      ]
-    },
-    "vstream_test": {
-      "column_vindexes": [
-        {
-          "column": "id",
-          "name": "hash"
-        }
-      ]
-    },
-    "aggr_test": {
-      "column_vindexes": [
-        {
-          "column": "id",
-          "name": "hash"
-        }
-      ],
-      "columns": [
-        {
-          "name": "val1",
-          "type": "VARCHAR"
-        }
-      ]
-    }
+	routingRules = `
+{"rules": [
+  {
+    "from_table": "ks.t1000",
+	"to_tables": ["ks.t1"]
   }
-}`
+]}
+`
 )
 
 func TestMain(m *testing.M) {
 	flag.Parse()
-
 	exitCode := func() int {
-		clusterInstance =  cluster.NewCluster(Cell, "localhost")
+		clusterInstance = cluster.NewCluster(Cell, "localhost")
 		defer clusterInstance.Teardown()
 
 		// Start topo server
@@ -183,21 +69,57 @@ func TestMain(m *testing.M) {
 			SchemaSQL: SchemaSQL,
 			VSchema:   VSchema,
 		}
-		err = clusterInstance.StartKeyspace(*keyspace, []string{"-80", "80-"}, 1, true)
+		clusterInstance.VtTabletExtraArgs = append(clusterInstance.VtTabletExtraArgs,
+			"--queryserver-config-max-result-size", "100",
+			"--queryserver-config-terse-errors")
+		err = clusterInstance.StartKeyspace(*keyspace, []string{"-80", "80-"}, 2, false, clusterInstance.Cell)
 		if err != nil {
 			return 1
 		}
 
+		err = clusterInstance.VtctldClientProcess.ApplyRoutingRules(routingRules)
+		if err != nil {
+			return 1
+		}
+
+		_, err = clusterInstance.VtctldClientProcess.ExecuteCommandWithOutput("RebuildVSchemaGraph")
+		if err != nil {
+			return 1
+		}
+
+		clusterInstance.VtGateExtraArgs = append(clusterInstance.VtGateExtraArgs,
+			"--vschema-ddl-authorized-users", "%")
 		// Start vtgate
 		err = clusterInstance.StartVtgate()
 		if err != nil {
 			return 1
 		}
-		vtParams = mysql.ConnParams{
-			Host: clusterInstance.Hostname,
-			Port: clusterInstance.VtgateMySQLPort,
-		}
+
+		vtParams = clusterInstance.GetVTParams(KeyspaceName)
+
 		return m.Run()
 	}()
 	os.Exit(exitCode)
+}
+
+func start(t *testing.T) (*mysql.Conn, func()) {
+	ctx := t.Context()
+	conn, err := mysql.Connect(ctx, &vtParams)
+	require.NoError(t, err)
+
+	deleteAll := func() {
+		utils.Exec(t, conn, "use ks")
+		tables := []string{"t1", "t2", "vstream_test", "t3", "t4", "t6", "t7_xxhash", "t7_xxhash_idx", "t7_fk", "t8", "t9", "t9_id_to_keyspace_id_idx", "t10", "t10_id_to_keyspace_id_idx", "t1_id2_idx", "t2_id4_idx", "t3_id7_idx", "t4_id2_idx", "t5_null_vindex", "t6_id2_idx"}
+		for _, table := range tables {
+			_, _ = utils.ExecAllowError(t, conn, "delete from "+table)
+		}
+		utils.Exec(t, conn, "set workload = oltp")
+	}
+
+	deleteAll()
+
+	return conn, func() {
+		deleteAll()
+		conn.Close()
+	}
 }

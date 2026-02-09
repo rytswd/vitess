@@ -17,7 +17,6 @@ limitations under the License.
 package topocustomrule
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -78,11 +77,12 @@ func TestUpdate(t *testing.T) {
 
 	cell := "cell1"
 	filePath := "/keyspaces/ks1/configs/CustomRules"
-	ts := memorytopo.NewServer(cell)
+	ctx := t.Context()
+
+	ts := memorytopo.NewServer(ctx, cell)
 	qsc := tabletservermock.NewController()
 	qsc.TS = ts
 	sleepDuringTopoFailure = time.Millisecond
-	ctx := context.Background()
 
 	cr, err := newTopoCustomRule(qsc, cell, filePath)
 	if err != nil {

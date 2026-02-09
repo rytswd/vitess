@@ -17,37 +17,28 @@ limitations under the License.
 package srvtopo
 
 import (
+	"context"
 	"testing"
 
-	"golang.org/x/net/context"
+	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/stats"
 	"vitess.io/vitess/go/vt/key"
 	"vitess.io/vitess/go/vt/logutil"
 	"vitess.io/vitess/go/vt/topo/memorytopo"
 	"vitess.io/vitess/go/vt/topotools"
-	"vitess.io/vitess/go/vt/vttablet/queryservice"
+	"vitess.io/vitess/go/vt/vttablet/tabletconntest"
 
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
-// fakeStats implements TargetStats.
-type fakeStats struct{}
-
-func (s *fakeStats) GetAggregateStats(target *querypb.Target) (*querypb.AggregateStats, queryservice.QueryService, error) {
-	return &querypb.AggregateStats{}, nil, nil
-}
-
-func (s *fakeStats) GetMasterCell(keyspace, shard string) (cell string, qs queryservice.QueryService, err error) {
-	return "", nil, nil
-}
-
-func initResolver(t *testing.T, name string) *Resolver {
-	ctx := context.Background()
+func initResolver(t *testing.T, ctx context.Context) *Resolver {
 	cell := "cell1"
-	ts := memorytopo.NewServer(cell)
-	rs := NewResilientServer(ts, name)
+	ts := memorytopo.NewServer(ctx, cell)
+	counts := stats.NewCountersWithSingleLabel("", "Resilient srvtopo server operations", "type")
+	rs := NewResilientServer(ctx, ts, counts)
 
 	// Create sharded keyspace and shards.
 	if err := ts.CreateKeyspace(ctx, "sks", &topodatapb.Keyspace{}); err != nil {
@@ -74,16 +65,40 @@ func initResolver(t *testing.T, name string) *Resolver {
 
 	// And rebuild both.
 	for _, keyspace := range []string{"sks", "uks"} {
-		if err := topotools.RebuildKeyspace(ctx, logutil.NewConsoleLogger(), ts, keyspace, []string{cell}); err != nil {
+		if err := topotools.RebuildKeyspace(ctx, logutil.NewConsoleLogger(), ts, keyspace, []string{cell}, false); err != nil {
 			t.Fatalf("RebuildKeyspace(%v) failed: %v", keyspace, err)
 		}
 	}
 
-	return NewResolver(rs, &fakeStats{}, cell)
+	// Create snapshot keyspace and shard.
+	err = ts.CreateKeyspace(ctx, "rks", &topodatapb.Keyspace{KeyspaceType: topodatapb.KeyspaceType_SNAPSHOT})
+	require.NoError(t, err, "CreateKeyspace(rks) failed: %v")
+	err = ts.CreateShard(ctx, "rks", "-80")
+	require.NoError(t, err, "CreateShard(-80) failed: %v")
+
+	// Rebuild should error because allowPartial is false and shard does not cover full keyrange
+	err = topotools.RebuildKeyspace(ctx, logutil.NewConsoleLogger(), ts, "rks", []string{cell}, false)
+	require.Error(t, err, "RebuildKeyspace(rks) failed")
+	require.EqualError(t, err, "keyspace partition for PRIMARY in cell cell1 does not end with max key")
+
+	// Rebuild should succeed with allowPartial true
+	err = topotools.RebuildKeyspace(ctx, logutil.NewConsoleLogger(), ts, "rks", []string{cell}, true)
+	require.NoError(t, err, "RebuildKeyspace(rks) failed")
+
+	// Create missing shard
+	err = ts.CreateShard(ctx, "rks", "80-")
+	require.NoError(t, err, "CreateShard(80-) failed: %v")
+
+	// Rebuild should now succeed even with allowPartial false
+	err = topotools.RebuildKeyspace(ctx, logutil.NewConsoleLogger(), ts, "rks", []string{cell}, false)
+	require.NoError(t, err, "RebuildKeyspace(rks) failed")
+
+	return NewResolver(rs, &tabletconntest.FakeQueryService{}, cell)
 }
 
 func TestResolveDestinations(t *testing.T) {
-	resolver := initResolver(t, "TestResolveDestinations")
+	ctx := t.Context()
+	resolver := initResolver(t, ctx)
 
 	id1 := &querypb.Value{
 		Type:  sqltypes.VarChar,
@@ -107,11 +122,11 @@ func TestResolveDestinations(t *testing.T) {
 		End:   []byte{0x30},
 	}
 
-	var testCases = []struct {
+	testCases := []struct {
 		name           string
 		keyspace       string
 		ids            []*querypb.Value
-		destinations   []key.Destination
+		destinations   []key.ShardDestination
 		errString      string
 		expectedShards []string
 		expectedValues [][]*querypb.Value
@@ -119,7 +134,7 @@ func TestResolveDestinations(t *testing.T) {
 		{
 			name:     "unsharded keyspace, regular shard, no ids",
 			keyspace: "uks",
-			destinations: []key.Destination{
+			destinations: []key.ShardDestination{
 				key.DestinationShard("0"),
 			},
 			expectedShards: []string{"0"},
@@ -128,7 +143,7 @@ func TestResolveDestinations(t *testing.T) {
 			name:     "unsharded keyspace, regular shard, with ids",
 			keyspace: "uks",
 			ids:      []*querypb.Value{id1, id2},
-			destinations: []key.Destination{
+			destinations: []key.ShardDestination{
 				key.DestinationShard("0"),
 				key.DestinationShard("0"),
 			},
@@ -141,7 +156,7 @@ func TestResolveDestinations(t *testing.T) {
 			name:     "sharded keyspace, keyrange destinations, with ids",
 			keyspace: "sks",
 			ids:      []*querypb.Value{id1, id2},
-			destinations: []key.Destination{
+			destinations: []key.ShardDestination{
 				key.DestinationExactKeyRange{KeyRange: kr2040},
 				key.DestinationExactKeyRange{KeyRange: kr80a0},
 			},
@@ -155,7 +170,7 @@ func TestResolveDestinations(t *testing.T) {
 			name:     "sharded keyspace, keyspace id destinations, with ids",
 			keyspace: "sks",
 			ids:      []*querypb.Value{id1, id2},
-			destinations: []key.Destination{
+			destinations: []key.ShardDestination{
 				key.DestinationKeyspaceID{0x28},
 				key.DestinationKeyspaceID{0x78, 0x23},
 			},
@@ -169,7 +184,7 @@ func TestResolveDestinations(t *testing.T) {
 			name:     "sharded keyspace, multi keyspace id destinations, with ids",
 			keyspace: "sks",
 			ids:      []*querypb.Value{id1, id2},
-			destinations: []key.Destination{
+			destinations: []key.ShardDestination{
 				key.DestinationKeyspaceIDs{
 					{0x28},
 					{0x47},
@@ -189,7 +204,7 @@ func TestResolveDestinations(t *testing.T) {
 		{
 			name:     "using non-mapping keyranges should fail",
 			keyspace: "sks",
-			destinations: []key.Destination{
+			destinations: []key.ShardDestination{
 				key.DestinationExactKeyRange{
 					KeyRange: kr2830,
 				},

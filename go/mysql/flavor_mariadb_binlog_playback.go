@@ -17,15 +17,37 @@ limitations under the License.
 
 package mysql
 
-// These two methods are isolated here so they can be easily changed
-// in other trees.
+// baseShowTables is part of the Flavor interface.
+func (mariadbFlavor) baseShowTables() string {
+	return mysqlFlavor{}.baseShowTables()
+}
 
-// enableBinlogPlaybackCommand is part of the Flavor interface.
-func (mariadbFlavor) enableBinlogPlaybackCommand() string {
+func (mariadbFlavor) baseShowInnodbTableSizes() string {
 	return ""
 }
 
-// disableBinlogPlaybackCommand is part of the Flavor interface.
-func (mariadbFlavor) disableBinlogPlaybackCommand() string {
+func (mariadbFlavor) baseShowPartitions() string {
 	return ""
+}
+
+func (mariadbFlavor) baseShowTableRowCountClusteredIndex() string {
+	return ""
+}
+
+func (mariadbFlavor) baseShowIndexSizes() string {
+	return ""
+}
+
+func (mariadbFlavor) baseShowIndexCardinalities() string {
+	return ""
+}
+
+// baseShowTablesWithSizes is part of the Flavor interface.
+func (mariadbFlavor101) baseShowTablesWithSizes() string {
+	return TablesWithSize56
+}
+
+// baseShowTablesWithSizes is part of the Flavor interface.
+func (mariadbFlavor102) baseShowTablesWithSizes() string {
+	return TablesWithSize57
 }

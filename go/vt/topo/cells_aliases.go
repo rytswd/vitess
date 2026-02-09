@@ -17,11 +17,9 @@ limitations under the License.
 package topo
 
 import (
+	"context"
 	"fmt"
 	"path"
-
-	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
@@ -41,6 +39,9 @@ func pathForCellsAlias(alias string) string {
 // GetCellsAliases returns the names of the existing cells. They are
 // sorted by name.
 func (ts *Server) GetCellsAliases(ctx context.Context, strongRead bool) (ret map[string]*topodatapb.CellsAlias, err error) {
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
 	conn := ts.globalCell
 	if !strongRead {
 		conn = ts.globalReadOnlyCell
@@ -62,7 +63,7 @@ func (ts *Server) GetCellsAliases(ctx context.Context, strongRead bool) (ret map
 
 			// Unpack the contents.
 			cellsAlias := &topodatapb.CellsAlias{}
-			if err := proto.Unmarshal(contents, cellsAlias); err != nil {
+			if err := cellsAlias.UnmarshalVT(contents); err != nil {
 				return nil, err
 			}
 
@@ -74,8 +75,36 @@ func (ts *Server) GetCellsAliases(ctx context.Context, strongRead bool) (ret map
 	}
 }
 
+// GetCellsAlias returns the CellsAlias that matches the given name.
+func (ts *Server) GetCellsAlias(ctx context.Context, name string, strongRead bool) (*topodatapb.CellsAlias, error) {
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	conn := ts.globalCell
+	if !strongRead {
+		conn = ts.globalReadOnlyCell
+	}
+
+	aliasPath := pathForCellsAlias(name)
+	contents, _, err := conn.Get(ctx, aliasPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Unpack the contents.
+	cellsAlias := &topodatapb.CellsAlias{}
+	if err := cellsAlias.UnmarshalVT(contents); err != nil {
+		return nil, err
+	}
+
+	return cellsAlias, nil
+}
+
 // DeleteCellsAlias deletes the specified CellsAlias
 func (ts *Server) DeleteCellsAlias(ctx context.Context, alias string) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	ts.clearCellAliasesCache()
 
 	filePath := pathForCellsAlias(alias)
@@ -96,12 +125,15 @@ func (ts *Server) CreateCellsAlias(ctx context.Context, alias string, cellsAlias
 	ts.clearCellAliasesCache()
 
 	// Pack the content.
-	contents, err := proto.Marshal(cellsAlias)
+	contents, err := cellsAlias.MarshalVT()
 	if err != nil {
 		return err
 	}
 
 	// Save it.
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	filePath := pathForCellsAlias(alias)
 	_, err = ts.globalCell.Create(ctx, filePath, contents)
 	return err
@@ -113,13 +145,17 @@ func (ts *Server) UpdateCellsAlias(ctx context.Context, alias string, update fun
 
 	filePath := pathForCellsAlias(alias)
 	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
 		cellsAlias := &topodatapb.CellsAlias{}
 
 		// Read the file, unpack the contents.
 		contents, version, err := ts.globalCell.Get(ctx, filePath)
 		switch {
 		case err == nil:
-			if err := proto.Unmarshal(contents, cellsAlias); err != nil {
+			if err := cellsAlias.UnmarshalVT(contents); err != nil {
 				return err
 			}
 		case IsErrType(err, NoNode):
@@ -146,7 +182,7 @@ func (ts *Server) UpdateCellsAlias(ctx context.Context, alias string, update fun
 		}
 
 		// Pack and save.
-		contents, err = proto.Marshal(cellsAlias)
+		contents, err = cellsAlias.MarshalVT()
 		if err != nil {
 			return err
 		}

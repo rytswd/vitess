@@ -23,25 +23,27 @@ limitations under the License.
 // own policy as a package that calls RegisterPolicy(), and compile it into all
 // Vitess binaries that you use.
 //
-// By default (when no security_policy is specified), everyone is allowed to do
+// By default (when no security-policy is specified), everyone is allowed to do
 // anything.
 //
 // For convenience, there are two other built-in policies that also do NOT do
 // any authentication, but allow you to globally disable some roles entirely:
-//   * `deny-all` disallows all roles for everyone. Note that access is still
+//   - `deny-all` disallows all roles for everyone. Note that access is still
 //     allowed to endpoints that are considered "public" (no ACL check at all).
-//   * `read-only` allows anyone to act as DEBUGGING or MONITORING, but no one
+//   - `read-only` allows anyone to act as DEBUGGING or MONITORING, but no one
 //     is allowed to act as ADMIN. It also disallows any other custom roles that
 //     are requested.
 package acl
 
 import (
-	"flag"
 	"fmt"
 	"net/http"
 	"sync"
 
+	"github.com/spf13/pflag"
+
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/utils"
 )
 
 // This is a list of predefined roles. Applications are free
@@ -54,7 +56,7 @@ const (
 )
 
 var (
-	securityPolicy = flag.String("security_policy", "", "the name of a registered security policy to use for controlling access to URLs - empty means allow all for anyone (built-in policies: deny-all, read-only)")
+	securityPolicy string
 	policies       = make(map[string]Policy)
 	once           sync.Once
 	currentPolicy  Policy
@@ -63,12 +65,13 @@ var (
 // Policy defines the interface that needs to be satisfied by
 // ACL policy implementors.
 type Policy interface {
-	// CheckAccessActor can be called to verify if an actor
-	// has access to the role.
-	CheckAccessActor(actor, role string) error
 	// CheckAccessHTTP can be called to verify if an actor in
 	// the http request has access to the role.
 	CheckAccessHTTP(req *http.Request, role string) error
+}
+
+func RegisterFlags(fs *pflag.FlagSet) {
+	utils.SetFlagStringVar(fs, &securityPolicy, "security-policy", securityPolicy, "the name of a registered security policy to use for controlling access to URLs - empty means allow all for anyone (built-in policies: deny-all, read-only)")
 }
 
 // RegisterPolicy registers a security policy. This function must be called
@@ -83,27 +86,17 @@ func RegisterPolicy(name string, policy Policy) {
 }
 
 func savePolicy() {
-	if *securityPolicy == "" {
+	if securityPolicy == "" {
 		// Setting the policy to nil means Allow All from Anyone.
 		currentPolicy = nil
 		return
 	}
-	if policy, ok := policies[*securityPolicy]; ok {
+	if policy, ok := policies[securityPolicy]; ok {
 		currentPolicy = policy
 		return
 	}
-	log.Warningf("security_policy %q not found; using fallback policy (deny-all)", *securityPolicy)
+	log.Warningf("security-policy %q not found; using fallback policy (deny-all)", securityPolicy)
 	currentPolicy = denyAllPolicy{}
-}
-
-// CheckAccessActor uses the current security policy to
-// verify if an actor has access to the role.
-func CheckAccessActor(actor, role string) error {
-	once.Do(savePolicy)
-	if currentPolicy != nil {
-		return currentPolicy.CheckAccessActor(actor, role)
-	}
-	return nil
 }
 
 // CheckAccessHTTP uses the current security policy to

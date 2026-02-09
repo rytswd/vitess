@@ -18,8 +18,11 @@ package vstreamer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 )
@@ -29,6 +32,11 @@ func TestStreamResults(t *testing.T) {
 		t.Skip()
 	}
 
+	reset := AdjustPacketSize(1)
+	defer reset()
+	engine.resultStreamerNumPackets.Reset()
+	engine.resultStreamerNumRows.Reset()
+
 	execStatements(t, []string{
 		"create table t1(id int, val varbinary(128), primary key(id))",
 		"insert into t1 values (1, 'aaa'), (2, 'bbb')",
@@ -36,11 +44,11 @@ func TestStreamResults(t *testing.T) {
 	defer execStatements(t, []string{
 		"drop table t1",
 	})
-	engine.se.Reload(context.Background())
 
 	query := "select id, val from t1 order by id"
 	wantStream := []string{
-		`rows:<lengths:1 lengths:3 values:"1aaa" > rows:<lengths:1 lengths:3 values:"2bbb" > `,
+		`rows:{lengths:1 lengths:3 values:"1aaa"}`,
+		`rows:{lengths:1 lengths:3 values:"2bbb"}`,
 	}
 	i := 0
 	ch := make(chan error)
@@ -53,7 +61,7 @@ func TestStreamResults(t *testing.T) {
 			if first {
 				first = false
 				if rows.Gtid == "" {
-					ch <- fmt.Errorf("stream gtid is empty")
+					ch <- errors.New("stream gtid is empty")
 				}
 				return nil
 			}
@@ -75,4 +83,6 @@ func TestStreamResults(t *testing.T) {
 	for err := range ch {
 		t.Error(err)
 	}
+	require.Equal(t, int64(2), engine.resultStreamerNumPackets.Get())
+	require.Equal(t, int64(2), engine.resultStreamerNumRows.Get())
 }

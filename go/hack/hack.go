@@ -1,3 +1,5 @@
+//go:build gc && !wasm
+
 /*
 Copyright 2019 The Vitess Authors.
 
@@ -19,7 +21,6 @@ limitations under the License.
 package hack
 
 import (
-	"reflect"
 	"unsafe"
 )
 
@@ -29,11 +30,11 @@ func String(b []byte) (s string) {
 	if len(b) == 0 {
 		return ""
 	}
-	return *(*string)(unsafe.Pointer(&b))
+	return unsafe.String(&b[0], len(b))
 }
 
-// StringPointer returns &s[0], which is not allowed in go
-func StringPointer(s string) unsafe.Pointer {
-	pstring := (*reflect.StringHeader)(unsafe.Pointer(&s))
-	return unsafe.Pointer(pstring.Data)
+// StringBytes returns the underlying bytes for a string. Modifying this byte slice
+// will lead to undefined behavior.
+func StringBytes(s string) []byte {
+	return unsafe.Slice(unsafe.StringData(s), len(s))
 }

@@ -17,9 +17,9 @@ limitations under the License.
 package consultopo
 
 import (
+	"context"
 	"errors"
-
-	"golang.org/x/net/context"
+	"net/url"
 
 	"vitess.io/vitess/go/vt/topo"
 )
@@ -38,11 +38,19 @@ var (
 // convertError converts a context error into a topo error. All errors
 // are either application-level errors, or context errors.
 func convertError(err error, nodePath string) error {
-	switch err {
-	case context.Canceled:
+	// Unwrap errors from the Go HTTP client.
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		err = urlErr.Err
+	}
+
+	// Convert specific sentinel values.
+	switch {
+	case errors.Is(err, context.Canceled):
 		return topo.NewError(topo.Interrupted, nodePath)
-	case context.DeadlineExceeded:
+	case errors.Is(err, context.DeadlineExceeded):
 		return topo.NewError(topo.Timeout, nodePath)
 	}
+
 	return err
 }

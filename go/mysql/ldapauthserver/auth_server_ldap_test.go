@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/stretchr/testify/require"
 	ldap "gopkg.in/ldap.v2"
 )
 
@@ -33,6 +34,7 @@ func (mlc *MockLdapClient) Bind(username, password string) error {
 	}
 	return nil
 }
+
 func (mlc *MockLdapClient) Search(searchRequest *ldap.SearchRequest) (*ldap.SearchResult, error) {
 	return &ldap.SearchResult{}, nil
 }
@@ -46,12 +48,8 @@ func TestValidateClearText(t *testing.T) {
 		RefreshSeconds: 1,
 	}
 	_, err := asl.validate("testuser", "testpass")
-	if err != nil {
-		t.Fatalf("AuthServerLdap failed to validate valid credentials. Got: %v", err)
-	}
+	require.NoError(t, err, "AuthServerLdap failed to validate valid credentials. Got: %v", err)
 
 	_, err = asl.validate("invaliduser", "invalidpass")
-	if err == nil {
-		t.Fatalf("AuthServerLdap validated invalid credentials.")
-	}
+	require.Error(t, err, "AuthServerLdap validated invalid credentials.")
 }

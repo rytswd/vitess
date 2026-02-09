@@ -18,15 +18,11 @@ package io.vitess.client;
 
 import io.vitess.client.cursor.Cursor;
 import io.vitess.client.cursor.CursorWithError;
-import io.vitess.proto.Query.SplitQueryRequest.Algorithm;
-import io.vitess.proto.Vtgate.SplitQueryResponse;
-
 import java.io.Closeable;
 import java.io.IOException;
 import java.sql.SQLException;
 import java.util.List;
 import java.util.Map;
-
 import javax.annotation.Nullable;
 
 /**
@@ -83,8 +79,8 @@ public final class VTGateBlockingConnection implements Closeable {
    *
    * @param ctx Context on user and execution deadline if any.
    * @param queryList List of sql queries to be executed.
-   * @param bindVarsList <p>For each sql query it will provide a list of parameters to bind with. If
-   * provided, should match the number of sql queries.</p>
+   * @param bindVarsList for each SQL query, provides a list of parameters to bind with.
+   *     If provided, it should match the number of SQL queries.
    * @param vtSession Session to be used with the call.
    * @return List of Cursors
    * @throws SQLException If anything fails on query execution.
@@ -94,31 +90,6 @@ public final class VTGateBlockingConnection implements Closeable {
       @Nullable List<Map<String, ?>> bindVarsList,
       final VTSession vtSession) throws SQLException {
     return vtGateConnection.executeBatch(ctx, queryList, bindVarsList, vtSession).checkedGet();
-  }
-
-  /**
-   * This method calls the VTGate to execute list of queries as a batch.
-   * <p>
-   * <p>If asTransaction is set to <code>true</code> then query execution will not change the
-   * session cookie.
-   * Otherwise, query execution will become part of the session.</p>
-   *
-   * @param ctx Context on user and execution deadline if any.
-   * @param queryList List of sql queries to be executed.
-   * @param bindVarsList <p>For each sql query it will provide a list of parameters to bind with. If
-   * provided, should match the number of sql queries.</p>
-   * @param asTransaction To execute query without impacting session cookie.
-   * @param vtSession Session to be used with the call.
-   * @return List of Cursors
-   * @throws SQLException If anything fails on query execution.
-   */
-  public List<CursorWithError> executeBatch(Context ctx,
-      List<String> queryList,
-      @Nullable List<Map<String, ?>> bindVarsList,
-      boolean asTransaction,
-      final VTSession vtSession) throws SQLException {
-    return vtGateConnection.executeBatch(ctx, queryList, bindVarsList, asTransaction, vtSession)
-        .checkedGet();
   }
 
   /**
@@ -138,37 +109,6 @@ public final class VTGateBlockingConnection implements Closeable {
     return vtGateConnection.streamExecute(ctx, query, bindVars, vtSession);
   }
 
-  /**
-   * This method splits the query into small parts based on the splitColumn and Algorithm type
-   * provided.
-   *
-   * @param ctx Context on user and execution deadline if any.
-   * @param keyspace Keyspace to execute the query on.
-   * @param query Sql Query to be executed.
-   * @param bindVars Parameters to bind with sql.
-   * @param splitColumns Column to be used to split the data.
-   * @param splitCount Number of Partitions
-   * @param numRowsPerQueryPart Limit the number of records per query part.
-   * @param algorithm EQUAL_SPLITS or FULL_SCAN
-   * @return Query Parts
-   * @throws SQLException If anything fails on query execution.
-   */
-  public List<SplitQueryResponse.Part> splitQuery(Context ctx,
-      String keyspace,
-      String query,
-      @Nullable Map<String, ?> bindVars,
-      Iterable<String> splitColumns,
-      int splitCount,
-      int numRowsPerQueryPart,
-      Algorithm algorithm) throws SQLException {
-    return vtGateConnection
-        .splitQuery(ctx, keyspace, query, bindVars, splitColumns, splitCount, numRowsPerQueryPart,
-            algorithm).checkedGet();
-  }
-
-  /**
-   * @inheritDoc
-   */
   @Override
   public void close() throws IOException {
     vtGateConnection.close();

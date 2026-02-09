@@ -17,17 +17,22 @@ limitations under the License.
 package binlog
 
 import (
-	"fmt"
+	"context"
+	"errors"
 	"io"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
+
+	"vitess.io/vitess/go/mysql/replication"
+	"vitess.io/vitess/go/mysql/sqlerror"
 
 	"vitess.io/vitess/go/mysql"
 
+	"vitess.io/vitess/go/vt/dbconfigs"
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 	querypb "vitess.io/vitess/go/vt/proto/query"
 )
@@ -38,7 +43,7 @@ type fullBinlogTransaction struct {
 	statements []FullBinlogStatement
 }
 
-type binlogStatements []binlogdatapb.BinlogTransaction
+type binlogStatements []*binlogdatapb.BinlogTransaction
 
 func (bs *binlogStatements) sendTransaction(eventToken *querypb.EventToken, statements []FullBinlogStatement) error {
 	var s []*binlogdatapb.BinlogTransaction_Statement
@@ -48,19 +53,19 @@ func (bs *binlogStatements) sendTransaction(eventToken *querypb.EventToken, stat
 			s[i] = statement.Statement
 		}
 	}
-	*bs = append(*bs, binlogdatapb.BinlogTransaction{
+	*bs = append(*bs, &binlogdatapb.BinlogTransaction{
 		Statements: s,
 		EventToken: eventToken,
 	})
 	return nil
 }
 
-func (bs *binlogStatements) equal(bts []binlogdatapb.BinlogTransaction) bool {
+func (bs *binlogStatements) equal(bts []*binlogdatapb.BinlogTransaction) bool {
 	if len(*bs) != len(bts) {
 		return false
 	}
 	for i, s := range *bs {
-		if !proto.Equal(&s, &bts[i]) {
+		if !proto.Equal(s, bts[i]) {
 			return false
 		}
 	}
@@ -82,19 +87,22 @@ func TestStreamerParseEventsXID(t *testing.T) {
 	input := []mysql.BinlogEvent{
 		mysql.NewRotateEvent(f, s, 0, ""),
 		mysql.NewFormatDescriptionEvent(f, s),
-		mysql.NewMariaDBGTIDEvent(f, s, mysql.MariadbGTID{Domain: 0, Sequence: 0xd}, false /* hasBegin */),
+		mysql.NewMariaDBGTIDEvent(f, s, replication.MariadbGTID{Domain: 0, Sequence: 0xd}, false /* hasBegin */),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "BEGIN"}),
+			SQL:      "BEGIN",
+		}),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "insert into vt_a(eid, id) values (1, 1) /* _stream vt_a (eid id ) (1 1 ); */"}),
+			SQL:      "insert into vt_a(eid, id) values (1, 1) /* _stream vt_a (eid id ) (1 1 ); */",
+		}),
 		mysql.NewXIDEvent(f, s),
 	}
 
 	events := make(chan mysql.BinlogEvent)
+	errs := make(chan error)
 
-	want := []binlogdatapb.BinlogTransaction{
+	want := []*binlogdatapb.BinlogTransaction{
 		{
 			Statements: []*binlogdatapb.BinlogTransaction_Statement{
 				{Category: binlogdatapb.BinlogTransaction_Statement_BL_SET, Sql: []byte("SET TIMESTAMP=1407805592")},
@@ -102,9 +110,9 @@ func TestStreamerParseEventsXID(t *testing.T) {
 			},
 			EventToken: &querypb.EventToken{
 				Timestamp: 1407805592,
-				Position: mysql.EncodePosition(mysql.Position{
-					GTIDSet: mysql.MariadbGTIDSet{
-						mysql.MariadbGTID{
+				Position: replication.EncodePosition(replication.Position{
+					GTIDSet: replication.MariadbGTIDSet{
+						0: replication.MariadbGTID{
 							Domain:   0,
 							Server:   62344,
 							Sequence: 0x0d,
@@ -115,10 +123,17 @@ func TestStreamerParseEventsXID(t *testing.T) {
 		},
 	}
 	var got binlogStatements
-	bls := NewStreamer(&mysql.ConnParams{DbName: "vt_test_keyspace"}, nil, nil, mysql.Position{}, 0, (&got).sendTransaction)
+
+	// Set mock mysql.ConnParams and dbconfig
+	mcp := &mysql.ConnParams{
+		DbName: "vt_test_keyspace",
+	}
+	dbcfgs := dbconfigs.New(mcp)
+
+	bls := NewStreamer(dbcfgs, nil, nil, replication.Position{}, 0, (&got).sendTransaction)
 
 	go sendTestEvents(events, input)
-	_, err := bls.parseEvents(context.Background(), events)
+	_, err := bls.parseEvents(context.Background(), events, errs)
 	if err != ErrServerEOF {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -136,21 +151,25 @@ func TestStreamerParseEventsCommit(t *testing.T) {
 	input := []mysql.BinlogEvent{
 		mysql.NewRotateEvent(f, s, 0, ""),
 		mysql.NewFormatDescriptionEvent(f, s),
-		mysql.NewMariaDBGTIDEvent(f, s, mysql.MariadbGTID{Domain: 0, Sequence: 0xd}, false /* hasBegin */),
+		mysql.NewMariaDBGTIDEvent(f, s, replication.MariadbGTID{Domain: 0, Sequence: 0xd}, false /* hasBegin */),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "BEGIN"}),
+			SQL:      "BEGIN",
+		}),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "insert into vt_a(eid, id) values (1, 1) /* _stream vt_a (eid id ) (1 1 ); */"}),
+			SQL:      "insert into vt_a(eid, id) values (1, 1) /* _stream vt_a (eid id ) (1 1 ); */",
+		}),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "COMMIT"}),
+			SQL:      "COMMIT",
+		}),
 	}
 
 	events := make(chan mysql.BinlogEvent)
+	errs := make(chan error)
 
-	want := []binlogdatapb.BinlogTransaction{
+	want := []*binlogdatapb.BinlogTransaction{
 		{
 			Statements: []*binlogdatapb.BinlogTransaction_Statement{
 				{Category: binlogdatapb.BinlogTransaction_Statement_BL_SET, Sql: []byte("SET TIMESTAMP=1407805592")},
@@ -158,9 +177,9 @@ func TestStreamerParseEventsCommit(t *testing.T) {
 			},
 			EventToken: &querypb.EventToken{
 				Timestamp: 1407805592,
-				Position: mysql.EncodePosition(mysql.Position{
-					GTIDSet: mysql.MariadbGTIDSet{
-						mysql.MariadbGTID{
+				Position: replication.EncodePosition(replication.Position{
+					GTIDSet: replication.MariadbGTIDSet{
+						0: replication.MariadbGTID{
 							Domain:   0,
 							Server:   62344,
 							Sequence: 0x0d,
@@ -170,11 +189,17 @@ func TestStreamerParseEventsCommit(t *testing.T) {
 			},
 		},
 	}
+	// Set mock mysql.ConnParams and dbconfig
+	mcp := &mysql.ConnParams{
+		DbName: "vt_test_keyspace",
+	}
+	dbcfgs := dbconfigs.New(mcp)
+
 	var got binlogStatements
-	bls := NewStreamer(&mysql.ConnParams{DbName: "vt_test_keyspace"}, nil, nil, mysql.Position{}, 0, (&got).sendTransaction)
+	bls := NewStreamer(dbcfgs, nil, nil, replication.Position{}, 0, (&got).sendTransaction)
 
 	go sendTestEvents(events, input)
-	_, err := bls.parseEvents(context.Background(), events)
+	_, err := bls.parseEvents(context.Background(), events, errs)
 	if err != ErrServerEOF {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -186,17 +211,25 @@ func TestStreamerParseEventsCommit(t *testing.T) {
 
 func TestStreamerStop(t *testing.T) {
 	events := make(chan mysql.BinlogEvent)
+	errs := make(chan error)
 
 	sendTransaction := func(eventToken *querypb.EventToken, statements []FullBinlogStatement) error {
 		return nil
 	}
-	bls := NewStreamer(&mysql.ConnParams{DbName: "vt_test_keyspace"}, nil, nil, mysql.Position{}, 0, sendTransaction)
+
+	// Set mock mysql.ConnParams and dbconfig
+	mcp := &mysql.ConnParams{
+		DbName: "vt_test_keyspace",
+	}
+	dbcfgs := dbconfigs.New(mcp)
+
+	bls := NewStreamer(dbcfgs, nil, nil, replication.Position{}, 0, sendTransaction)
 
 	// Start parseEvents(), but don't send it anything, so it just waits.
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error)
 	go func() {
-		_, err := bls.parseEvents(ctx, events)
+		_, err := bls.parseEvents(ctx, events, errs)
 		done <- err
 	}()
 
@@ -222,23 +255,33 @@ func TestStreamerParseEventsClientEOF(t *testing.T) {
 		mysql.NewFormatDescriptionEvent(f, s),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "BEGIN"}),
+			SQL:      "BEGIN",
+		}),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "insert into vt_a(eid, id) values (1, 1) /* _stream vt_a (eid id ) (1 1 ); */"}),
+			SQL:      "insert into vt_a(eid, id) values (1, 1) /* _stream vt_a (eid id ) (1 1 ); */",
+		}),
 		mysql.NewXIDEvent(f, s),
 	}
 	want := ErrClientEOF
 
 	events := make(chan mysql.BinlogEvent)
+	errs := make(chan error)
 
 	sendTransaction := func(eventToken *querypb.EventToken, statements []FullBinlogStatement) error {
 		return io.EOF
 	}
-	bls := NewStreamer(&mysql.ConnParams{DbName: "vt_test_keyspace"}, nil, nil, mysql.Position{}, 0, sendTransaction)
+
+	// Set mock mysql.ConnParams and dbconfig
+	mcp := &mysql.ConnParams{
+		DbName: "vt_test_keyspace",
+	}
+	dbcfgs := dbconfigs.New(mcp)
+
+	bls := NewStreamer(dbcfgs, nil, nil, replication.Position{}, 0, sendTransaction)
 
 	go sendTestEvents(events, input)
-	_, err := bls.parseEvents(context.Background(), events)
+	_, err := bls.parseEvents(context.Background(), events, errs)
 	if err != want {
 		t.Errorf("wrong error, got %#v, want %#v", err, want)
 	}
@@ -248,17 +291,61 @@ func TestStreamerParseEventsServerEOF(t *testing.T) {
 	want := ErrServerEOF
 
 	events := make(chan mysql.BinlogEvent)
+	errs := make(chan error)
 	close(events)
 
 	sendTransaction := func(eventToken *querypb.EventToken, statements []FullBinlogStatement) error {
 		return nil
 	}
-	bls := NewStreamer(&mysql.ConnParams{DbName: "vt_test_keyspace"}, nil, nil, mysql.Position{}, 0, sendTransaction)
+	// Set mock mysql.ConnParams and dbconfig
+	mcp := &mysql.ConnParams{
+		DbName: "vt_test_keyspace",
+	}
+	dbcfgs := dbconfigs.New(mcp)
 
-	_, err := bls.parseEvents(context.Background(), events)
+	bls := NewStreamer(dbcfgs, nil, nil, replication.Position{}, 0, sendTransaction)
+	_, err := bls.parseEvents(context.Background(), events, errs)
 	if err != want {
 		t.Errorf("wrong error, got %#v, want %#v", err, want)
 	}
+}
+
+// TestStreamerParseEventsGTIDPurged tests binlog streamer error
+// propagation generally, as well as testing specifically for
+// the error seen when the client needs GTIDs that have been
+// purged on the source.
+func TestStreamerParseEventsGTIDPurged(t *testing.T) {
+	events := make(chan mysql.BinlogEvent)
+	errs := make(chan error)
+	expectedStreamErr := sqlerror.NewSQLError(sqlerror.ERMasterFatalReadingBinlog, sqlerror.SSUnknownSQLState,
+		"Cannot replicate because the master purged required binary logs.")
+
+	sendTransaction := func(eventToken *querypb.EventToken, statements []FullBinlogStatement) error {
+		return nil
+	}
+	// Set mock mysql.ConnParams and dbconfig
+	mcp := &mysql.ConnParams{
+		DbName: "vt_test_keyspace",
+	}
+	dbcfgs := dbconfigs.New(mcp)
+
+	go func() {
+		tmr := time.NewTimer(10 * time.Second)
+		defer tmr.Stop()
+		select {
+		case errs <- expectedStreamErr:
+		case <-tmr.C:
+			require.FailNow(t, "timed out sending error message")
+		}
+	}()
+
+	bls := NewStreamer(dbcfgs, nil, nil, replication.Position{}, 0, sendTransaction)
+	_, err := bls.parseEvents(context.Background(), events, errs)
+	require.Error(t, err)
+	sqlErr, ok := err.(*sqlerror.SQLError)
+	require.True(t, ok, "expected SQLError, got %T", err)
+	require.True(t, sqlErr.Num == sqlerror.ERMasterFatalReadingBinlog, "expected ERMasterFatalReadingBinlog (%d), got %d",
+		sqlerror.ERMasterFatalReadingBinlog, sqlErr.Num)
 }
 
 func TestStreamerParseEventsSendErrorXID(t *testing.T) {
@@ -270,24 +357,34 @@ func TestStreamerParseEventsSendErrorXID(t *testing.T) {
 		mysql.NewFormatDescriptionEvent(f, s),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "BEGIN"}),
+			SQL:      "BEGIN",
+		}),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "insert into vt_a(eid, id) values (1, 1) /* _stream vt_a (eid id ) (1 1 ); */"}),
+			SQL:      "insert into vt_a(eid, id) values (1, 1) /* _stream vt_a (eid id ) (1 1 ); */",
+		}),
 		mysql.NewXIDEvent(f, s),
 	}
 	want := "send reply error: foobar"
 
 	events := make(chan mysql.BinlogEvent)
+	errs := make(chan error)
 
 	sendTransaction := func(eventToken *querypb.EventToken, statements []FullBinlogStatement) error {
-		return fmt.Errorf("foobar")
+		return errors.New("foobar")
 	}
-	bls := NewStreamer(&mysql.ConnParams{DbName: "vt_test_keyspace"}, nil, nil, mysql.Position{}, 0, sendTransaction)
+
+	// Set mock mysql.ConnParams and dbconfig
+	mcp := &mysql.ConnParams{
+		DbName: "vt_test_keyspace",
+	}
+	dbcfgs := dbconfigs.New(mcp)
+
+	bls := NewStreamer(dbcfgs, nil, nil, replication.Position{}, 0, sendTransaction)
 
 	go sendTestEvents(events, input)
 
-	_, err := bls.parseEvents(context.Background(), events)
+	_, err := bls.parseEvents(context.Background(), events, errs)
 	if err == nil {
 		t.Errorf("expected error, got none")
 		return
@@ -306,25 +403,36 @@ func TestStreamerParseEventsSendErrorCommit(t *testing.T) {
 		mysql.NewFormatDescriptionEvent(f, s),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "BEGIN"}),
+			SQL:      "BEGIN",
+		}),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "insert into vt_a(eid, id) values (1, 1) /* _stream vt_a (eid id ) (1 1 ); */"}),
+			SQL:      "insert into vt_a(eid, id) values (1, 1) /* _stream vt_a (eid id ) (1 1 ); */",
+		}),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "COMMIT"}),
+			SQL:      "COMMIT",
+		}),
 	}
 	want := "send reply error: foobar"
 
 	events := make(chan mysql.BinlogEvent)
+	errs := make(chan error)
 
 	sendTransaction := func(eventToken *querypb.EventToken, statements []FullBinlogStatement) error {
-		return fmt.Errorf("foobar")
+		return errors.New("foobar")
 	}
-	bls := NewStreamer(&mysql.ConnParams{DbName: "vt_test_keyspace"}, nil, nil, mysql.Position{}, 0, sendTransaction)
+
+	// Set mock mysql.ConnParams and dbconfig
+	mcp := &mysql.ConnParams{
+		DbName: "vt_test_keyspace",
+	}
+	dbcfgs := dbconfigs.New(mcp)
+
+	bls := NewStreamer(dbcfgs, nil, nil, replication.Position{}, 0, sendTransaction)
 
 	go sendTestEvents(events, input)
-	_, err := bls.parseEvents(context.Background(), events)
+	_, err := bls.parseEvents(context.Background(), events, errs)
 	if err == nil {
 		t.Errorf("expected error, got none")
 		return
@@ -343,21 +451,30 @@ func TestStreamerParseEventsInvalid(t *testing.T) {
 		mysql.NewFormatDescriptionEvent(f, s),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "BEGIN"}),
+			SQL:      "BEGIN",
+		}),
 		mysql.NewInvalidEvent(),
 		mysql.NewXIDEvent(f, s),
 	}
 	want := "can't parse binlog event, invalid data:"
 
 	events := make(chan mysql.BinlogEvent)
+	errs := make(chan error)
 
 	sendTransaction := func(eventToken *querypb.EventToken, statements []FullBinlogStatement) error {
 		return nil
 	}
-	bls := NewStreamer(&mysql.ConnParams{DbName: "vt_test_keyspace"}, nil, nil, mysql.Position{}, 0, sendTransaction)
+
+	// Set mock mysql.ConnParams and dbconfig
+	mcp := &mysql.ConnParams{
+		DbName: "vt_test_keyspace",
+	}
+	dbcfgs := dbconfigs.New(mcp)
+
+	bls := NewStreamer(dbcfgs, nil, nil, replication.Position{}, 0, sendTransaction)
 
 	go sendTestEvents(events, input)
-	_, err := bls.parseEvents(context.Background(), events)
+	_, err := bls.parseEvents(context.Background(), events, errs)
 	if err == nil {
 		t.Errorf("expected error, got none")
 		return
@@ -376,23 +493,33 @@ func TestStreamerParseEventsInvalidFormat(t *testing.T) {
 		mysql.NewInvalidFormatDescriptionEvent(f, s),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "BEGIN"}),
+			SQL:      "BEGIN",
+		}),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "insert into vt_a(eid, id) values (1, 1) /* _stream vt_a (eid id ) (1 1 ); */"}),
+			SQL:      "insert into vt_a(eid, id) values (1, 1) /* _stream vt_a (eid id ) (1 1 ); */",
+		}),
 		mysql.NewXIDEvent(f, s),
 	}
 	want := "can't parse FORMAT_DESCRIPTION_EVENT:"
 
 	events := make(chan mysql.BinlogEvent)
+	errs := make(chan error)
 
 	sendTransaction := func(eventToken *querypb.EventToken, statements []FullBinlogStatement) error {
 		return nil
 	}
-	bls := NewStreamer(&mysql.ConnParams{DbName: "vt_test_keyspace"}, nil, nil, mysql.Position{}, 0, sendTransaction)
+
+	// Set mock mysql.ConnParams and dbconfig
+	mcp := &mysql.ConnParams{
+		DbName: "vt_test_keyspace",
+	}
+	dbcfgs := dbconfigs.New(mcp)
+
+	bls := NewStreamer(dbcfgs, nil, nil, replication.Position{}, 0, sendTransaction)
 
 	go sendTestEvents(events, input)
-	_, err := bls.parseEvents(context.Background(), events)
+	_, err := bls.parseEvents(context.Background(), events, errs)
 	if err == nil {
 		t.Errorf("expected error, got none")
 		return
@@ -408,26 +535,36 @@ func TestStreamerParseEventsNoFormat(t *testing.T) {
 
 	input := []mysql.BinlogEvent{
 		mysql.NewRotateEvent(f, s, 0, ""),
-		//mysql.NewFormatDescriptionEvent(f, s),
+		// mysql.NewFormatDescriptionEvent(f, s),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "BEGIN"}),
+			SQL:      "BEGIN",
+		}),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "insert into vt_a(eid, id) values (1, 1) /* _stream vt_a (eid id ) (1 1 ); */"}),
+			SQL:      "insert into vt_a(eid, id) values (1, 1) /* _stream vt_a (eid id ) (1 1 ); */",
+		}),
 		mysql.NewXIDEvent(f, s),
 	}
 	want := "got a real event before FORMAT_DESCRIPTION_EVENT:"
 
 	events := make(chan mysql.BinlogEvent)
+	errs := make(chan error)
 
 	sendTransaction := func(eventToken *querypb.EventToken, statements []FullBinlogStatement) error {
 		return nil
 	}
-	bls := NewStreamer(&mysql.ConnParams{DbName: "vt_test_keyspace"}, nil, nil, mysql.Position{}, 0, sendTransaction)
+
+	// Set mock mysql.ConnParams and dbconfig
+	mcp := &mysql.ConnParams{
+		DbName: "vt_test_keyspace",
+	}
+	dbcfgs := dbconfigs.New(mcp)
+
+	bls := NewStreamer(dbcfgs, nil, nil, replication.Position{}, 0, sendTransaction)
 
 	go sendTestEvents(events, input)
-	_, err := bls.parseEvents(context.Background(), events)
+	_, err := bls.parseEvents(context.Background(), events, errs)
 	if err == nil {
 		t.Errorf("expected error, got none")
 		return
@@ -446,21 +583,30 @@ func TestStreamerParseEventsInvalidQuery(t *testing.T) {
 		mysql.NewFormatDescriptionEvent(f, s),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "BEGIN"}),
+			SQL:      "BEGIN",
+		}),
 		mysql.NewInvalidQueryEvent(f, s),
 		mysql.NewXIDEvent(f, s),
 	}
 	want := "can't get query from binlog event:"
 
 	events := make(chan mysql.BinlogEvent)
+	errs := make(chan error)
 
 	sendTransaction := func(eventToken *querypb.EventToken, statements []FullBinlogStatement) error {
 		return nil
 	}
-	bls := NewStreamer(&mysql.ConnParams{DbName: "vt_test_keyspace"}, nil, nil, mysql.Position{}, 0, sendTransaction)
+
+	// Set mock mysql.ConnParams and dbconfig
+	mcp := &mysql.ConnParams{
+		DbName: "vt_test_keyspace",
+	}
+	dbcfgs := dbconfigs.New(mcp)
+
+	bls := NewStreamer(dbcfgs, nil, nil, replication.Position{}, 0, sendTransaction)
 
 	go sendTestEvents(events, input)
-	_, err := bls.parseEvents(context.Background(), events)
+	_, err := bls.parseEvents(context.Background(), events, errs)
 	if err == nil {
 		t.Errorf("expected error, got none")
 		return
@@ -478,38 +624,45 @@ func TestStreamerParseEventsRollback(t *testing.T) {
 	input := []mysql.BinlogEvent{
 		mysql.NewRotateEvent(f, s, 0, ""),
 		mysql.NewFormatDescriptionEvent(f, s),
-		mysql.NewMariaDBGTIDEvent(f, s, mysql.MariadbGTID{Domain: 0, Sequence: 0xd}, false /* hasBegin */),
+		mysql.NewMariaDBGTIDEvent(f, s, replication.MariadbGTID{Domain: 0, Sequence: 0xd}, false /* hasBegin */),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "BEGIN"}),
+			SQL:      "BEGIN",
+		}),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "insert into vt_a(eid, id) values (1, 1) /* _stream vt_a (eid id ) (1 1 ); */"}),
+			SQL:      "insert into vt_a(eid, id) values (1, 1) /* _stream vt_a (eid id ) (1 1 ); */",
+		}),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "insert into vt_a(eid, id) values (1, 1) /* _stream vt_a (eid id ) (1 1 ); */"}),
+			SQL:      "insert into vt_a(eid, id) values (1, 1) /* _stream vt_a (eid id ) (1 1 ); */",
+		}),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "ROLLBACK"}),
+			SQL:      "ROLLBACK",
+		}),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "BEGIN"}),
+			SQL:      "BEGIN",
+		}),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "insert into vt_a(eid, id) values (1, 1) /* _stream vt_a (eid id ) (1 1 ); */"}),
+			SQL:      "insert into vt_a(eid, id) values (1, 1) /* _stream vt_a (eid id ) (1 1 ); */",
+		}),
 		mysql.NewXIDEvent(f, s),
 	}
 
 	events := make(chan mysql.BinlogEvent)
+	errs := make(chan error)
 
-	want := []binlogdatapb.BinlogTransaction{
+	want := []*binlogdatapb.BinlogTransaction{
 		{
 			Statements: nil,
 			EventToken: &querypb.EventToken{
 				Timestamp: 1407805592,
-				Position: mysql.EncodePosition(mysql.Position{
-					GTIDSet: mysql.MariadbGTIDSet{
-						mysql.MariadbGTID{
+				Position: replication.EncodePosition(replication.Position{
+					GTIDSet: replication.MariadbGTIDSet{
+						0: replication.MariadbGTID{
 							Domain:   0,
 							Server:   62344,
 							Sequence: 0x0d,
@@ -525,9 +678,9 @@ func TestStreamerParseEventsRollback(t *testing.T) {
 			},
 			EventToken: &querypb.EventToken{
 				Timestamp: 1407805592,
-				Position: mysql.EncodePosition(mysql.Position{
-					GTIDSet: mysql.MariadbGTIDSet{
-						mysql.MariadbGTID{
+				Position: replication.EncodePosition(replication.Position{
+					GTIDSet: replication.MariadbGTIDSet{
+						0: replication.MariadbGTID{
 							Domain:   0,
 							Server:   62344,
 							Sequence: 0x0d,
@@ -538,10 +691,16 @@ func TestStreamerParseEventsRollback(t *testing.T) {
 		},
 	}
 	var got binlogStatements
-	bls := NewStreamer(&mysql.ConnParams{DbName: "vt_test_keyspace"}, nil, nil, mysql.Position{}, 0, (&got).sendTransaction)
+	// Set mock mysql.ConnParams and dbconfig
+	mcp := &mysql.ConnParams{
+		DbName: "vt_test_keyspace",
+	}
+	dbcfgs := dbconfigs.New(mcp)
+
+	bls := NewStreamer(dbcfgs, nil, nil, replication.Position{}, 0, (&got).sendTransaction)
 
 	go sendTestEvents(events, input)
-	if _, err := bls.parseEvents(context.Background(), events); err != ErrServerEOF {
+	if _, err := bls.parseEvents(context.Background(), events, errs); err != ErrServerEOF {
 		t.Errorf("unexpected error: %v", err)
 	}
 
@@ -558,16 +717,18 @@ func TestStreamerParseEventsDMLWithoutBegin(t *testing.T) {
 	input := []mysql.BinlogEvent{
 		mysql.NewRotateEvent(f, s, 0, ""),
 		mysql.NewFormatDescriptionEvent(f, s),
-		mysql.NewMariaDBGTIDEvent(f, s, mysql.MariadbGTID{Domain: 0, Sequence: 0xd}, false /* hasBegin */),
+		mysql.NewMariaDBGTIDEvent(f, s, replication.MariadbGTID{Domain: 0, Sequence: 0xd}, false /* hasBegin */),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "insert into vt_a(eid, id) values (1, 1) /* _stream vt_a (eid id ) (1 1 ); */"}),
+			SQL:      "insert into vt_a(eid, id) values (1, 1) /* _stream vt_a (eid id ) (1 1 ); */",
+		}),
 		mysql.NewXIDEvent(f, s),
 	}
 
 	events := make(chan mysql.BinlogEvent)
+	errs := make(chan error)
 
-	want := []binlogdatapb.BinlogTransaction{
+	want := []*binlogdatapb.BinlogTransaction{
 		{
 			Statements: []*binlogdatapb.BinlogTransaction_Statement{
 				{Category: binlogdatapb.BinlogTransaction_Statement_BL_SET, Sql: []byte("SET TIMESTAMP=1407805592")},
@@ -575,9 +736,9 @@ func TestStreamerParseEventsDMLWithoutBegin(t *testing.T) {
 			},
 			EventToken: &querypb.EventToken{
 				Timestamp: 1407805592,
-				Position: mysql.EncodePosition(mysql.Position{
-					GTIDSet: mysql.MariadbGTIDSet{
-						mysql.MariadbGTID{
+				Position: replication.EncodePosition(replication.Position{
+					GTIDSet: replication.MariadbGTIDSet{
+						0: replication.MariadbGTID{
 							Domain:   0,
 							Server:   62344,
 							Sequence: 0x0d,
@@ -590,9 +751,9 @@ func TestStreamerParseEventsDMLWithoutBegin(t *testing.T) {
 			Statements: nil,
 			EventToken: &querypb.EventToken{
 				Timestamp: 1407805592,
-				Position: mysql.EncodePosition(mysql.Position{
-					GTIDSet: mysql.MariadbGTIDSet{
-						mysql.MariadbGTID{
+				Position: replication.EncodePosition(replication.Position{
+					GTIDSet: replication.MariadbGTIDSet{
+						0: replication.MariadbGTID{
 							Domain:   0,
 							Server:   62344,
 							Sequence: 0x0d,
@@ -603,10 +764,17 @@ func TestStreamerParseEventsDMLWithoutBegin(t *testing.T) {
 		},
 	}
 	var got binlogStatements
-	bls := NewStreamer(&mysql.ConnParams{DbName: "vt_test_keyspace"}, nil, nil, mysql.Position{}, 0, (&got).sendTransaction)
+
+	// Set mock mysql.ConnParams and dbconfig
+	mcp := &mysql.ConnParams{
+		DbName: "vt_test_keyspace",
+	}
+	dbcfgs := dbconfigs.New(mcp)
+
+	bls := NewStreamer(dbcfgs, nil, nil, replication.Position{}, 0, (&got).sendTransaction)
 
 	go sendTestEvents(events, input)
-	if _, err := bls.parseEvents(context.Background(), events); err != ErrServerEOF {
+	if _, err := bls.parseEvents(context.Background(), events, errs); err != ErrServerEOF {
 		t.Errorf("unexpected error: %v", err)
 	}
 
@@ -623,19 +791,22 @@ func TestStreamerParseEventsBeginWithoutCommit(t *testing.T) {
 	input := []mysql.BinlogEvent{
 		mysql.NewRotateEvent(f, s, 0, ""),
 		mysql.NewFormatDescriptionEvent(f, s),
-		mysql.NewMariaDBGTIDEvent(f, s, mysql.MariadbGTID{Domain: 0, Sequence: 0xd}, false /* hasBegin */),
+		mysql.NewMariaDBGTIDEvent(f, s, replication.MariadbGTID{Domain: 0, Sequence: 0xd}, false /* hasBegin */),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "insert into vt_a(eid, id) values (1, 1) /* _stream vt_a (eid id ) (1 1 ); */"}),
+			SQL:      "insert into vt_a(eid, id) values (1, 1) /* _stream vt_a (eid id ) (1 1 ); */",
+		}),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "BEGIN"}),
+			SQL:      "BEGIN",
+		}),
 		mysql.NewXIDEvent(f, s),
 	}
 
 	events := make(chan mysql.BinlogEvent)
+	errs := make(chan error)
 
-	want := []binlogdatapb.BinlogTransaction{
+	want := []*binlogdatapb.BinlogTransaction{
 		{
 			Statements: []*binlogdatapb.BinlogTransaction_Statement{
 				{Category: binlogdatapb.BinlogTransaction_Statement_BL_SET, Sql: []byte("SET TIMESTAMP=1407805592")},
@@ -643,9 +814,9 @@ func TestStreamerParseEventsBeginWithoutCommit(t *testing.T) {
 			},
 			EventToken: &querypb.EventToken{
 				Timestamp: 1407805592,
-				Position: mysql.EncodePosition(mysql.Position{
-					GTIDSet: mysql.MariadbGTIDSet{
-						mysql.MariadbGTID{
+				Position: replication.EncodePosition(replication.Position{
+					GTIDSet: replication.MariadbGTIDSet{
+						0: replication.MariadbGTID{
 							Domain:   0,
 							Server:   62344,
 							Sequence: 0x0d,
@@ -658,9 +829,9 @@ func TestStreamerParseEventsBeginWithoutCommit(t *testing.T) {
 			Statements: nil,
 			EventToken: &querypb.EventToken{
 				Timestamp: 1407805592,
-				Position: mysql.EncodePosition(mysql.Position{
-					GTIDSet: mysql.MariadbGTIDSet{
-						mysql.MariadbGTID{
+				Position: replication.EncodePosition(replication.Position{
+					GTIDSet: replication.MariadbGTIDSet{
+						0: replication.MariadbGTID{
 							Domain:   0,
 							Server:   62344,
 							Sequence: 0x0d,
@@ -671,10 +842,17 @@ func TestStreamerParseEventsBeginWithoutCommit(t *testing.T) {
 		},
 	}
 	var got binlogStatements
-	bls := NewStreamer(&mysql.ConnParams{DbName: "vt_test_keyspace"}, nil, nil, mysql.Position{}, 0, (&got).sendTransaction)
+
+	// Set mock mysql.ConnParams and dbconfig
+	mcp := &mysql.ConnParams{
+		DbName: "vt_test_keyspace",
+	}
+	dbcfgs := dbconfigs.New(mcp)
+
+	bls := NewStreamer(dbcfgs, nil, nil, replication.Position{}, 0, (&got).sendTransaction)
 
 	go sendTestEvents(events, input)
-	if _, err := bls.parseEvents(context.Background(), events); err != ErrServerEOF {
+	if _, err := bls.parseEvents(context.Background(), events, errs); err != ErrServerEOF {
 		t.Errorf("unexpected error: %v", err)
 	}
 
@@ -691,20 +869,23 @@ func TestStreamerParseEventsSetInsertID(t *testing.T) {
 	input := []mysql.BinlogEvent{
 		mysql.NewRotateEvent(f, s, 0, ""),
 		mysql.NewFormatDescriptionEvent(f, s),
-		mysql.NewMariaDBGTIDEvent(f, s, mysql.MariadbGTID{Domain: 0, Sequence: 0xd}, false /* hasBegin */),
+		mysql.NewMariaDBGTIDEvent(f, s, replication.MariadbGTID{Domain: 0, Sequence: 0xd}, false /* hasBegin */),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "BEGIN"}),
+			SQL:      "BEGIN",
+		}),
 		mysql.NewIntVarEvent(f, s, mysql.IntVarInsertID, 101),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "insert into vt_a(eid, id) values (1, 1) /* _stream vt_a (eid id ) (1 1 ); */"}),
+			SQL:      "insert into vt_a(eid, id) values (1, 1) /* _stream vt_a (eid id ) (1 1 ); */",
+		}),
 		mysql.NewXIDEvent(f, s),
 	}
 
 	events := make(chan mysql.BinlogEvent)
+	errs := make(chan error)
 
-	want := []binlogdatapb.BinlogTransaction{
+	want := []*binlogdatapb.BinlogTransaction{
 		{
 			Statements: []*binlogdatapb.BinlogTransaction_Statement{
 				{Category: binlogdatapb.BinlogTransaction_Statement_BL_SET, Sql: []byte("SET INSERT_ID=101")},
@@ -713,9 +894,9 @@ func TestStreamerParseEventsSetInsertID(t *testing.T) {
 			},
 			EventToken: &querypb.EventToken{
 				Timestamp: 1407805592,
-				Position: mysql.EncodePosition(mysql.Position{
-					GTIDSet: mysql.MariadbGTIDSet{
-						mysql.MariadbGTID{
+				Position: replication.EncodePosition(replication.Position{
+					GTIDSet: replication.MariadbGTIDSet{
+						0: replication.MariadbGTID{
 							Domain:   0,
 							Server:   62344,
 							Sequence: 0x0d,
@@ -726,10 +907,16 @@ func TestStreamerParseEventsSetInsertID(t *testing.T) {
 		},
 	}
 	var got binlogStatements
-	bls := NewStreamer(&mysql.ConnParams{DbName: "vt_test_keyspace"}, nil, nil, mysql.Position{}, 0, (&got).sendTransaction)
+	// Set mock mysql.ConnParams and dbconfig
+	mcp := &mysql.ConnParams{
+		DbName: "vt_test_keyspace",
+	}
+	dbcfgs := dbconfigs.New(mcp)
+
+	bls := NewStreamer(dbcfgs, nil, nil, replication.Position{}, 0, (&got).sendTransaction)
 
 	go sendTestEvents(events, input)
-	if _, err := bls.parseEvents(context.Background(), events); err != ErrServerEOF {
+	if _, err := bls.parseEvents(context.Background(), events, errs); err != ErrServerEOF {
 		t.Errorf("unexpected error: %v", err)
 	}
 
@@ -747,24 +934,33 @@ func TestStreamerParseEventsInvalidIntVar(t *testing.T) {
 		mysql.NewFormatDescriptionEvent(f, s),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "BEGIN"}),
+			SQL:      "BEGIN",
+		}),
 		mysql.NewIntVarEvent(f, s, mysql.IntVarInvalidInt, 0), // Invalid intvar.
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "insert into vt_a(eid, id) values (1, 1) /* _stream vt_a (eid id ) (1 1 ); */"}),
+			SQL:      "insert into vt_a(eid, id) values (1, 1) /* _stream vt_a (eid id ) (1 1 ); */",
+		}),
 		mysql.NewXIDEvent(f, s),
 	}
 	want := "can't parse INTVAR_EVENT:"
 
 	events := make(chan mysql.BinlogEvent)
+	errs := make(chan error)
 
 	sendTransaction := func(eventToken *querypb.EventToken, statements []FullBinlogStatement) error {
 		return nil
 	}
-	bls := NewStreamer(&mysql.ConnParams{DbName: "vt_test_keyspace"}, nil, nil, mysql.Position{}, 0, sendTransaction)
+	// Set mock mysql.ConnParams and dbconfig
+	mcp := &mysql.ConnParams{
+		DbName: "vt_test_keyspace",
+	}
+	dbcfgs := dbconfigs.New(mcp)
+
+	bls := NewStreamer(dbcfgs, nil, nil, replication.Position{}, 0, sendTransaction)
 
 	go sendTestEvents(events, input)
-	_, err := bls.parseEvents(context.Background(), events)
+	_, err := bls.parseEvents(context.Background(), events, errs)
 	if err == nil {
 		t.Errorf("expected error, got none")
 		return
@@ -782,22 +978,26 @@ func TestStreamerParseEventsOtherDB(t *testing.T) {
 	input := []mysql.BinlogEvent{
 		mysql.NewRotateEvent(f, s, 0, ""),
 		mysql.NewFormatDescriptionEvent(f, s),
-		mysql.NewMariaDBGTIDEvent(f, s, mysql.MariadbGTID{Domain: 0, Sequence: 0xd}, false /* hasBegin */),
+		mysql.NewMariaDBGTIDEvent(f, s, replication.MariadbGTID{Domain: 0, Sequence: 0xd}, false /* hasBegin */),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "BEGIN"}),
+			SQL:      "BEGIN",
+		}),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "other",
-			SQL:      "INSERT INTO test values (3, 4)"}),
+			SQL:      "INSERT INTO test values (3, 4)",
+		}),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "insert into vt_a(eid, id) values (1, 1) /* _stream vt_a (eid id ) (1 1 ); */"}),
+			SQL:      "insert into vt_a(eid, id) values (1, 1) /* _stream vt_a (eid id ) (1 1 ); */",
+		}),
 		mysql.NewXIDEvent(f, s),
 	}
 
 	events := make(chan mysql.BinlogEvent)
+	errs := make(chan error)
 
-	want := []binlogdatapb.BinlogTransaction{
+	want := []*binlogdatapb.BinlogTransaction{
 		{
 			Statements: []*binlogdatapb.BinlogTransaction_Statement{
 				{Category: binlogdatapb.BinlogTransaction_Statement_BL_SET, Sql: []byte("SET TIMESTAMP=1407805592")},
@@ -805,9 +1005,9 @@ func TestStreamerParseEventsOtherDB(t *testing.T) {
 			},
 			EventToken: &querypb.EventToken{
 				Timestamp: 1407805592,
-				Position: mysql.EncodePosition(mysql.Position{
-					GTIDSet: mysql.MariadbGTIDSet{
-						mysql.MariadbGTID{
+				Position: replication.EncodePosition(replication.Position{
+					GTIDSet: replication.MariadbGTIDSet{
+						0: replication.MariadbGTID{
 							Domain:   0,
 							Server:   62344,
 							Sequence: 0x0d,
@@ -818,10 +1018,16 @@ func TestStreamerParseEventsOtherDB(t *testing.T) {
 		},
 	}
 	var got binlogStatements
-	bls := NewStreamer(&mysql.ConnParams{DbName: "vt_test_keyspace"}, nil, nil, mysql.Position{}, 0, (&got).sendTransaction)
+	// Set mock mysql.ConnParams and dbconfig
+	mcp := &mysql.ConnParams{
+		DbName: "vt_test_keyspace",
+	}
+	dbcfgs := dbconfigs.New(mcp)
+
+	bls := NewStreamer(dbcfgs, nil, nil, replication.Position{}, 0, (&got).sendTransaction)
 
 	go sendTestEvents(events, input)
-	if _, err := bls.parseEvents(context.Background(), events); err != ErrServerEOF {
+	if _, err := bls.parseEvents(context.Background(), events, errs); err != ErrServerEOF {
 		t.Errorf("unexpected error: %v", err)
 	}
 
@@ -838,22 +1044,26 @@ func TestStreamerParseEventsOtherDBBegin(t *testing.T) {
 	input := []mysql.BinlogEvent{
 		mysql.NewRotateEvent(f, s, 0, ""),
 		mysql.NewFormatDescriptionEvent(f, s),
-		mysql.NewMariaDBGTIDEvent(f, s, mysql.MariadbGTID{Domain: 0, Sequence: 0xd}, false /* hasBegin */),
+		mysql.NewMariaDBGTIDEvent(f, s, replication.MariadbGTID{Domain: 0, Sequence: 0xd}, false /* hasBegin */),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "other",
-			SQL:      "BEGIN"}), // Check that this doesn't get filtered out.
+			SQL:      "BEGIN",
+		}), // Check that this doesn't get filtered out.
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "other",
-			SQL:      "INSERT INTO test values (3, 4)"}),
+			SQL:      "INSERT INTO test values (3, 4)",
+		}),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "insert into vt_a(eid, id) values (1, 1) /* _stream vt_a (eid id ) (1 1 ); */"}),
+			SQL:      "insert into vt_a(eid, id) values (1, 1) /* _stream vt_a (eid id ) (1 1 ); */",
+		}),
 		mysql.NewXIDEvent(f, s),
 	}
 
 	events := make(chan mysql.BinlogEvent)
+	errs := make(chan error)
 
-	want := []binlogdatapb.BinlogTransaction{
+	want := []*binlogdatapb.BinlogTransaction{
 		{
 			Statements: []*binlogdatapb.BinlogTransaction_Statement{
 				{Category: binlogdatapb.BinlogTransaction_Statement_BL_SET, Sql: []byte("SET TIMESTAMP=1407805592")},
@@ -861,9 +1071,9 @@ func TestStreamerParseEventsOtherDBBegin(t *testing.T) {
 			},
 			EventToken: &querypb.EventToken{
 				Timestamp: 1407805592,
-				Position: mysql.EncodePosition(mysql.Position{
-					GTIDSet: mysql.MariadbGTIDSet{
-						mysql.MariadbGTID{
+				Position: replication.EncodePosition(replication.Position{
+					GTIDSet: replication.MariadbGTIDSet{
+						0: replication.MariadbGTID{
 							Domain:   0,
 							Server:   62344,
 							Sequence: 0x0d,
@@ -874,10 +1084,16 @@ func TestStreamerParseEventsOtherDBBegin(t *testing.T) {
 		},
 	}
 	var got binlogStatements
-	bls := NewStreamer(&mysql.ConnParams{DbName: "vt_test_keyspace"}, nil, nil, mysql.Position{}, 0, (&got).sendTransaction)
+	// Set mock mysql.ConnParams and dbconfig
+	mcp := &mysql.ConnParams{
+		DbName: "vt_test_keyspace",
+	}
+	dbcfgs := dbconfigs.New(mcp)
+
+	bls := NewStreamer(dbcfgs, nil, nil, replication.Position{}, 0, (&got).sendTransaction)
 
 	go sendTestEvents(events, input)
-	if _, err := bls.parseEvents(context.Background(), events); err != ErrServerEOF {
+	if _, err := bls.parseEvents(context.Background(), events, errs); err != ErrServerEOF {
 		t.Errorf("unexpected error: %v", err)
 	}
 
@@ -895,25 +1111,35 @@ func TestStreamerParseEventsBeginAgain(t *testing.T) {
 		mysql.NewFormatDescriptionEvent(f, s),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "BEGIN"}),
+			SQL:      "BEGIN",
+		}),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "insert into vt_a(eid, id) values (1, 1) /* _stream vt_a (eid id ) (1 1 ); */"}),
+			SQL:      "insert into vt_a(eid, id) values (1, 1) /* _stream vt_a (eid id ) (1 1 ); */",
+		}),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Database: "vt_test_keyspace",
-			SQL:      "BEGIN"}),
+			SQL:      "BEGIN",
+		}),
 	}
 
 	events := make(chan mysql.BinlogEvent)
+	errs := make(chan error)
 
 	sendTransaction := func(eventToken *querypb.EventToken, statements []FullBinlogStatement) error {
 		return nil
 	}
-	bls := NewStreamer(&mysql.ConnParams{DbName: "vt_test_keyspace"}, nil, nil, mysql.Position{}, 0, sendTransaction)
+	// Set mock mysql.ConnParams and dbconfig
+	mcp := &mysql.ConnParams{
+		DbName: "vt_test_keyspace",
+	}
+	dbcfgs := dbconfigs.New(mcp)
+
+	bls := NewStreamer(dbcfgs, nil, nil, replication.Position{}, 0, sendTransaction)
 	before := binlogStreamerErrors.Counts()["ParseEvents"]
 
 	go sendTestEvents(events, input)
-	if _, err := bls.parseEvents(context.Background(), events); err != ErrServerEOF {
+	if _, err := bls.parseEvents(context.Background(), events, errs); err != ErrServerEOF {
 		t.Errorf("unexpected error: %v", err)
 	}
 	after := binlogStreamerErrors.Counts()["ParseEvents"]
@@ -933,7 +1159,7 @@ func TestStreamerParseEventsMariadbBeginGTID(t *testing.T) {
 	input := []mysql.BinlogEvent{
 		mysql.NewRotateEvent(f, s, 4, "filename.0001"),
 		mysql.NewFormatDescriptionEvent(f, s),
-		mysql.NewMariaDBGTIDEvent(f, s, mysql.MariadbGTID{Domain: 0, Sequence: 10}, true /* hasBegin */),
+		mysql.NewMariaDBGTIDEvent(f, s, replication.MariadbGTID{Domain: 0, Sequence: 10}, true /* hasBegin */),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Charset: &binlogdatapb.Charset{Client: 33, Conn: 33, Server: 33},
 			SQL:     "insert into vt_insert_test(msg) values ('test 0') /* _stream vt_insert_test (id ) (null ); */",
@@ -942,8 +1168,9 @@ func TestStreamerParseEventsMariadbBeginGTID(t *testing.T) {
 	}
 
 	events := make(chan mysql.BinlogEvent)
+	errs := make(chan error)
 
-	want := []binlogdatapb.BinlogTransaction{
+	want := []*binlogdatapb.BinlogTransaction{
 		{
 			Statements: []*binlogdatapb.BinlogTransaction_Statement{
 				{
@@ -959,9 +1186,9 @@ func TestStreamerParseEventsMariadbBeginGTID(t *testing.T) {
 			},
 			EventToken: &querypb.EventToken{
 				Timestamp: 1409892744,
-				Position: mysql.EncodePosition(mysql.Position{
-					GTIDSet: mysql.MariadbGTIDSet{
-						mysql.MariadbGTID{
+				Position: replication.EncodePosition(replication.Position{
+					GTIDSet: replication.MariadbGTIDSet{
+						0: replication.MariadbGTID{
 							Domain:   0,
 							Server:   62344,
 							Sequence: 10,
@@ -972,10 +1199,16 @@ func TestStreamerParseEventsMariadbBeginGTID(t *testing.T) {
 		},
 	}
 	var got binlogStatements
-	bls := NewStreamer(&mysql.ConnParams{DbName: "vt_test_keyspace"}, nil, nil, mysql.Position{}, 0, (&got).sendTransaction)
+	// Set mock mysql.ConnParams and dbconfig
+	mcp := &mysql.ConnParams{
+		DbName: "vt_test_keyspace",
+	}
+	dbcfgs := dbconfigs.New(mcp)
+
+	bls := NewStreamer(dbcfgs, nil, nil, replication.Position{}, 0, (&got).sendTransaction)
 
 	go sendTestEvents(events, input)
-	if _, err := bls.parseEvents(context.Background(), events); err != ErrServerEOF {
+	if _, err := bls.parseEvents(context.Background(), events, errs); err != ErrServerEOF {
 		t.Errorf("unexpected error: %v", err)
 	}
 
@@ -995,7 +1228,7 @@ func TestStreamerParseEventsMariadbStandaloneGTID(t *testing.T) {
 	input := []mysql.BinlogEvent{
 		mysql.NewRotateEvent(f, s, 4, "filename.0001"),
 		mysql.NewFormatDescriptionEvent(f, s),
-		mysql.NewMariaDBGTIDEvent(f, s, mysql.MariadbGTID{Domain: 0, Sequence: 9}, false /* hasBegin */),
+		mysql.NewMariaDBGTIDEvent(f, s, replication.MariadbGTID{Domain: 0, Sequence: 9}, false /* hasBegin */),
 		mysql.NewQueryEvent(f, s, mysql.Query{
 			Charset: &binlogdatapb.Charset{Client: 8, Conn: 8, Server: 33},
 			SQL:     "create table if not exists vt_insert_test (\nid bigint auto_increment,\nmsg varchar(64),\nprimary key (id)\n) Engine=InnoDB",
@@ -1003,8 +1236,9 @@ func TestStreamerParseEventsMariadbStandaloneGTID(t *testing.T) {
 	}
 
 	events := make(chan mysql.BinlogEvent)
+	errs := make(chan error)
 
-	want := []binlogdatapb.BinlogTransaction{
+	want := []*binlogdatapb.BinlogTransaction{
 		{
 			Statements: []*binlogdatapb.BinlogTransaction_Statement{
 				{Category: binlogdatapb.BinlogTransaction_Statement_BL_SET, Charset: &binlogdatapb.Charset{Client: 8, Conn: 8, Server: 33}, Sql: []byte("SET TIMESTAMP=1409892744")},
@@ -1012,9 +1246,9 @@ func TestStreamerParseEventsMariadbStandaloneGTID(t *testing.T) {
 			},
 			EventToken: &querypb.EventToken{
 				Timestamp: 1409892744,
-				Position: mysql.EncodePosition(mysql.Position{
-					GTIDSet: mysql.MariadbGTIDSet{
-						mysql.MariadbGTID{
+				Position: replication.EncodePosition(replication.Position{
+					GTIDSet: replication.MariadbGTIDSet{
+						0: replication.MariadbGTID{
 							Domain:   0,
 							Server:   62344,
 							Sequence: 9,
@@ -1025,10 +1259,16 @@ func TestStreamerParseEventsMariadbStandaloneGTID(t *testing.T) {
 		},
 	}
 	var got binlogStatements
-	bls := NewStreamer(&mysql.ConnParams{DbName: "vt_test_keyspace"}, nil, nil, mysql.Position{}, 0, (&got).sendTransaction)
+	// Set mock mysql.ConnParams and dbconfig
+	mcp := &mysql.ConnParams{
+		DbName: "vt_test_keyspace",
+	}
+	dbcfgs := dbconfigs.New(mcp)
+
+	bls := NewStreamer(dbcfgs, nil, nil, replication.Position{}, 0, (&got).sendTransaction)
 
 	go sendTestEvents(events, input)
-	if _, err := bls.parseEvents(context.Background(), events); err != ErrServerEOF {
+	if _, err := bls.parseEvents(context.Background(), events, errs); err != ErrServerEOF {
 		t.Errorf("unexpected error: %v", err)
 	}
 

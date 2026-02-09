@@ -21,9 +21,6 @@ import (
 	"fmt"
 	"testing"
 
-	"golang.org/x/net/context"
-
-	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	vtgatepb "vitess.io/vitess/go/vt/proto/vtgate"
 )
 
@@ -53,7 +50,7 @@ func init() {
 
 	buf := &bytes.Buffer{}
 	buf.WriteString("select a from t1 where v = 1")
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		fmt.Fprintf(buf, " and v%d = '%d%s'", i, i, baseval.String())
 	}
 	benchQuery = buf.String()
@@ -61,22 +58,19 @@ func init() {
 }
 
 func BenchmarkWithNormalizer(b *testing.B) {
-	createSandbox(KsTestUnsharded)
-	hcVTGateTest.Reset()
-	_ = hcVTGateTest.AddTestTablet("aa", "1.1.1.1", 1001, KsTestUnsharded, "0", topodatapb.TabletType_MASTER, true, 1, nil)
-	saved := rpcVTGate.executor.normalize
-	rpcVTGate.executor.normalize = true
-	defer func() { rpcVTGate.executor.normalize = saved }()
+	vtgateInst, _, ctx := createVtgateEnv(b)
 
-	for i := 0; i < b.N; i++ {
-		_, _, err := rpcVTGate.Execute(
-			context.Background(),
+	for b.Loop() {
+		_, _, err := vtgateInst.Execute(
+			ctx,
+			nil,
 			&vtgatepb.Session{
-				TargetString: "@master",
+				TargetString: "@primary",
 				Options:      executeOptions,
 			},
 			benchQuery,
 			nil,
+			false,
 		)
 		if err != nil {
 			panic(err)
@@ -85,22 +79,21 @@ func BenchmarkWithNormalizer(b *testing.B) {
 }
 
 func BenchmarkWithoutNormalizer(b *testing.B) {
-	createSandbox(KsTestUnsharded)
-	hcVTGateTest.Reset()
-	_ = hcVTGateTest.AddTestTablet("aa", "1.1.1.1", 1001, KsTestUnsharded, "0", topodatapb.TabletType_MASTER, true, 1, nil)
-	saved := rpcVTGate.executor.normalize
-	rpcVTGate.executor.normalize = false
-	defer func() { rpcVTGate.executor.normalize = saved }()
+	vtgateInst, _, ctx := createVtgateEnv(b)
 
-	for i := 0; i < b.N; i++ {
-		_, _, err := rpcVTGate.Execute(
-			context.Background(),
+	vtgateInst.executor.config.Normalize = false
+
+	for b.Loop() {
+		_, _, err := vtgateInst.Execute(
+			ctx,
+			nil,
 			&vtgatepb.Session{
-				TargetString: "@master",
+				TargetString: "@primary",
 				Options:      executeOptions,
 			},
 			benchQuery,
 			nil,
+			false,
 		)
 		if err != nil {
 			panic(err)

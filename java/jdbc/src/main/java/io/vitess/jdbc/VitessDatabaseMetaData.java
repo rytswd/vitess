@@ -17,12 +17,10 @@
 package io.vitess.jdbc;
 
 import io.vitess.util.Constants;
-
 import java.sql.DatabaseMetaData;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.SQLFeatureNotSupportedException;
-import java.util.logging.Logger;
 
 /**
  * Created by harshit.gangal on 25/01/16.
@@ -36,8 +34,6 @@ public abstract class VitessDatabaseMetaData implements DatabaseMetaData {
   private static final String PROCEDURE_TERM = "procedure";
   private static final String CATALOG_TERM = "database";
   private static final String DATABASE_PRODUCT_NAME = "MySQL";
-  /* Get actual class name to be printed on */
-  private static Logger logger = Logger.getLogger(VitessDatabaseMetaData.class.getName());
   protected final String quotedId = "`";
   protected VitessConnection connection = null;
 

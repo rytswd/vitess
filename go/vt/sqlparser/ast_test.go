@@ -24,15 +24,16 @@ import (
 	"testing"
 	"unsafe"
 
-	"vitess.io/vitess/go/sqltypes"
+	"github.com/stretchr/testify/assert"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestAppend(t *testing.T) {
+	parser := NewTestParser()
 	query := "select * from t where a = 1"
-	tree, err := Parse(query)
-	if err != nil {
-		t.Error(err)
-	}
+	tree, err := parser.Parse(query)
+	require.NoError(t, err)
 	var b strings.Builder
 	Append(&b, tree)
 	got := b.String()
@@ -49,73 +50,68 @@ func TestAppend(t *testing.T) {
 }
 
 func TestSelect(t *testing.T) {
-	tree, err := Parse("select * from t where a = 1")
-	if err != nil {
-		t.Error(err)
-	}
-	expr := tree.(*Select).Where.Expr
+	parser := NewTestParser()
+	e1, err := parser.ParseExpr("a = 1")
+	require.NoError(t, err)
+	e2, err := parser.ParseExpr("b = 2")
+	require.NoError(t, err)
+	t.Run("single predicate where", func(t *testing.T) {
+		sel := &Select{}
+		sel.AddWhere(e1)
+		assert.Equal(t, " where a = 1", String(sel.Where))
+	})
 
-	sel := &Select{}
-	sel.AddWhere(expr)
-	buf := NewTrackedBuffer(nil)
-	sel.Where.Format(buf)
-	want := " where a = 1"
-	if buf.String() != want {
-		t.Errorf("where: %q, want %s", buf.String(), want)
-	}
-	sel.AddWhere(expr)
-	buf = NewTrackedBuffer(nil)
-	sel.Where.Format(buf)
-	want = " where a = 1 and a = 1"
-	if buf.String() != want {
-		t.Errorf("where: %q, want %s", buf.String(), want)
-	}
-	sel = &Select{}
-	sel.AddHaving(expr)
-	buf = NewTrackedBuffer(nil)
-	sel.Having.Format(buf)
-	want = " having a = 1"
-	if buf.String() != want {
-		t.Errorf("having: %q, want %s", buf.String(), want)
-	}
-	sel.AddHaving(expr)
-	buf = NewTrackedBuffer(nil)
-	sel.Having.Format(buf)
-	want = " having a = 1 and a = 1"
-	if buf.String() != want {
-		t.Errorf("having: %q, want %s", buf.String(), want)
-	}
+	t.Run("single predicate having", func(t *testing.T) {
+		sel := &Select{}
+		sel.AddHaving(e1)
+		assert.Equal(t, " having a = 1", String(sel.Having))
+	})
 
-	// OR clauses must be parenthesized.
-	tree, err = Parse("select * from t where a = 1 or b = 1")
-	if err != nil {
-		t.Error(err)
-	}
-	expr = tree.(*Select).Where.Expr
-	sel = &Select{}
-	sel.AddWhere(expr)
-	buf = NewTrackedBuffer(nil)
-	sel.Where.Format(buf)
-	want = " where (a = 1 or b = 1)"
-	if buf.String() != want {
-		t.Errorf("where: %q, want %s", buf.String(), want)
-	}
-	sel = &Select{}
-	sel.AddHaving(expr)
-	buf = NewTrackedBuffer(nil)
-	sel.Having.Format(buf)
-	want = " having (a = 1 or b = 1)"
-	if buf.String() != want {
-		t.Errorf("having: %q, want %s", buf.String(), want)
-	}
+	t.Run("double predicate where", func(t *testing.T) {
+		sel := &Select{}
+		sel.AddWhere(e1)
+		sel.AddWhere(e2)
+		assert.Equal(t, " where a = 1 and b = 2", String(sel.Where))
+	})
+
+	t.Run("double predicate having", func(t *testing.T) {
+		sel := &Select{}
+		sel.AddHaving(e1)
+		sel.AddHaving(e2)
+		assert.Equal(t, " having a = 1 and b = 2", String(sel.Having))
+	})
+}
+
+func TestUpdate(t *testing.T) {
+	parser := NewTestParser()
+	tree, err := parser.Parse("update t set a = 1")
+	require.NoError(t, err)
+
+	upd, ok := tree.(*Update)
+	require.True(t, ok)
+
+	upd.AddWhere(&ComparisonExpr{
+		Left:     &ColName{Name: NewIdentifierCI("b")},
+		Operator: EqualOp,
+		Right:    NewIntLiteral("2"),
+	})
+	assert.Equal(t, "update t set a = 1 where b = 2", String(upd))
+
+	upd.AddWhere(&ComparisonExpr{
+		Left:     &ColName{Name: NewIdentifierCI("c")},
+		Operator: EqualOp,
+		Right:    NewIntLiteral("3"),
+	})
+	assert.Equal(t, "update t set a = 1 where b = 2 and c = 3", String(upd))
 }
 
 func TestRemoveHints(t *testing.T) {
+	parser := NewTestParser()
 	for _, query := range []string{
 		"select * from t use index (i)",
 		"select * from t force index (i)",
 	} {
-		tree, err := Parse(query)
+		tree, err := parser.Parse(query)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -132,125 +128,100 @@ func TestRemoveHints(t *testing.T) {
 }
 
 func TestAddOrder(t *testing.T) {
-	src, err := Parse("select foo, bar from baz order by foo")
-	if err != nil {
-		t.Error(err)
-	}
+	parser := NewTestParser()
+	src, err := parser.Parse("select foo, bar from baz order by foo")
+	require.NoError(t, err)
 	order := src.(*Select).OrderBy[0]
-	dst, err := Parse("select * from t")
-	if err != nil {
-		t.Error(err)
-	}
+	dst, err := parser.Parse("select * from t")
+	require.NoError(t, err)
 	dst.(*Select).AddOrder(order)
 	buf := NewTrackedBuffer(nil)
 	dst.Format(buf)
-	want := "select * from t order by foo asc"
-	if buf.String() != want {
-		t.Errorf("order: %q, want %s", buf.String(), want)
-	}
-	dst, err = Parse("select * from t union select * from s")
-	if err != nil {
-		t.Error(err)
-	}
+	require.Equal(t, "select * from t order by foo asc", buf.String())
+	dst, err = parser.Parse("select * from t union select * from s")
+	require.NoError(t, err)
 	dst.(*Union).AddOrder(order)
 	buf = NewTrackedBuffer(nil)
 	dst.Format(buf)
-	want = "select * from t union select * from s order by foo asc"
-	if buf.String() != want {
-		t.Errorf("order: %q, want %s", buf.String(), want)
-	}
+	require.Equal(t, "select * from t union select * from s order by foo asc", buf.String())
 }
 
 func TestSetLimit(t *testing.T) {
-	src, err := Parse("select foo, bar from baz limit 4")
-	if err != nil {
-		t.Error(err)
-	}
+	parser := NewTestParser()
+	src, err := parser.Parse("select foo, bar from baz limit 4")
+	require.NoError(t, err)
 	limit := src.(*Select).Limit
-	dst, err := Parse("select * from t")
-	if err != nil {
-		t.Error(err)
-	}
+	dst, err := parser.Parse("select * from t")
+	require.NoError(t, err)
 	dst.(*Select).SetLimit(limit)
 	buf := NewTrackedBuffer(nil)
 	dst.Format(buf)
-	want := "select * from t limit 4"
-	if buf.String() != want {
-		t.Errorf("limit: %q, want %s", buf.String(), want)
-	}
-	dst, err = Parse("select * from t union select * from s")
-	if err != nil {
-		t.Error(err)
-	}
+	require.Equal(t, "select * from t limit 4", buf.String())
+	dst, err = parser.Parse("select * from t union select * from s")
+	require.NoError(t, err)
 	dst.(*Union).SetLimit(limit)
 	buf = NewTrackedBuffer(nil)
 	dst.Format(buf)
-	want = "select * from t union select * from s limit 4"
-	if buf.String() != want {
-		t.Errorf("order: %q, want %s", buf.String(), want)
-	}
+	require.Equal(t, "select * from t union select * from s limit 4", buf.String())
 }
 
 func TestDDL(t *testing.T) {
 	testcases := []struct {
 		query    string
-		output   *DDL
+		output   DDLStatement
 		affected []string
 	}{{
 		query: "create table a",
-		output: &DDL{
-			Action: CreateStr,
-			Table:  TableName{Name: NewTableIdent("a")},
+		output: &CreateTable{
+			Table: TableName{Name: NewIdentifierCS("a")},
 		},
 		affected: []string{"a"},
 	}, {
 		query: "rename table a to b",
-		output: &DDL{
-			Action: RenameStr,
-			FromTables: TableNames{
-				TableName{Name: NewTableIdent("a")},
-			},
-			ToTables: TableNames{
-				TableName{Name: NewTableIdent("b")},
+		output: &RenameTable{
+			TablePairs: []*RenameTablePair{
+				{
+					FromTable: TableName{Name: NewIdentifierCS("a")},
+					ToTable:   TableName{Name: NewIdentifierCS("b")},
+				},
 			},
 		},
 		affected: []string{"a", "b"},
 	}, {
 		query: "rename table a to b, c to d",
-		output: &DDL{
-			Action: RenameStr,
-			FromTables: TableNames{
-				TableName{Name: NewTableIdent("a")},
-				TableName{Name: NewTableIdent("c")},
-			},
-			ToTables: TableNames{
-				TableName{Name: NewTableIdent("b")},
-				TableName{Name: NewTableIdent("d")},
+		output: &RenameTable{
+			TablePairs: []*RenameTablePair{
+				{
+					FromTable: TableName{Name: NewIdentifierCS("a")},
+					ToTable:   TableName{Name: NewIdentifierCS("b")},
+				}, {
+					FromTable: TableName{Name: NewIdentifierCS("c")},
+					ToTable:   TableName{Name: NewIdentifierCS("d")},
+				},
 			},
 		},
-		affected: []string{"a", "c", "b", "d"},
+		affected: []string{"a", "b", "c", "d"},
 	}, {
 		query: "drop table a",
-		output: &DDL{
-			Action: DropStr,
+		output: &DropTable{
 			FromTables: TableNames{
-				TableName{Name: NewTableIdent("a")},
+				TableName{Name: NewIdentifierCS("a")},
 			},
 		},
 		affected: []string{"a"},
 	}, {
 		query: "drop table a, b",
-		output: &DDL{
-			Action: DropStr,
+		output: &DropTable{
 			FromTables: TableNames{
-				TableName{Name: NewTableIdent("a")},
-				TableName{Name: NewTableIdent("b")},
+				TableName{Name: NewIdentifierCS("a")},
+				TableName{Name: NewIdentifierCS("b")},
 			},
 		},
 		affected: []string{"a", "b"},
 	}}
+	parser := NewTestParser()
 	for _, tcase := range testcases {
-		got, err := Parse(tcase.query)
+		got, err := parser.Parse(tcase.query)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -259,19 +230,18 @@ func TestDDL(t *testing.T) {
 		}
 		want := make(TableNames, 0, len(tcase.affected))
 		for _, t := range tcase.affected {
-			want = append(want, TableName{Name: NewTableIdent(t)})
+			want = append(want, TableName{Name: NewIdentifierCS(t)})
 		}
-		if affected := got.(*DDL).AffectedTables(); !reflect.DeepEqual(affected, want) {
+		if affected := got.(DDLStatement).AffectedTables(); !reflect.DeepEqual(affected, want) {
 			t.Errorf("Affected(%s): %v, want %v", tcase.query, affected, want)
 		}
 	}
 }
 
 func TestSetAutocommitON(t *testing.T) {
-	stmt, err := Parse("SET autocommit=ON")
-	if err != nil {
-		t.Error(err)
-	}
+	parser := NewTestParser()
+	stmt, err := parser.Parse("SET autocommit=ON")
+	require.NoError(t, err)
 	s, ok := stmt.(*Set)
 	if !ok {
 		t.Errorf("SET statement is not Set: %T", s)
@@ -283,22 +253,20 @@ func TestSetAutocommitON(t *testing.T) {
 
 	e := s.Exprs[0]
 	switch v := e.Expr.(type) {
-	case *SQLVal:
+	case *Literal:
 		if v.Type != StrVal {
 			t.Errorf("SET statement value is not StrVal: %T", v)
 		}
 
-		if !bytes.Equal([]byte("on"), v.Val) {
+		if v.Val != "on" {
 			t.Errorf("SET statement value want: on, got: %s", v.Val)
 		}
 	default:
-		t.Errorf("SET statement expression is not SQLVal: %T", e.Expr)
+		t.Errorf("SET statement expression is not Literal: %T", e.Expr)
 	}
 
-	stmt, err = Parse("SET @@session.autocommit=ON")
-	if err != nil {
-		t.Error(err)
-	}
+	stmt, err = parser.Parse("SET @@session.autocommit=ON")
+	require.NoError(t, err)
 	s, ok = stmt.(*Set)
 	if !ok {
 		t.Errorf("SET statement is not Set: %T", s)
@@ -310,24 +278,23 @@ func TestSetAutocommitON(t *testing.T) {
 
 	e = s.Exprs[0]
 	switch v := e.Expr.(type) {
-	case *SQLVal:
+	case *Literal:
 		if v.Type != StrVal {
 			t.Errorf("SET statement value is not StrVal: %T", v)
 		}
 
-		if !bytes.Equal([]byte("on"), v.Val) {
+		if v.Val != "on" {
 			t.Errorf("SET statement value want: on, got: %s", v.Val)
 		}
 	default:
-		t.Errorf("SET statement expression is not SQLVal: %T", e.Expr)
+		t.Errorf("SET statement expression is not Literal: %T", e.Expr)
 	}
 }
 
 func TestSetAutocommitOFF(t *testing.T) {
-	stmt, err := Parse("SET autocommit=OFF")
-	if err != nil {
-		t.Error(err)
-	}
+	parser := NewTestParser()
+	stmt, err := parser.Parse("SET autocommit=OFF")
+	require.NoError(t, err)
 	s, ok := stmt.(*Set)
 	if !ok {
 		t.Errorf("SET statement is not Set: %T", s)
@@ -339,22 +306,20 @@ func TestSetAutocommitOFF(t *testing.T) {
 
 	e := s.Exprs[0]
 	switch v := e.Expr.(type) {
-	case *SQLVal:
+	case *Literal:
 		if v.Type != StrVal {
 			t.Errorf("SET statement value is not StrVal: %T", v)
 		}
 
-		if !bytes.Equal([]byte("off"), v.Val) {
+		if v.Val != "off" {
 			t.Errorf("SET statement value want: on, got: %s", v.Val)
 		}
 	default:
-		t.Errorf("SET statement expression is not SQLVal: %T", e.Expr)
+		t.Errorf("SET statement expression is not Literal: %T", e.Expr)
 	}
 
-	stmt, err = Parse("SET @@session.autocommit=OFF")
-	if err != nil {
-		t.Error(err)
-	}
+	stmt, err = parser.Parse("SET @@session.autocommit=OFF")
+	require.NoError(t, err)
 	s, ok = stmt.(*Set)
 	if !ok {
 		t.Errorf("SET statement is not Set: %T", s)
@@ -366,18 +331,17 @@ func TestSetAutocommitOFF(t *testing.T) {
 
 	e = s.Exprs[0]
 	switch v := e.Expr.(type) {
-	case *SQLVal:
+	case *Literal:
 		if v.Type != StrVal {
 			t.Errorf("SET statement value is not StrVal: %T", v)
 		}
 
-		if !bytes.Equal([]byte("off"), v.Val) {
+		if v.Val != "off" {
 			t.Errorf("SET statement value want: on, got: %s", v.Val)
 		}
 	default:
-		t.Errorf("SET statement expression is not SQLVal: %T", e.Expr)
+		t.Errorf("SET statement expression is not Literal: %T", e.Expr)
 	}
-
 }
 
 func TestWhere(t *testing.T) {
@@ -387,7 +351,7 @@ func TestWhere(t *testing.T) {
 	if buf.String() != "" {
 		t.Errorf("w.Format(nil): %q, want \"\"", buf.String())
 	}
-	w = NewWhere(WhereStr, nil)
+	w = NewWhere(WhereClause, nil)
 	buf = NewTrackedBuffer(nil)
 	w.Format(buf)
 	if buf.String() != "" {
@@ -395,46 +359,29 @@ func TestWhere(t *testing.T) {
 	}
 }
 
-func TestIsAggregate(t *testing.T) {
-	f := FuncExpr{Name: NewColIdent("avg")}
-	if !f.IsAggregate() {
-		t.Error("IsAggregate: false, want true")
-	}
-
-	f = FuncExpr{Name: NewColIdent("Avg")}
-	if !f.IsAggregate() {
-		t.Error("IsAggregate: false, want true")
-	}
-
-	f = FuncExpr{Name: NewColIdent("foo")}
-	if f.IsAggregate() {
-		t.Error("IsAggregate: true, want false")
-	}
-}
-
 func TestIsImpossible(t *testing.T) {
 	f := ComparisonExpr{
-		Operator: NotEqualStr,
-		Left:     newIntVal("1"),
-		Right:    newIntVal("1"),
+		Operator: NotEqualOp,
+		Left:     NewIntLiteral("1"),
+		Right:    NewIntLiteral("1"),
 	}
 	if !f.IsImpossible() {
 		t.Error("IsImpossible: false, want true")
 	}
 
 	f = ComparisonExpr{
-		Operator: EqualStr,
-		Left:     newIntVal("1"),
-		Right:    newIntVal("1"),
+		Operator: EqualOp,
+		Left:     NewIntLiteral("1"),
+		Right:    NewIntLiteral("1"),
 	}
 	if f.IsImpossible() {
 		t.Error("IsImpossible: true, want false")
 	}
 
 	f = ComparisonExpr{
-		Operator: NotEqualStr,
-		Left:     newIntVal("1"),
-		Right:    newIntVal("2"),
+		Operator: NotEqualOp,
+		Left:     NewIntLiteral("1"),
+		Right:    NewIntLiteral("2"),
 	}
 	if f.IsImpossible() {
 		t.Error("IsImpossible: true, want false")
@@ -464,7 +411,7 @@ func TestReplaceExpr(t *testing.T) {
 		out: "not :a",
 	}, {
 		in:  "select * from t where ((select a from b))",
-		out: "(:a)",
+		out: ":a",
 	}, {
 		in:  "select * from t where (select a from b) = 1",
 		out: ":a = 1",
@@ -506,9 +453,6 @@ func TestReplaceExpr(t *testing.T) {
 		in:  "select * from t where -(select a from b)",
 		out: "-:a",
 	}, {
-		in:  "select * from t where interval (select a from b) aa",
-		out: "interval :a aa",
-	}, {
 		in:  "select * from t where (select a from b) collate utf8",
 		out: ":a collate utf8",
 	}, {
@@ -539,15 +483,6 @@ func TestReplaceExpr(t *testing.T) {
 		in:  "select * from t where convert((select a from b) using utf8)",
 		out: "convert(:a using utf8)",
 	}, {
-		in:  "select * from t where match((select a from b), 1) against (a)",
-		out: "match(:a, 1) against (a)",
-	}, {
-		in:  "select * from t where match(1, (select a from b), 1) against (a)",
-		out: "match(1, :a, 1) against (a)",
-	}, {
-		in:  "select * from t where match(1, a, 1) against ((select a from b))",
-		out: "match(1, a, 1) against (:a)",
-	}, {
 		in:  "select * from t where case (select a from b) when a then b when b then c else d end",
 		out: "case :a when a then b when b then c else d end",
 	}, {
@@ -563,69 +498,24 @@ func TestReplaceExpr(t *testing.T) {
 		in:  "select * from t where case a when b then c when d then c else (select a from b) end",
 		out: "case a when b then c when d then c else :a end",
 	}}
-	to := NewValArg([]byte(":a"))
+	to := NewArgument("a")
+	parser := NewTestParser()
 	for _, tcase := range tcases {
-		tree, err := Parse(tcase.in)
-		if err != nil {
-			t.Fatal(err)
-		}
-		var from *Subquery
-		_ = Walk(func(node SQLNode) (kontinue bool, err error) {
-			if sq, ok := node.(*Subquery); ok {
-				from = sq
-				return false, nil
-			}
-			return true, nil
-		}, tree)
-		if from == nil {
-			t.Fatalf("from is nil for %s", tcase.in)
-		}
-		expr := ReplaceExpr(tree.(*Select).Where.Expr, from, to)
-		got := String(expr)
-		if tcase.out != got {
-			t.Errorf("ReplaceExpr(%s): %s, want %s", tcase.in, got, tcase.out)
-		}
-	}
-}
-
-func TestExprFromValue(t *testing.T) {
-	tcases := []struct {
-		in  sqltypes.Value
-		out SQLNode
-		err string
-	}{{
-		in:  sqltypes.NULL,
-		out: &NullVal{},
-	}, {
-		in:  sqltypes.NewInt64(1),
-		out: NewIntVal([]byte("1")),
-	}, {
-		in:  sqltypes.NewFloat64(1.1),
-		out: NewFloatVal([]byte("1.1")),
-	}, {
-		in:  sqltypes.MakeTrusted(sqltypes.Decimal, []byte("1.1")),
-		out: NewFloatVal([]byte("1.1")),
-	}, {
-		in:  sqltypes.NewVarChar("aa"),
-		out: NewStrVal([]byte("aa")),
-	}, {
-		in:  sqltypes.MakeTrusted(sqltypes.Expression, []byte("rand()")),
-		err: "cannot convert value EXPRESSION(rand()) to AST",
-	}}
-	for _, tcase := range tcases {
-		got, err := ExprFromValue(tcase.in)
-		if tcase.err != "" {
-			if err == nil || err.Error() != tcase.err {
-				t.Errorf("ExprFromValue(%v) err: %v, want %s", tcase.in, err, tcase.err)
-			}
-			continue
-		}
-		if err != nil {
-			t.Error(err)
-		}
-		if got, want := got, tcase.out; !reflect.DeepEqual(got, want) {
-			t.Errorf("ExprFromValue(%v): %v, want %s", tcase.in, got, want)
-		}
+		t.Run(tcase.in, func(t *testing.T) {
+			tree, err := parser.Parse(tcase.in)
+			require.NoError(t, err)
+			var from *Subquery
+			_ = Walk(func(node SQLNode) (kontinue bool, err error) {
+				if sq, ok := node.(*Subquery); ok {
+					from = sq
+					return false, nil
+				}
+				return true, nil
+			}, tree)
+			require.NotNilf(t, from, "from is nil for %s", tcase.in)
+			expr := ReplaceExpr(tree.(*Select).Where.Expr, from, to)
+			assert.Equal(t, tcase.out, String(expr))
+		})
 	}
 }
 
@@ -635,22 +525,22 @@ func TestColNameEqual(t *testing.T) {
 		t.Error("nil columns equal, want unequal")
 	}
 	c1 = &ColName{
-		Name: NewColIdent("aa"),
+		Name: NewIdentifierCI("aa"),
 	}
 	c2 = &ColName{
-		Name: NewColIdent("bb"),
+		Name: NewIdentifierCI("bb"),
 	}
 	if c1.Equal(c2) {
 		t.Error("columns equal, want unequal")
 	}
-	c2.Name = NewColIdent("aa")
+	c2.Name = NewIdentifierCI("aa")
 	if !c1.Equal(c2) {
 		t.Error("columns unequal, want equal")
 	}
 }
 
-func TestColIdent(t *testing.T) {
-	str := NewColIdent("Ab")
+func TestIdentifierCI(t *testing.T) {
+	str := NewIdentifierCI("Ab")
 	if str.String() != "Ab" {
 		t.Errorf("String=%s, want Ab", str.String())
 	}
@@ -660,20 +550,20 @@ func TestColIdent(t *testing.T) {
 	if str.Lowered() != "ab" {
 		t.Errorf("Val=%s, want ab", str.Lowered())
 	}
-	if !str.Equal(NewColIdent("aB")) {
-		t.Error("str.Equal(NewColIdent(aB))=false, want true")
+	if !str.Equal(NewIdentifierCI("aB")) {
+		t.Error("str.Equal(NewIdentifierCI(aB))=false, want true")
 	}
 	if !str.EqualString("ab") {
 		t.Error("str.EqualString(ab)=false, want true")
 	}
-	str = NewColIdent("")
+	str = NewIdentifierCI("")
 	if str.Lowered() != "" {
 		t.Errorf("Val=%s, want \"\"", str.Lowered())
 	}
 }
 
-func TestColIdentMarshal(t *testing.T) {
-	str := NewColIdent("Ab")
+func TestIdentifierCIMarshal(t *testing.T) {
+	str := NewIdentifierCI("Ab")
 	b, err := json.Marshal(str)
 	if err != nil {
 		t.Fatal(err)
@@ -683,7 +573,7 @@ func TestColIdentMarshal(t *testing.T) {
 	if got != want {
 		t.Errorf("json.Marshal()= %s, want %s", got, want)
 	}
-	var out ColIdent
+	var out IdentifierCI
 	if err := json.Unmarshal(b, &out); err != nil {
 		t.Errorf("Unmarshal err: %v, want nil", err)
 	}
@@ -692,16 +582,14 @@ func TestColIdentMarshal(t *testing.T) {
 	}
 }
 
-func TestColIdentSize(t *testing.T) {
-	size := unsafe.Sizeof(NewColIdent(""))
+func TestIdentifierCISize(t *testing.T) {
+	size := unsafe.Sizeof(NewIdentifierCI(""))
 	want := 2 * unsafe.Sizeof("")
-	if size != want {
-		t.Errorf("Size of ColIdent: %d, want 32", want)
-	}
+	assert.Equal(t, want, size, "size of IdentifierCI")
 }
 
-func TestTableIdentMarshal(t *testing.T) {
-	str := NewTableIdent("Ab")
+func TestIdentifierCSMarshal(t *testing.T) {
+	str := NewIdentifierCS("Ab")
 	b, err := json.Marshal(str)
 	if err != nil {
 		t.Fatal(err)
@@ -711,7 +599,7 @@ func TestTableIdentMarshal(t *testing.T) {
 	if got != want {
 		t.Errorf("json.Marshal()= %s, want %s", got, want)
 	}
-	var out TableIdent
+	var out IdentifierCS
 	if err := json.Unmarshal(b, &out); err != nil {
 		t.Errorf("Unmarshal err: %v, want nil", err)
 	}
@@ -734,7 +622,7 @@ func TestHexDecode(t *testing.T) {
 		out: "encoding/hex: odd length hex string",
 	}}
 	for _, tc := range testcase {
-		out, err := newHexVal(tc.in).HexDecode()
+		out, err := NewHexLiteral(tc.in).HexDecode()
 		if err != nil {
 			if err.Error() != tc.out {
 				t.Errorf("Decode(%q): %v, want %s", tc.in, err, tc.out)
@@ -767,30 +655,32 @@ func TestCompliantName(t *testing.T) {
 		out: "_ab",
 	}}
 	for _, tc := range testcases {
-		out := NewColIdent(tc.in).CompliantName()
+		out := NewIdentifierCI(tc.in).CompliantName()
 		if out != tc.out {
-			t.Errorf("ColIdent(%s).CompliantNamt: %s, want %s", tc.in, out, tc.out)
+			t.Errorf("IdentifierCI(%s).CompliantNamt: %s, want %s", tc.in, out, tc.out)
 		}
-		out = NewTableIdent(tc.in).CompliantName()
+		out = NewIdentifierCS(tc.in).CompliantName()
 		if out != tc.out {
-			t.Errorf("TableIdent(%s).CompliantNamt: %s, want %s", tc.in, out, tc.out)
+			t.Errorf("IdentifierCS(%s).CompliantNamt: %s, want %s", tc.in, out, tc.out)
 		}
 	}
 }
 
 func TestColumns_FindColumn(t *testing.T) {
-	cols := Columns{NewColIdent("a"), NewColIdent("c"), NewColIdent("b"), NewColIdent("0")}
+	cols := Columns{NewIdentifierCI("a"), NewIdentifierCI("c"), NewIdentifierCI("b"), NewIdentifierCI("0")}
 
 	testcases := []struct {
 		in  string
 		out int
-	}{{
-		in:  "a",
-		out: 0,
-	}, {
-		in:  "b",
-		out: 2,
-	},
+	}{
+		{
+			in:  "a",
+			out: 0,
+		},
+		{
+			in:  "b",
+			out: 2,
+		},
 		{
 			in:  "0",
 			out: 3,
@@ -798,57 +688,166 @@ func TestColumns_FindColumn(t *testing.T) {
 		{
 			in:  "f",
 			out: -1,
-		}}
+		},
+	}
 
 	for _, tc := range testcases {
-		val := cols.FindColumn(NewColIdent(tc.in))
+		val := cols.FindColumn(NewIdentifierCI(tc.in))
 		if val != tc.out {
 			t.Errorf("FindColumn(%s): %d, want %d", tc.in, val, tc.out)
 		}
 	}
 }
 
-func TestSplitStatementToPieces(t *testing.T) {
+func TestParseMultipleIgnoreEmpty(t *testing.T) {
 	testcases := []struct {
-		input  string
-		output string
-	}{{
-		input: "select * from table",
-	}, {
-		input:  "select * from table1; select * from table2;",
-		output: "select * from table1; select * from table2",
-	}, {
-		input:  "select * from /* comment ; */ table;",
-		output: "select * from /* comment ; */ table",
-	}, {
-		input:  "select * from table where semi = ';';",
-		output: "select * from table where semi = ';'",
-	}, {
-		input:  "select * from table1;--comment;\nselect * from table2;",
-		output: "select * from table1;--comment;\nselect * from table2",
-	}, {
-		input: "CREATE TABLE `total_data` (`id` int(11) NOT NULL AUTO_INCREMENT COMMENT 'id', " +
-			"`region` varchar(32) NOT NULL COMMENT 'region name, like zh; th; kepler'," +
-			"`data_size` bigint NOT NULL DEFAULT '0' COMMENT 'data size;'," +
-			"`createtime` datetime NOT NULL DEFAULT NOW() COMMENT 'create time;'," +
-			"`comment` varchar(100) NOT NULL DEFAULT '' COMMENT 'comment'," +
-			"PRIMARY KEY (`id`))",
-	}}
+		input   string
+		stmts   int
+		wantErr bool
+	}{
+		{
+			input: "select * from table1; \t; \n; \n\t\t ;select * from table1;",
+			stmts: 2,
+		}, {
+			input: "select 1; ; ; select 2; /* Comment only */; /* Comment */; select 3;;;; /* Comment */",
+			stmts: 3,
+		}, {
+			input: "select * from table1",
+			stmts: 1,
+		}, {
+			input: "select * from table1;",
+			stmts: 1,
+		}, {
+			input: "select * from table1;   ",
+			stmts: 1,
+		}, {
+			input: "select * from table1; select * from table2;",
+			stmts: 2,
+		}, {
+			input: "create /*vt+ directive=true */ table t1 (id int); create table t2 (id int); create table t3 (id int)",
+			stmts: 3,
+		}, {
+			input: "create /*vt+ directive=true */ table t1 (id int); create table t2 (id int); create table t3 (id int);",
+			stmts: 3,
+		}, {
+			input: "select * from /* comment ; */ table1;",
+			stmts: 1,
+		}, {
+			input: "select * from table1 where semi = ';';",
+			stmts: 1,
+		}, {
+			input: "CREATE TABLE `total_data` (`id` int(11) NOT NULL AUTO_INCREMENT COMMENT 'id', " +
+				"`region` varchar(32) NOT NULL COMMENT 'region name, like zh; th; kepler'," +
+				"`data_size` bigint NOT NULL DEFAULT '0' COMMENT 'data size;'," +
+				"`createtime` datetime NOT NULL DEFAULT NOW() COMMENT 'create time;'," +
+				"`comment` varchar(100) NOT NULL DEFAULT '' COMMENT 'comment'," +
+				"PRIMARY KEY (`id`))",
+			stmts: 1,
+		}, {
+			input: "create table t1 (id int primary key); create table t2 (id int primary key);",
+			stmts: 2,
+		}, {
+			input: ";;; create table t1 (id int primary key);;; ;create table t2 (id int primary key);",
+			stmts: 2,
+		}, {
+			input:   ";create table t1 ;create table t2 (id;",
+			wantErr: true,
+		}, {
+			// Ignore quoted semicolon
+			input:   ";create table t1 ';';;;create table t2 (id;",
+			wantErr: true,
+		},
+	}
 
+	parser := NewTestParser()
 	for _, tcase := range testcases {
-		if tcase.output == "" {
-			tcase.output = tcase.input
-		}
+		t.Run(tcase.input, func(t *testing.T) {
+			statements, err := parser.ParseMultipleIgnoreEmpty(tcase.input)
+			if tcase.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, tcase.stmts, len(statements))
+			}
+		})
+	}
+}
 
-		stmtPieces, err := SplitStatementToPieces(tcase.input)
-		if err != nil {
-			t.Errorf("input: %s, err: %v", tcase.input, err)
-			continue
-		}
+func TestTypeConversion(t *testing.T) {
+	ct1 := &ColumnType{Type: "BIGINT"}
+	ct2 := &ColumnType{Type: "bigint"}
+	assert.Equal(t, ct1.SQLType(), ct2.SQLType())
+}
 
-		out := strings.Join(stmtPieces, ";")
-		if out != tcase.output {
-			t.Errorf("out: %s, want %s", out, tcase.output)
-		}
+func TestDefaultStatus(t *testing.T) {
+	assert.Equal(t,
+		String(&Default{ColName: "status"}),
+		"default(`status`)")
+}
+
+func TestShowTableStatus(t *testing.T) {
+	parser := NewTestParser()
+	query := "Show Table Status FROM customer"
+	tree, err := parser.Parse(query)
+	require.NoError(t, err)
+	require.NotNil(t, tree)
+}
+
+func BenchmarkStringTraces(b *testing.B) {
+	parser := NewTestParser()
+	for _, trace := range []string{"django_queries.txt", "lobsters.sql.gz"} {
+		b.Run(trace, func(b *testing.B) {
+			queries := loadQueries(b, trace)
+			if len(queries) > 10000 {
+				queries = queries[:10000]
+			}
+
+			parsed := make([]Statement, 0, len(queries))
+			for _, q := range queries {
+				pp, err := parser.Parse(q)
+				if err != nil {
+					b.Fatal(err)
+				}
+				parsed = append(parsed, pp)
+			}
+
+			b.ResetTimer()
+			b.ReportAllocs()
+
+			for i := 0; i < b.N; i++ {
+				for _, stmt := range parsed {
+					_ = String(stmt)
+				}
+			}
+		})
+	}
+}
+
+func TestCloneComments(t *testing.T) {
+	c := []string{"/*vt+ a=b */"}
+	parsedComments := Comments(c).Parsed()
+	directives := parsedComments.Directives()
+	{
+		assert.NotEmpty(t, directives.m)
+		val, ok := directives.m["a"]
+		assert.Truef(t, ok, "directives map: %v", directives.m)
+		assert.Equal(t, "b", val)
+	}
+	cloned := CloneRefOfParsedComments(parsedComments)
+	cloned.ResetDirectives()
+	clonedDirectives := cloned.Directives()
+	{
+		assert.NotEmpty(t, clonedDirectives.m)
+		val, ok := clonedDirectives.m["a"]
+		assert.Truef(t, ok, "directives map: %v", directives.m)
+		assert.Equal(t, "b", val)
+	}
+	{
+		delete(directives.m, "a")
+		assert.Empty(t, directives.m)
+
+		val, ok := clonedDirectives.m["a"]
+		assert.Truef(t, ok, "directives map: %v", directives.m)
+		assert.Equal(t, "b", val)
 	}
 }

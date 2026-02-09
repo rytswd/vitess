@@ -17,11 +17,10 @@ limitations under the License.
 package schemamanager
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"time"
-
-	"golang.org/x/net/context"
 
 	"vitess.io/vitess/go/vt/log"
 	querypb "vitess.io/vitess/go/vt/proto/query"
@@ -30,18 +29,16 @@ import (
 const (
 	// SchemaChangeDirName is the key name in the ControllerFactory params.
 	// It specifies the schema change directory.
-	SchemaChangeDirName = "schema_change_dir"
+	SchemaChangeDirName = "schema-change-dir"
 	// SchemaChangeUser is the key name in the ControllerFactory params.
 	// It specifies the user who submits this schema change.
-	SchemaChangeUser = "schema_change_user"
+	SchemaChangeUser = "schema-change-user"
 )
 
 // ControllerFactory takes a set params and construct a Controller instance.
 type ControllerFactory func(params map[string]string) (Controller, error)
 
-var (
-	controllerFactories = make(map[string]ControllerFactory)
-)
+var controllerFactories = make(map[string]ControllerFactory)
 
 // Controller is responsible for getting schema change for a
 // certain keyspace and also handling various events happened during schema
@@ -72,6 +69,7 @@ type ExecuteResult struct {
 	SuccessShards  []ShardResult
 	CurSQLIndex    int
 	Sqls           []string
+	UUIDs          []string
 	ExecutorErr    string
 	TotalTimeSpent time.Duration
 }
@@ -84,63 +82,63 @@ type ShardWithError struct {
 
 // ShardResult contains sql execute information on a particular shard
 type ShardResult struct {
-	Shard  string
-	Result *querypb.QueryResult
+	Shard   string
+	Results []*querypb.QueryResult
 	// Position is a replication position that is guaranteed to be after the
-	// schema change was applied. It can be used to wait for slaves to receive
+	// schema change was applied. It can be used to wait for replicas to receive
 	// the schema change via replication.
 	Position string
 }
 
 // Run applies schema changes on Vitess through VtGate.
-func Run(ctx context.Context, controller Controller, executor Executor) error {
+func Run(ctx context.Context, controller Controller, executor Executor) (execResult *ExecuteResult, err error) {
 	if err := controller.Open(ctx); err != nil {
 		log.Errorf("failed to open data sourcer: %v", err)
-		return err
+		return execResult, err
 	}
 	defer controller.Close()
 	sqls, err := controller.Read(ctx)
 	if err != nil {
 		log.Errorf("failed to read data from data sourcer: %v", err)
 		controller.OnReadFail(ctx, err)
-		return err
+		return execResult, err
 	}
 	controller.OnReadSuccess(ctx)
 	if len(sqls) == 0 {
-		return nil
+		return execResult, nil
 	}
 	keyspace := controller.Keyspace()
 	if err := executor.Open(ctx, keyspace); err != nil {
 		log.Errorf("failed to open executor: %v", err)
-		return err
+		return execResult, err
 	}
 	defer executor.Close()
 	if err := executor.Validate(ctx, sqls); err != nil {
 		log.Errorf("validation fail: %v", err)
 		controller.OnValidationFail(ctx, err)
-		return err
+		return execResult, err
 	}
 
 	if err := controller.OnValidationSuccess(ctx); err != nil {
-		return err
+		return execResult, err
 	}
 
-	result := executor.Execute(ctx, sqls)
+	execResult = executor.Execute(ctx, sqls)
 
-	if err := controller.OnExecutorComplete(ctx, result); err != nil {
-		return err
+	if err := controller.OnExecutorComplete(ctx, execResult); err != nil {
+		return execResult, err
 	}
-	if result.ExecutorErr != "" || len(result.FailedShards) > 0 {
-		out, _ := json.MarshalIndent(result, "", "  ")
-		return fmt.Errorf("schema change failed, ExecuteResult: %v", string(out))
+	if execResult.ExecutorErr != "" || len(execResult.FailedShards) > 0 {
+		out, _ := json.MarshalIndent(execResult, "", "  ")
+		return execResult, fmt.Errorf("schema change failed, ExecuteResult: %v", string(out))
 	}
-	return nil
+	return execResult, nil
 }
 
 // RegisterControllerFactory register a control factory.
 func RegisterControllerFactory(name string, factory ControllerFactory) {
 	if _, ok := controllerFactories[name]; ok {
-		panic(fmt.Sprintf("register a registered key: %s", name))
+		panic("register a registered key: " + name)
 	}
 	controllerFactories[name] = factory
 }

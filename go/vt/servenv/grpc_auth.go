@@ -17,15 +17,39 @@ limitations under the License.
 package servenv
 
 import (
-	"golang.org/x/net/context"
+	"context"
 
+	"github.com/spf13/pflag"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/utils"
 )
+
+var grpcAuthServerFlagHooks []func(*pflag.FlagSet)
+
+// RegisterGRPCServerAuthFlags registers flags required to enable server-side
+// authentication in vitess gRPC services.
+//
+// `go/cmd/*` entrypoints should call this function before
+// ParseFlags(WithArgs)? if they wish to expose Authenticator functionality.
+func RegisterGRPCServerAuthFlags() {
+	OnParse(func(fs *pflag.FlagSet) {
+		utils.SetFlagStringVar(fs, &gRPCAuth, "grpc-auth-mode", gRPCAuth, "Which auth plugin implementation to use (eg: static)")
+
+		for _, fn := range grpcAuthServerFlagHooks {
+			fn(fs)
+		}
+	})
+}
+
+// GRPCAuth returns the value of the `--grpc-auth-mode` flag.
+func GRPCAuth() string {
+	return gRPCAuth
+}
 
 // Authenticator provides an interface to implement auth in Vitess in
 // grpc server
@@ -54,7 +78,7 @@ func GetAuthenticator(name string) func() (Authenticator, error) {
 }
 
 // FakeAuthStreamInterceptor fake interceptor to test plugin
-func FakeAuthStreamInterceptor(srv interface{}, stream grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+func FakeAuthStreamInterceptor(srv any, stream grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 	if fakeDummyAuthenticate(stream.Context()) {
 		return handler(srv, stream)
 	}
@@ -62,7 +86,7 @@ func FakeAuthStreamInterceptor(srv interface{}, stream grpc.ServerStream, info *
 }
 
 // FakeAuthUnaryInterceptor fake interceptor to test plugin
-func FakeAuthUnaryInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+func FakeAuthUnaryInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 	if fakeDummyAuthenticate(ctx) {
 		return handler(ctx, req)
 	}

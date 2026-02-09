@@ -7,7 +7,7 @@ You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreedto in writing, software
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -18,6 +18,8 @@ package exit
 
 import (
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 type repanicType int
@@ -25,15 +27,11 @@ type repanicType int
 func TestReturn(t *testing.T) {
 	defer func() {
 		err := recover()
-		if err == nil {
-			t.Errorf("Return() did not panic with exit code")
-		}
+		assert.NotNil(t, err, "Return() did not panic with exit code")
 
 		switch code := err.(type) {
 		case exitCode:
-			if code != 152 {
-				t.Errorf("got %v, want %v", code, 152)
-			}
+			assert.Equal(t, exitCode(152), code)
 		default:
 			panic(err)
 		}
@@ -54,21 +52,20 @@ func TestRecover(t *testing.T) {
 		Return(8235)
 	}()
 
-	if code != 8235 {
-		t.Errorf("got %v, want %v", code, 8235)
-	}
+	assert.EqualValues(t, 8235, code)
 }
 
 func TestRecoverRepanic(t *testing.T) {
 	defer func() {
 		err := recover()
-
+		assert.NotNil(t, err, "Recover() didn't re-panic an error other than exitCode")
 		if err == nil {
-			t.Errorf("Recover() didn't re-panic an error other than exitCode")
 			return
 		}
 
-		if _, ok := err.(repanicType); !ok {
+		_, ok := err.(repanicType)
+		assert.True(t, ok, "unexpected error type recovered")
+		if !ok {
 			panic(err) // something unexpected went wrong
 		}
 	}()
@@ -83,10 +80,7 @@ func TestRecoverAll(t *testing.T) {
 
 	defer func() {
 		err := recover()
-
-		if err != nil {
-			t.Errorf("RecoverAll() didn't absorb all panics")
-		}
+		assert.Nil(t, err, "RecoverAll() didn't absorb all panics")
 	}()
 
 	defer RecoverAll()

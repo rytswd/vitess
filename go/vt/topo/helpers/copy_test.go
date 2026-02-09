@@ -17,13 +17,15 @@ limitations under the License.
 package helpers
 
 import (
+	"context"
 	"testing"
 
-	"golang.org/x/net/context"
+	"github.com/stretchr/testify/require"
+
+	"vitess.io/vitess/go/vt/sqlparser"
 
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/memorytopo"
-	"vitess.io/vitess/go/vt/topo/topoproto"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
@@ -33,8 +35,8 @@ func createSetup(ctx context.Context, t *testing.T) (*topo.Server, *topo.Server)
 	// Create a source and destination TS. They will have
 	// different generations, so we test using the Version for
 	// both works as expected.
-	fromTS := memorytopo.NewServer("test_cell")
-	toTS := memorytopo.NewServer("test_cell")
+	fromTS := memorytopo.NewServer(ctx, "test_cell")
+	toTS := memorytopo.NewServer(ctx, "test_cell")
 
 	// create a keyspace and a couple tablets
 	if err := fromTS.CreateKeyspace(ctx, "test_keyspace", &topodatapb.Keyspace{}); err != nil {
@@ -48,21 +50,21 @@ func createSetup(ctx context.Context, t *testing.T) (*topo.Server, *topo.Server)
 			Cell: "test_cell",
 			Uid:  123,
 		},
-		Hostname:      "masterhost",
-		MysqlHostname: "masterhost",
+		Hostname:      "primaryhost",
+		MysqlHostname: "primaryhost",
 		PortMap: map[string]int32{
 			"vt":   8101,
 			"gprc": 8102,
 		},
 		Keyspace:       "test_keyspace",
 		Shard:          "0",
-		Type:           topodatapb.TabletType_MASTER,
+		Type:           topodatapb.TabletType_PRIMARY,
 		DbNameOverride: "",
 		KeyRange:       nil,
 	}
-	topoproto.SetMysqlPort(tablet1, 3306)
+	tablet1.MysqlPort = 3306
 	if err := fromTS.CreateTablet(ctx, tablet1); err != nil {
-		t.Fatalf("cannot create master tablet: %v", err)
+		t.Fatalf("cannot create primary tablet: %v", err)
 	}
 	tablet2 := &topodatapb.Tablet{
 		Alias: &topodatapb.TabletAlias{
@@ -73,8 +75,8 @@ func createSetup(ctx context.Context, t *testing.T) (*topo.Server, *topo.Server)
 			"vt":   8101,
 			"grpc": 8102,
 		},
-		Hostname:      "slavehost",
-		MysqlHostname: "slavehost",
+		Hostname:      "replicahost",
+		MysqlHostname: "replicahost",
 
 		Keyspace:       "test_keyspace",
 		Shard:          "0",
@@ -82,10 +84,9 @@ func createSetup(ctx context.Context, t *testing.T) (*topo.Server, *topo.Server)
 		DbNameOverride: "",
 		KeyRange:       nil,
 	}
-	topoproto.SetMysqlPort(tablet2, 3306)
-	if err := fromTS.CreateTablet(ctx, tablet2); err != nil {
-		t.Fatalf("cannot create slave tablet: %v", err)
-	}
+	tablet2.MysqlPort = 3306
+	err := fromTS.CreateTablet(ctx, tablet2)
+	require.NoError(t, err, "cannot create tablet: %v", tablet2)
 
 	rr := &vschemapb.RoutingRules{
 		Rules: []*vschemapb.RoutingRule{{
@@ -105,7 +106,7 @@ func TestBasic(t *testing.T) {
 	fromTS, toTS := createSetup(ctx, t)
 
 	// check keyspace copy
-	CopyKeyspaces(ctx, fromTS, toTS)
+	CopyKeyspaces(ctx, fromTS, toTS, sqlparser.NewTestParser())
 	keyspaces, err := toTS.GetKeyspaces(ctx)
 	if err != nil {
 		t.Fatalf("toTS.GetKeyspaces failed: %v", err)
@@ -113,7 +114,7 @@ func TestBasic(t *testing.T) {
 	if len(keyspaces) != 1 || keyspaces[0] != "test_keyspace" {
 		t.Fatalf("unexpected keyspaces: %v", keyspaces)
 	}
-	CopyKeyspaces(ctx, fromTS, toTS)
+	CopyKeyspaces(ctx, fromTS, toTS, sqlparser.NewTestParser())
 
 	// check shard copy
 	CopyShards(ctx, fromTS, toTS)
@@ -140,9 +141,19 @@ func TestBasic(t *testing.T) {
 		t.Fatalf("unexpected ShardReplication: %v", sr)
 	}
 
+	// check ShardReplications is idempotent
+	CopyShardReplications(ctx, fromTS, toTS)
+	sr, err = toTS.GetShardReplication(ctx, "test_cell", "test_keyspace", "0")
+	if err != nil {
+		t.Fatalf("toTS.GetShardReplication failed: %v", err)
+	}
+	if len(sr.Nodes) != 2 {
+		t.Fatalf("unexpected ShardReplication after second copy: %v", sr)
+	}
+
 	// check tablet copy
 	CopyTablets(ctx, fromTS, toTS)
-	tablets, err := toTS.GetTabletsByCell(ctx, "test_cell")
+	tablets, err := toTS.GetTabletAliasesByCell(ctx, "test_cell")
 	if err != nil {
 		t.Fatalf("toTS.GetTabletsByCell failed: %v", err)
 	}

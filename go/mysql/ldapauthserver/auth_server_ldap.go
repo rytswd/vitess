@@ -18,62 +18,57 @@ package ldapauthserver
 
 import (
 	"encoding/json"
-	"flag"
 	"fmt"
-	"io/ioutil"
 	"net"
+	"os"
 	"sync"
 	"time"
 
-	ldap "gopkg.in/ldap.v2"
+	"gopkg.in/ldap.v2"
+
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/netutil"
 	"vitess.io/vitess/go/vt/log"
-	querypb "vitess.io/vitess/go/vt/proto/query"
 	"vitess.io/vitess/go/vt/vttls"
-)
 
-var (
-	ldapAuthConfigFile   = flag.String("mysql_ldap_auth_config_file", "", "JSON File from which to read LDAP server config.")
-	ldapAuthConfigString = flag.String("mysql_ldap_auth_config_string", "", "JSON representation of LDAP server config.")
-	ldapAuthMethod       = flag.String("mysql_ldap_auth_method", mysql.MysqlClearPassword, "client-side authentication method to use. Supported values: mysql_clear_password, dialog.")
+	querypb "vitess.io/vitess/go/vt/proto/query"
 )
 
 // AuthServerLdap implements AuthServer with an LDAP backend
 type AuthServerLdap struct {
 	Client
 	ServerConfig
-	Method         string
 	User           string
 	Password       string
 	GroupQuery     string
 	UserDnPattern  string
 	RefreshSeconds int64
+	methods        []mysql.AuthMethod
 }
 
 // Init is public so it can be called from plugin_auth_ldap.go (go/cmd/vtgate)
-func Init() {
-	if *ldapAuthConfigFile == "" && *ldapAuthConfigString == "" {
+func Init(ldapAuthConfigFile, ldapAuthConfigString, ldapAuthMethod string) {
+	if ldapAuthConfigFile == "" && ldapAuthConfigString == "" {
 		log.Infof("Not configuring AuthServerLdap because mysql_ldap_auth_config_file and mysql_ldap_auth_config_string are empty")
 		return
 	}
-	if *ldapAuthConfigFile != "" && *ldapAuthConfigString != "" {
+	if ldapAuthConfigFile != "" && ldapAuthConfigString != "" {
 		log.Infof("Both mysql_ldap_auth_config_file and mysql_ldap_auth_config_string are non-empty, can only use one.")
 		return
 	}
-	if *ldapAuthMethod != mysql.MysqlClearPassword && *ldapAuthMethod != mysql.MysqlDialog {
+
+	if ldapAuthMethod != string(mysql.MysqlClearPassword) && ldapAuthMethod != string(mysql.MysqlDialog) {
 		log.Exitf("Invalid mysql_ldap_auth_method value: only support mysql_clear_password or dialog")
 	}
 	ldapAuthServer := &AuthServerLdap{
 		Client:       &ClientImpl{},
 		ServerConfig: ServerConfig{},
-		Method:       *ldapAuthMethod,
 	}
 
-	data := []byte(*ldapAuthConfigString)
-	if *ldapAuthConfigFile != "" {
+	data := []byte(ldapAuthConfigString)
+	if ldapAuthConfigFile != "" {
 		var err error
-		data, err = ioutil.ReadFile(*ldapAuthConfigFile)
+		data, err = os.ReadFile(ldapAuthConfigFile)
 		if err != nil {
 			log.Exitf("Failed to read mysql_ldap_auth_config_file: %v", err)
 		}
@@ -81,40 +76,51 @@ func Init() {
 	if err := json.Unmarshal(data, ldapAuthServer); err != nil {
 		log.Exitf("Error parsing AuthServerLdap config: %v", err)
 	}
-	mysql.RegisterAuthServerImpl("ldap", ldapAuthServer)
-}
 
-// AuthMethod is part of the AuthServer interface.
-func (asl *AuthServerLdap) AuthMethod(user string) (string, error) {
-	return asl.Method, nil
-}
-
-// Salt will be unused in AuthServerLdap.
-func (asl *AuthServerLdap) Salt() ([]byte, error) {
-	return mysql.NewSalt()
-}
-
-// ValidateHash is unimplemented for AuthServerLdap.
-func (asl *AuthServerLdap) ValidateHash(salt []byte, user string, authResponse []byte, remoteAddr net.Addr) (mysql.Getter, error) {
-	panic("unimplemented")
-}
-
-// Negotiate is part of the AuthServer interface.
-func (asl *AuthServerLdap) Negotiate(c *mysql.Conn, user string, remoteAddr net.Addr) (mysql.Getter, error) {
-	// Finish the negotiation.
-	password, err := mysql.AuthServerNegotiateClearOrDialog(c, asl.Method)
-	if err != nil {
-		return nil, err
+	var authMethod mysql.AuthMethod
+	switch mysql.AuthMethodDescription(ldapAuthMethod) {
+	case mysql.MysqlClearPassword:
+		authMethod = mysql.NewMysqlClearAuthMethod(ldapAuthServer, ldapAuthServer)
+	case mysql.MysqlDialog:
+		authMethod = mysql.NewMysqlDialogAuthMethod(ldapAuthServer, ldapAuthServer, "")
+	default:
+		log.Exitf("Invalid mysql_ldap_auth_method value: only support mysql_clear_password or dialog")
 	}
+
+	ldapAuthServer.methods = []mysql.AuthMethod{authMethod}
+	mysql.RegisterAuthServer("ldap", ldapAuthServer)
+}
+
+// AuthMethods returns the list of registered auth methods
+// implemented by this auth server.
+func (asl *AuthServerLdap) AuthMethods() []mysql.AuthMethod {
+	return asl.methods
+}
+
+// DefaultAuthMethodDescription returns MysqlNativePassword as the default
+// authentication method for the auth server implementation.
+func (asl *AuthServerLdap) DefaultAuthMethodDescription() mysql.AuthMethodDescription {
+	return mysql.MysqlNativePassword
+}
+
+// HandleUser is part of the Validator interface. We
+// handle any user here since we don't check up front.
+func (asl *AuthServerLdap) HandleUser(user string) bool {
+	return true
+}
+
+// UserEntryWithPassword is part of the PlaintextStorage interface
+// and called after the password is sent by the client.
+func (asl *AuthServerLdap) UserEntryWithPassword(conn *mysql.Conn, user string, password string, remoteAddr net.Addr) (mysql.Getter, error) {
 	return asl.validate(user, password)
 }
 
 func (asl *AuthServerLdap) validate(username, password string) (mysql.Getter, error) {
-	if err := asl.Client.Connect("tcp", &asl.ServerConfig); err != nil {
+	if err := asl.Connect("tcp", &asl.ServerConfig); err != nil {
 		return nil, err
 	}
-	defer asl.Client.Close()
-	if err := asl.Client.Bind(fmt.Sprintf(asl.UserDnPattern, username), password); err != nil {
+	defer asl.Close()
+	if err := asl.Bind(fmt.Sprintf(asl.UserDnPattern, username), password); err != nil {
 		return nil, err
 	}
 	groups, err := asl.getGroups(username)
@@ -124,9 +130,9 @@ func (asl *AuthServerLdap) validate(username, password string) (mysql.Getter, er
 	return &LdapUserData{asl: asl, groups: groups, username: username, lastUpdated: time.Now(), updating: false}, nil
 }
 
-//this needs to be passed an already connected client...should check for this
+// this needs to be passed an already connected client...should check for this
 func (asl *AuthServerLdap) getGroups(username string) ([]string, error) {
-	err := asl.Client.Bind(asl.User, asl.Password)
+	err := asl.Bind(asl.User, asl.Password)
 	if err != nil {
 		return nil, err
 	}
@@ -137,7 +143,7 @@ func (asl *AuthServerLdap) getGroups(username string) ([]string, error) {
 		[]string{"cn"},
 		nil,
 	)
-	res, err := asl.Client.Search(req)
+	res, err := asl.Search(req)
 	if err != nil {
 		return nil, err
 	}
@@ -169,12 +175,12 @@ func (lud *LdapUserData) update() {
 	}
 	lud.updating = true
 	lud.Unlock()
-	err := lud.asl.Client.Connect("tcp", &lud.asl.ServerConfig)
+	err := lud.asl.Connect("tcp", &lud.asl.ServerConfig)
 	if err != nil {
 		log.Errorf("Error updating LDAP user data: %v", err)
 		return
 	}
-	defer lud.asl.Client.Close() //after the error check
+	defer lud.asl.Close() // after the error check
 	groups, err := lud.asl.getGroups(lud.username)
 	if err != nil {
 		log.Errorf("Error updating LDAP user data: %v", err)
@@ -198,10 +204,12 @@ func (lud *LdapUserData) Get() *querypb.VTGateCallerID {
 // ServerConfig holds the config for and LDAP server
 // * include port in ldapServer, "ldap.example.com:386"
 type ServerConfig struct {
-	LdapServer string
-	LdapCert   string
-	LdapKey    string
-	LdapCA     string
+	LdapServer        string
+	LdapCert          string
+	LdapKey           string
+	LdapCA            string
+	LdapCRL           string
+	LdapTLSMinVersion string
 }
 
 // Client provides an interface we can mock
@@ -230,7 +238,13 @@ func (lci *ClientImpl) Connect(network string, config *ServerConfig) error {
 	if err != nil {
 		return err
 	}
-	tlsConfig, err := vttls.ClientConfig(config.LdapCert, config.LdapKey, config.LdapCA, serverName)
+
+	tlsVersion, err := vttls.TLSVersionToNumber(config.LdapTLSMinVersion)
+	if err != nil {
+		return err
+	}
+
+	tlsConfig, err := vttls.ClientConfig(vttls.VerifyIdentity, config.LdapCert, config.LdapKey, config.LdapCA, config.LdapCRL, serverName, tlsVersion)
 	if err != nil {
 		return err
 	}

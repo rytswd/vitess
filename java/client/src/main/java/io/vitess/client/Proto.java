@@ -21,7 +21,6 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
 import com.google.common.primitives.UnsignedLong;
 import com.google.protobuf.ByteString;
-
 import io.vitess.client.cursor.Cursor;
 import io.vitess.client.cursor.CursorWithError;
 import io.vitess.client.cursor.SimpleCursor;
@@ -29,11 +28,7 @@ import io.vitess.proto.Query;
 import io.vitess.proto.Query.BindVariable;
 import io.vitess.proto.Query.BoundQuery;
 import io.vitess.proto.Query.QueryResult;
-import io.vitess.proto.Vtgate.BoundKeyspaceIdQuery;
-import io.vitess.proto.Vtgate.BoundShardQuery;
-import io.vitess.proto.Vtgate.ExecuteEntityIdsRequest.EntityId;
 import io.vitess.proto.Vtrpc.RPCError;
-
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.sql.SQLException;
@@ -47,7 +42,6 @@ import java.sql.SQLTransientException;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-
 import javax.annotation.Nullable;
 
 /**
@@ -62,13 +56,6 @@ public class Proto {
           return ByteString.copyFrom(from);
         }
       };
-  public static final Function<Map.Entry<byte[], ?>, EntityId> MAP_ENTRY_TO_ENTITY_KEYSPACE_ID =
-      new Function<Map.Entry<byte[], ?>, EntityId>() {
-        @Override
-        public EntityId apply(Map.Entry<byte[], ?> entry) {
-          return buildEntityId(entry.getKey(), entry.getValue());
-        }
-      };
   private static final int MAX_DECIMAL_UNIT = 30;
 
   /**
@@ -76,7 +63,7 @@ public class Proto {
    *
    * <p>
    * Errors returned by Vitess are documented in the
-   * <a href="https://github.com/vitessio/vitess/blob/master/proto/vtrpc.proto">vtrpc proto</a>.
+   * <a href="https://github.com/vitessio/vitess/blob/main/proto/vtrpc.proto">vtrpc proto</a>.
    */
   public static void checkError(RPCError error) throws SQLException {
     if (error != null) {
@@ -97,26 +84,6 @@ public class Proto {
         case UNAUTHENTICATED:
           throw new SQLInvalidAuthorizationSpecException(error.toString(), sqlState, errno);
         case ABORTED:
-          throw new SQLRecoverableException(error.toString(), sqlState, errno);
-        default:
-          throw new SQLNonTransientException("Vitess RPC error: " + error.toString(), sqlState,
-              errno);
-      }
-
-      switch (error.getLegacyCode()) {
-        case SUCCESS_LEGACY:
-          break;
-        case BAD_INPUT_LEGACY:
-          throw new SQLSyntaxErrorException(error.toString(), sqlState, errno);
-        case DEADLINE_EXCEEDED_LEGACY:
-          throw new SQLTimeoutException(error.toString(), sqlState, errno);
-        case INTEGRITY_ERROR_LEGACY:
-          throw new SQLIntegrityConstraintViolationException(error.toString(), sqlState, errno);
-        case TRANSIENT_ERROR_LEGACY:
-          throw new SQLTransientException(error.toString(), sqlState, errno);
-        case UNAUTHENTICATED_LEGACY:
-          throw new SQLInvalidAuthorizationSpecException(error.toString(), sqlState, errno);
-        case NOT_IN_TX_LEGACY:
           throw new SQLRecoverableException(error.toString(), sqlState, errno);
         default:
           throw new SQLNonTransientException("Vitess RPC error: " + error.toString(), sqlState,
@@ -209,13 +176,6 @@ public class Proto {
     return builder.build();
   }
 
-  public static EntityId buildEntityId(byte[] keyspaceId, Object value) {
-    TypedValue tval = new TypedValue(value);
-
-    return EntityId.newBuilder().setKeyspaceId(ByteString.copyFrom(keyspaceId)).setType(tval.type)
-        .setValue(tval.value).build();
-  }
-
   /**
    * bindQuery creates a BoundQuery from query and vars.
    */
@@ -227,49 +187,6 @@ public class Proto {
       }
     }
     return boundQueryBuilder.build();
-  }
-
-  /**
-   * bindShardQuery creates a BoundShardQuery.
-   */
-  public static BoundShardQuery bindShardQuery(String keyspace, Iterable<String> shards,
-      BoundQuery query) {
-    return BoundShardQuery.newBuilder().setKeyspace(keyspace).addAllShards(shards).setQuery(query)
-        .build();
-  }
-
-  /**
-   * bindShardQuery creates a BoundShardQuery.
-   */
-  public static BoundShardQuery bindShardQuery(String keyspace, Iterable<String> shards,
-      String query, Map<String, ?> vars) {
-    return bindShardQuery(keyspace, shards, bindQuery(query, vars));
-  }
-
-  /**
-   * bindKeyspaceIdQuery creates a BoundKeyspaceIdQuery.
-   */
-  public static BoundKeyspaceIdQuery bindKeyspaceIdQuery(String keyspace,
-      Iterable<byte[]> keyspaceIds, BoundQuery query) {
-    return BoundKeyspaceIdQuery.newBuilder().setKeyspace(keyspace)
-        .addAllKeyspaceIds(Iterables.transform(keyspaceIds, BYTE_ARRAY_TO_BYTE_STRING))
-        .setQuery(query).build();
-  }
-
-  /**
-   * bindKeyspaceIdQuery creates a BoundKeyspaceIdQuery.
-   */
-  public static BoundKeyspaceIdQuery bindKeyspaceIdQuery(String keyspace,
-      Iterable<byte[]> keyspaceIds, String query, Map<String, ?> vars) {
-    return bindKeyspaceIdQuery(keyspace, keyspaceIds, bindQuery(query, vars));
-  }
-
-  public static List<Cursor> toCursorList(List<QueryResult> queryResults) {
-    ImmutableList.Builder<Cursor> builder = new ImmutableList.Builder<Cursor>();
-    for (QueryResult queryResult : queryResults) {
-      builder.add(new SimpleCursor(queryResult));
-    }
-    return builder.build();
   }
 
   public static List<CursorWithError> fromQueryResponsesToCursorList(

@@ -18,6 +18,7 @@ package vindexes
 
 import (
 	"bytes"
+	"context"
 	"crypto/cipher"
 	"crypto/des"
 	"encoding/binary"
@@ -27,24 +28,31 @@ import (
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/key"
-	"vitess.io/vitess/go/vt/vterrors"
 )
 
 var (
-	_ Vindex     = (*Hash)(nil)
-	_ Reversible = (*Hash)(nil)
+	_ SingleColumn    = (*Hash)(nil)
+	_ Reversible      = (*Hash)(nil)
+	_ Hashing         = (*Hash)(nil)
+	_ ParamValidating = (*Hash)(nil)
 )
 
 // Hash defines vindex that hashes an int64 to a KeyspaceId
-// by using null-key 3DES hash. It's Unique, Reversible and
+// by using null-key DES hash. It's Unique, Reversible and
 // Functional.
+// Note that at once stage we used a 3DES-based hash here,
+// but for a null key as in our case, they are completely equivalent.
 type Hash struct {
-	name string
+	name          string
+	unknownParams []string
 }
 
-// NewHash creates a new Hash.
-func NewHash(name string, m map[string]string) (Vindex, error) {
-	return &Hash{name: name}, nil
+// newHash creates a new Hash.
+func newHash(name string, params map[string]string) (Vindex, error) {
+	return &Hash{
+		name:          name,
+		unknownParams: FindUnknownParams(params, nil),
+	}, nil
 }
 
 // String returns the name of the vindex.
@@ -62,39 +70,32 @@ func (vind *Hash) IsUnique() bool {
 	return true
 }
 
-// Map can map ids to key.Destination objects.
-func (vind *Hash) Map(cursor VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
-	out := make([]key.Destination, len(ids))
+// NeedsVCursor satisfies the Vindex interface.
+func (vind *Hash) NeedsVCursor() bool {
+	return false
+}
+
+// Map can map ids to key.ShardDestination objects.
+func (vind *Hash) Map(ctx context.Context, vcursor VCursor, ids []sqltypes.Value) ([]key.ShardDestination, error) {
+	out := make([]key.ShardDestination, len(ids))
 	for i, id := range ids {
-		var num uint64
-		var err error
-
-		if id.IsSigned() {
-			// This is ToUint64 with no check on negative values.
-			str := id.ToString()
-			var ival int64
-			ival, err = strconv.ParseInt(str, 10, 64)
-			num = uint64(ival)
-		} else {
-			num, err = sqltypes.ToUint64(id)
-		}
-
+		ksid, err := vind.Hash(id)
 		if err != nil {
 			out[i] = key.DestinationNone{}
 			continue
 		}
-		out[i] = key.DestinationKeyspaceID(vhash(num))
+		out[i] = key.DestinationKeyspaceID(ksid)
 	}
 	return out, nil
 }
 
 // Verify returns true if ids maps to ksids.
-func (vind *Hash) Verify(_ VCursor, ids []sqltypes.Value, ksids [][]byte) ([]bool, error) {
+func (vind *Hash) Verify(ctx context.Context, vcursor VCursor, ids []sqltypes.Value, ksids [][]byte) ([]bool, error) {
 	out := make([]bool, len(ids))
 	for i := range ids {
-		num, err := sqltypes.ToUint64(ids[i])
+		num, err := ids[i].ToCastUint64()
 		if err != nil {
-			return nil, vterrors.Wrap(err, "hash.Verify")
+			return nil, err
 		}
 		out[i] = bytes.Equal(vhash(num), ksids[i])
 	}
@@ -114,22 +115,47 @@ func (vind *Hash) ReverseMap(_ VCursor, ksids [][]byte) ([]sqltypes.Value, error
 	return reverseIds, nil
 }
 
-var block3DES cipher.Block
+func (vind *Hash) Hash(id sqltypes.Value) ([]byte, error) {
+	var num uint64
+	var err error
+
+	if id.IsSigned() {
+		// This is ToUint64 with no check on negative values.
+		str := id.ToString()
+		var ival int64
+		ival, err = strconv.ParseInt(str, 10, 64)
+		num = uint64(ival)
+	} else {
+		num, err = id.ToCastUint64()
+	}
+
+	if err != nil {
+		return nil, err
+	}
+	return vhash(num), nil
+}
+
+// UnknownParams implements the ParamValidating interface.
+func (vind *Hash) UnknownParams() []string {
+	return vind.unknownParams
+}
+
+var blockDES cipher.Block
 
 func init() {
 	var err error
-	block3DES, err = des.NewTripleDESCipher(make([]byte, 24))
+	blockDES, err = des.NewCipher(make([]byte, 8))
 	if err != nil {
 		panic(err)
 	}
-	Register("hash", NewHash)
+	Register("hash", newHash)
 }
 
 func vhash(shardKey uint64) []byte {
 	var keybytes, hashed [8]byte
 	binary.BigEndian.PutUint64(keybytes[:], shardKey)
-	block3DES.Encrypt(hashed[:], keybytes[:])
-	return []byte(hashed[:])
+	blockDES.Encrypt(hashed[:], keybytes[:])
+	return hashed[:]
 }
 
 func vunhash(k []byte) (uint64, error) {
@@ -137,6 +163,6 @@ func vunhash(k []byte) (uint64, error) {
 		return 0, fmt.Errorf("invalid keyspace id: %v", hex.EncodeToString(k))
 	}
 	var unhashed [8]byte
-	block3DES.Decrypt(unhashed[:], k)
+	blockDES.Decrypt(unhashed[:], k)
 	return binary.BigEndian.Uint64(unhashed[:]), nil
 }

@@ -45,6 +45,10 @@ service TabletManager {
   // GetPermissions asks the tablet for its permissions
   rpc GetPermissions(tabletmanagerdata.GetPermissionsRequest) returns (tabletmanagerdata.GetPermissionsResponse) {};
 
+  // GetGlobalStatusVars returns the server's global status variables asked for.
+  // An empty/nil variable name parameter slice means you want all of them.
+  rpc GetGlobalStatusVars(tabletmanagerdata.GetGlobalStatusVarsRequest) returns (tabletmanagerdata.GetGlobalStatusVarsResponse) {};
+
   //
   // Various read-write methods
   //
@@ -53,6 +57,9 @@ service TabletManager {
 
   rpc SetReadWrite(tabletmanagerdata.SetReadWriteRequest) returns (tabletmanagerdata.SetReadWriteResponse) {};
 
+  // ChangeTags asks the remote tablet to change its tags
+  rpc ChangeTags(tabletmanagerdata.ChangeTagsRequest) returns (tabletmanagerdata.ChangeTagsResponse) {};
+
   // ChangeType asks the remote tablet to change its type
   rpc ChangeType(tabletmanagerdata.ChangeTypeRequest) returns (tabletmanagerdata.ChangeTypeResponse) {};
 
@@ -60,85 +67,95 @@ service TabletManager {
 
   rpc RunHealthCheck(tabletmanagerdata.RunHealthCheckRequest) returns (tabletmanagerdata.RunHealthCheckResponse) {};
 
-  rpc IgnoreHealthError(tabletmanagerdata.IgnoreHealthErrorRequest) returns (tabletmanagerdata.IgnoreHealthErrorResponse) {};
-
   rpc ReloadSchema(tabletmanagerdata.ReloadSchemaRequest) returns (tabletmanagerdata.ReloadSchemaResponse) {};
 
   rpc PreflightSchema(tabletmanagerdata.PreflightSchemaRequest) returns (tabletmanagerdata.PreflightSchemaResponse) {};
 
   rpc ApplySchema(tabletmanagerdata.ApplySchemaRequest) returns (tabletmanagerdata.ApplySchemaResponse) {};
 
+  rpc ResetSequences(tabletmanagerdata.ResetSequencesRequest) returns (tabletmanagerdata.ResetSequencesResponse) {};
+
   rpc LockTables(tabletmanagerdata.LockTablesRequest) returns (tabletmanagerdata.LockTablesResponse) {};
 
   rpc UnlockTables(tabletmanagerdata.UnlockTablesRequest) returns (tabletmanagerdata.UnlockTablesResponse) {};
 
+  rpc ExecuteQuery(tabletmanagerdata.ExecuteQueryRequest) returns (tabletmanagerdata.ExecuteQueryResponse) {};
+
   rpc ExecuteFetchAsDba(tabletmanagerdata.ExecuteFetchAsDbaRequest) returns (tabletmanagerdata.ExecuteFetchAsDbaResponse) {};
+
+  rpc ExecuteMultiFetchAsDba(tabletmanagerdata.ExecuteMultiFetchAsDbaRequest) returns (tabletmanagerdata.ExecuteMultiFetchAsDbaResponse) {};
 
   rpc ExecuteFetchAsAllPrivs(tabletmanagerdata.ExecuteFetchAsAllPrivsRequest) returns (tabletmanagerdata.ExecuteFetchAsAllPrivsResponse) {};
 
   rpc ExecuteFetchAsApp(tabletmanagerdata.ExecuteFetchAsAppRequest) returns (tabletmanagerdata.ExecuteFetchAsAppResponse) {};
 
   //
+  // Distributed Transaction related methods
+  //
+
+  rpc GetUnresolvedTransactions(tabletmanagerdata.GetUnresolvedTransactionsRequest) returns (tabletmanagerdata.GetUnresolvedTransactionsResponse) {};
+
+  rpc ReadTransaction(tabletmanagerdata.ReadTransactionRequest) returns (tabletmanagerdata.ReadTransactionResponse) {};
+
+  rpc GetTransactionInfo(tabletmanagerdata.GetTransactionInfoRequest) returns (tabletmanagerdata.GetTransactionInfoResponse) {};
+
+  rpc ConcludeTransaction(tabletmanagerdata.ConcludeTransactionRequest) returns (tabletmanagerdata.ConcludeTransactionResponse) {};
+
+  rpc MysqlHostMetrics(tabletmanagerdata.MysqlHostMetricsRequest) returns (tabletmanagerdata.MysqlHostMetricsResponse) {};
+
+  //
   // Replication related methods
   //
 
-  // SlaveStatus returns the current slave status.
-  rpc SlaveStatus(tabletmanagerdata.SlaveStatusRequest) returns (tabletmanagerdata.SlaveStatusResponse) {};
+  // ReplicationStatus returns the current replication status.
+  rpc ReplicationStatus(tabletmanagerdata.ReplicationStatusRequest) returns (tabletmanagerdata.ReplicationStatusResponse) {};
 
-  // MasterPosition returns the current master position
-  rpc MasterPosition(tabletmanagerdata.MasterPositionRequest) returns (tabletmanagerdata.MasterPositionResponse) {};
+  // PrimaryStatus returns the current primary status.
+  rpc PrimaryStatus(tabletmanagerdata.PrimaryStatusRequest) returns (tabletmanagerdata.PrimaryStatusResponse) {};
+
+  // PrimaryPosition returns the current primary position
+  rpc PrimaryPosition(tabletmanagerdata.PrimaryPositionRequest) returns (tabletmanagerdata.PrimaryPositionResponse) {};
 
   // WaitForPosition waits for the position to be reached
   rpc WaitForPosition(tabletmanagerdata.WaitForPositionRequest) returns (tabletmanagerdata.WaitForPositionResponse) {};
 
-  // StopSlave makes mysql stop its replication
-  rpc StopSlave(tabletmanagerdata.StopSlaveRequest) returns (tabletmanagerdata.StopSlaveResponse) {};
+  // StopReplication makes mysql stop its replication
+  rpc StopReplication(tabletmanagerdata.StopReplicationRequest) returns (tabletmanagerdata.StopReplicationResponse) {};
 
-  // StopSlaveMinimum stops the mysql replication after it reaches
+  // StopReplicationMinimum stops the mysql replication after it reaches
   // the provided minimum point
-  rpc StopSlaveMinimum(tabletmanagerdata.StopSlaveMinimumRequest) returns (tabletmanagerdata.StopSlaveMinimumResponse) {};
+  rpc StopReplicationMinimum(tabletmanagerdata.StopReplicationMinimumRequest) returns (tabletmanagerdata.StopReplicationMinimumResponse) {};
 
-  // StartSlave starts the mysql replication
-  rpc StartSlave(tabletmanagerdata.StartSlaveRequest) returns (tabletmanagerdata.StartSlaveResponse) {};
+  // StartReplication starts the mysql replication
+  rpc StartReplication(tabletmanagerdata.StartReplicationRequest) returns (tabletmanagerdata.StartReplicationResponse) {};
 
-  // StartSlave starts the mysql replication until and including
+  // RestartReplication stops and then starts the mysql replication
+  rpc RestartReplication(tabletmanagerdata.RestartReplicationRequest) returns (tabletmanagerdata.RestartReplicationResponse) {};
+
+  // StartReplicationUnitAfter starts the mysql replication until and including
   // the provided position
-  rpc StartSlaveUntilAfter(tabletmanagerdata.StartSlaveUntilAfterRequest) returns (tabletmanagerdata.StartSlaveUntilAfterResponse) {};
+  rpc StartReplicationUntilAfter(tabletmanagerdata.StartReplicationUntilAfterRequest) returns (tabletmanagerdata.StartReplicationUntilAfterResponse) {};
 
-  // TabletExternallyReparented tells a tablet that its underlying MySQL is
-  // currently the master. It is only used in environments (tabletmanagerdata.such as Vitess+MoB)
-  // in which MySQL is reparented by some agent external to Vitess, and then
-  // that agent simply notifies Vitess.
-  //
-  // This call is idempotent with respect to a single target tablet.
-  // However, the tablet assumes there is a cooling-off period following the
-  // initial external reparent from A to B, before this call is repeated on any
-  // tablet other than B. This assumption is configurable with the vttablet flag
-  // "finalize_external_reparent_timeout".
-  //
-  // For more information, see the design doc at go/vt-fast-failover.
-  rpc TabletExternallyReparented(tabletmanagerdata.TabletExternallyReparentedRequest) returns (tabletmanagerdata.TabletExternallyReparentedResponse) {};
-
-  // TabletExternallyElected is an notification that may be sent in
-  // anticipation of potentially later sending TabletExternallyReparented.
-  // The tablet can use this extra lead time to prepare to react quickly if
-  // TabletExternallyReparented does follow.
-  //
-  // This call is effectively a no-op if it is not followed by a call to
-  // TabletExternallyReparented, so the external agent doing the reparent can
-  // still change its mind.
-  //
-  // The agent does not need to wait for this call or cancel it before calling
-  // TabletExternallyReparented if the external reparent operation finishes
-  // before TabletExternallyElected returns.
-  rpc TabletExternallyElected(tabletmanagerdata.TabletExternallyElectedRequest) returns (tabletmanagerdata.TabletExternallyElectedResponse) {};
-
-  // GetSlaves asks for the list of mysql slaves
-  rpc GetSlaves(tabletmanagerdata.GetSlavesRequest) returns (tabletmanagerdata.GetSlavesResponse) {};
+  // GetReplicas asks for the list of mysql replicas
+  rpc GetReplicas(tabletmanagerdata.GetReplicasRequest) returns (tabletmanagerdata.GetReplicasResponse) {};
 
   // VReplication API
+  rpc CreateVReplicationWorkflow(tabletmanagerdata.CreateVReplicationWorkflowRequest) returns (tabletmanagerdata.CreateVReplicationWorkflowResponse) {};
+  rpc DeleteTableData(tabletmanagerdata.DeleteTableDataRequest) returns(tabletmanagerdata.DeleteTableDataResponse) {}
+  rpc DeleteVReplicationWorkflow(tabletmanagerdata.DeleteVReplicationWorkflowRequest) returns(tabletmanagerdata.DeleteVReplicationWorkflowResponse) {};
+  rpc HasVReplicationWorkflows(tabletmanagerdata.HasVReplicationWorkflowsRequest) returns(tabletmanagerdata.HasVReplicationWorkflowsResponse) {};
+  rpc ReadVReplicationWorkflow(tabletmanagerdata.ReadVReplicationWorkflowRequest) returns(tabletmanagerdata.ReadVReplicationWorkflowResponse) {};
+  rpc ReadVReplicationWorkflows(tabletmanagerdata.ReadVReplicationWorkflowsRequest) returns(tabletmanagerdata.ReadVReplicationWorkflowsResponse) {};
+  rpc UpdateVReplicationWorkflow(tabletmanagerdata.UpdateVReplicationWorkflowRequest) returns(tabletmanagerdata.UpdateVReplicationWorkflowResponse) {};
+  rpc UpdateVReplicationWorkflows(tabletmanagerdata.UpdateVReplicationWorkflowsRequest) returns(tabletmanagerdata.UpdateVReplicationWorkflowsResponse) {};
+  rpc ValidateVReplicationPermissions(tabletmanagerdata.ValidateVReplicationPermissionsRequest) returns(tabletmanagerdata.ValidateVReplicationPermissionsResponse) {};
   rpc VReplicationExec(tabletmanagerdata.VReplicationExecRequest) returns(tabletmanagerdata.VReplicationExecResponse) {};
   rpc VReplicationWaitForPos(tabletmanagerdata.VReplicationWaitForPosRequest) returns(tabletmanagerdata.VReplicationWaitForPosResponse) {};
+  rpc UpdateSequenceTables(tabletmanagerdata.UpdateSequenceTablesRequest) returns(tabletmanagerdata.UpdateSequenceTablesResponse) {};
+  rpc GetMaxValueForSequences(tabletmanagerdata.GetMaxValueForSequencesRequest) returns(tabletmanagerdata.GetMaxValueForSequencesResponse) {};
+
+  // VDiff API
+  rpc VDiff(tabletmanagerdata.VDiffRequest) returns(tabletmanagerdata.VDiffResponse) {};
 
   //
   // Reparenting related functions
@@ -147,41 +164,46 @@ service TabletManager {
   // ResetReplication makes the target not replicating
   rpc ResetReplication(tabletmanagerdata.ResetReplicationRequest) returns (tabletmanagerdata.ResetReplicationResponse) {};
 
-  // InitMaster initializes the tablet as a master
-  rpc InitMaster(tabletmanagerdata.InitMasterRequest) returns (tabletmanagerdata.InitMasterResponse) {};
+  // InitPrimary initializes the tablet as a primary
+  rpc InitPrimary(tabletmanagerdata.InitPrimaryRequest) returns (tabletmanagerdata.InitPrimaryResponse) {};
 
   // PopulateReparentJournal tells the tablet to add an entry to its
   // reparent journal
   rpc PopulateReparentJournal(tabletmanagerdata.PopulateReparentJournalRequest) returns (tabletmanagerdata.PopulateReparentJournalResponse) {};
 
-  // InitSlave tells the tablet to reparent to the master unconditionally
-  rpc InitSlave(tabletmanagerdata.InitSlaveRequest) returns (tabletmanagerdata.InitSlaveResponse) {};
+  // ReadReparentJournalInfo reads the information from reparent journal
+  rpc ReadReparentJournalInfo(tabletmanagerdata.ReadReparentJournalInfoRequest) returns (tabletmanagerdata.ReadReparentJournalInfoResponse) {};
 
-  // DemoteMaster tells the soon-to-be-former master it's gonna change
-  rpc DemoteMaster(tabletmanagerdata.DemoteMasterRequest) returns (tabletmanagerdata.DemoteMasterResponse) {};
+  // InitReplica tells the tablet to reparent to the primary unconditionally
+  rpc InitReplica(tabletmanagerdata.InitReplicaRequest) returns (tabletmanagerdata.InitReplicaResponse) {};
 
-  // UndoDemoteMaster reverts all changes made by DemoteMaster
-  rpc UndoDemoteMaster(tabletmanagerdata.UndoDemoteMasterRequest) returns (tabletmanagerdata.UndoDemoteMasterResponse) {};
+  // DemotePrimary tells the soon-to-be-former primary it's gonna change
+  rpc DemotePrimary(tabletmanagerdata.DemotePrimaryRequest) returns (tabletmanagerdata.DemotePrimaryResponse) {};
 
-  // PromoteSlaveWhenCaughtUp tells the remote tablet to catch up,
-  // and then be the master
-  rpc PromoteSlaveWhenCaughtUp(tabletmanagerdata.PromoteSlaveWhenCaughtUpRequest) returns (tabletmanagerdata.PromoteSlaveWhenCaughtUpResponse) {};
+  // UndoDemotePrimary reverts all changes made by DemotePrimary
+  rpc UndoDemotePrimary(tabletmanagerdata.UndoDemotePrimaryRequest) returns (tabletmanagerdata.UndoDemotePrimaryResponse) {};
 
-  // SlaveWasPromoted tells the remote tablet it is now the master
-  rpc SlaveWasPromoted(tabletmanagerdata.SlaveWasPromotedRequest) returns (tabletmanagerdata.SlaveWasPromotedResponse) {};
+  // ReplicaWasPromoted tells the remote tablet it is now the primary
+  rpc ReplicaWasPromoted(tabletmanagerdata.ReplicaWasPromotedRequest) returns (tabletmanagerdata.ReplicaWasPromotedResponse) {};
 
-  // SetMaster tells the slave to reparent
-  rpc SetMaster(tabletmanagerdata.SetMasterRequest) returns (tabletmanagerdata.SetMasterResponse) {};
+  // ResetReplicationParameters resets the replica replication parameters
+  rpc ResetReplicationParameters(tabletmanagerdata.ResetReplicationParametersRequest) returns (tabletmanagerdata.ResetReplicationParametersResponse) {};
 
-  // SlaveWasRestarted tells the remote tablet its master has changed
-  rpc SlaveWasRestarted(tabletmanagerdata.SlaveWasRestartedRequest) returns (tabletmanagerdata.SlaveWasRestartedResponse) {};
+  // FullStatus collects and returns the full status of MySQL including the replication information, semi-sync information, GTID information among others
+  rpc FullStatus(tabletmanagerdata.FullStatusRequest) returns (tabletmanagerdata.FullStatusResponse) {};
+
+  // SetReplicationSource tells the replica to reparent
+  rpc SetReplicationSource(tabletmanagerdata.SetReplicationSourceRequest) returns (tabletmanagerdata.SetReplicationSourceResponse) {};
+
+  // ReplicaWasRestarted tells the remote tablet its primary has changed
+  rpc ReplicaWasRestarted(tabletmanagerdata.ReplicaWasRestartedRequest) returns (tabletmanagerdata.ReplicaWasRestartedResponse) {};
 
   // StopReplicationAndGetStatus stops MySQL replication, and returns the
   // replication status
   rpc StopReplicationAndGetStatus(tabletmanagerdata.StopReplicationAndGetStatusRequest) returns (tabletmanagerdata.StopReplicationAndGetStatusResponse) {};
 
-  // PromoteSlave makes the slave the new master
-  rpc PromoteSlave(tabletmanagerdata.PromoteSlaveRequest) returns (tabletmanagerdata.PromoteSlaveResponse) {};
+  // PromoteReplica makes the replica the new primary
+  rpc PromoteReplica(tabletmanagerdata.PromoteReplicaRequest) returns (tabletmanagerdata.PromoteReplicaResponse) {};
 
   //
   // Backup related methods
@@ -191,4 +213,14 @@ service TabletManager {
 
   // RestoreFromBackup deletes all local data and restores it from the latest backup.
   rpc RestoreFromBackup(tabletmanagerdata.RestoreFromBackupRequest) returns (stream tabletmanagerdata.RestoreFromBackupResponse) {};
+
+  //
+  // Tablet throttler related methods
+  //
+
+  // CheckThrottler issues a 'check' on a tablet's throttler
+  rpc CheckThrottler(tabletmanagerdata.CheckThrottlerRequest) returns (tabletmanagerdata.CheckThrottlerResponse) {};
+
+  // GetThrottlerStatus gets the status of a tablet throttler
+  rpc GetThrottlerStatus(tabletmanagerdata.GetThrottlerStatusRequest) returns (tabletmanagerdata.GetThrottlerStatusResponse) {};
 }

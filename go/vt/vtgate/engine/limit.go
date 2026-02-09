@@ -17,9 +17,14 @@ limitations under the License.
 package engine
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
 	"io"
+	"strconv"
+	"sync"
+
+	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/vtgate/evalengine"
 
 	"vitess.io/vitess/go/sqltypes"
 
@@ -28,60 +33,38 @@ import (
 
 var _ Primitive = (*Limit)(nil)
 
-// Limit is a primitive that performs the LIMIT operation.
+// Limit performs the LIMIT operation, restricting the number of rows returned.
 type Limit struct {
-	Count  sqltypes.PlanValue
-	Offset sqltypes.PlanValue
-	Input  Primitive
+	// Count specifies the maximum number of rows to return.
+	Count evalengine.Expr
+
+	// Offset specifies the number of rows to skip before returning results.
+	Offset evalengine.Expr
+
+	// RequireCompleteInput determines if all input rows must be fully retrieved.
+	// - If true, all Result structs are passed through, and the total rows are limited.
+	// - If false, Limit returns io.EOF once the limit is reached in streaming mode,
+	//   signaling the tablet to stop sending data.
+	RequireCompleteInput bool
+
+	// Input provides the input rows.
+	Input Primitive
 }
 
-// MarshalJSON serializes the Limit into a JSON representation.
-// It's used for testing and diagnostics.
-func (l *Limit) MarshalJSON() ([]byte, error) {
-	marshalLimit := struct {
-		Opcode string
-		Count  sqltypes.PlanValue
-		Offset sqltypes.PlanValue
-		Input  Primitive
-	}{
-		Opcode: "Limit",
-		Count:  l.Count,
-		Offset: l.Offset,
-		Input:  l.Input,
-	}
-	return json.Marshal(marshalLimit)
-}
+var UpperLimitStr = "__upper_limit"
 
-// RouteType returns a description of the query routing type used by the primitive
-func (l *Limit) RouteType() string {
-	return l.Input.RouteType()
-}
-
-// GetKeyspaceName specifies the Keyspace that this primitive routes to.
-func (l *Limit) GetKeyspaceName() string {
-	return l.Input.GetKeyspaceName()
-}
-
-// GetTableName specifies the table that this primitive routes to.
-func (l *Limit) GetTableName() string {
-	return l.Input.GetTableName()
-}
-
-// Execute satisfies the Primtive interface.
-func (l *Limit) Execute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error) {
-	count, err := l.fetchCount(bindVars)
-	if err != nil {
-		return nil, err
-	}
-	offset, err := l.fetchOffset(bindVars)
+// TryExecute satisfies the Primitive interface.
+func (l *Limit) TryExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error) {
+	count, offset, err := l.getCountAndOffset(ctx, vcursor, bindVars)
 	if err != nil {
 		return nil, err
 	}
 	// When offset is present, we hijack the limit value so we can calculate
 	// the offset in memory from the result of the scatter query with count + offset.
-	bindVars["__upper_limit"] = sqltypes.Int64BindVariable(int64(count + offset))
 
-	result, err := l.Input.Execute(vcursor, bindVars, wantfields)
+	bindVars[UpperLimitStr] = sqltypes.Int64BindVariable(int64(count + offset))
+
+	result, err := vcursor.ExecutePrimitive(ctx, l.Input, bindVars, wantfields)
 	if err != nil {
 		return nil, err
 	}
@@ -89,65 +72,103 @@ func (l *Limit) Execute(vcursor VCursor, bindVars map[string]*querypb.BindVariab
 	// There are more rows in the response than limit + offset
 	if count+offset <= len(result.Rows) {
 		result.Rows = result.Rows[offset : count+offset]
-		result.RowsAffected = uint64(count)
 		return result, nil
 	}
 	// Remove extra rows from response
 	if offset <= len(result.Rows) {
 		result.Rows = result.Rows[offset:]
-		result.RowsAffected = uint64(len(result.Rows))
 		return result, nil
 	}
 	// offset is beyond the result set
 	result.Rows = nil
-	result.RowsAffected = 0
 	return result, nil
 }
 
-// StreamExecute satisfies the Primtive interface.
-func (l *Limit) StreamExecute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
-	count, err := l.fetchCount(bindVars)
+func (l *Limit) mustRetrieveAll(vcursor VCursor) bool {
+	return l.RequireCompleteInput || vcursor.Session().InTransaction()
+}
+
+// TryStreamExecute satisfies the Primitive interface.
+func (l *Limit) TryStreamExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
+	count, offset, err := l.getCountAndOffset(ctx, vcursor, bindVars)
 	if err != nil {
 		return err
 	}
-	if !l.Offset.IsNull() {
-		return fmt.Errorf("offset not supported for stream execute queries")
-	}
 
-	bindVars["__upper_limit"] = sqltypes.Int64BindVariable(int64(count))
+	bindVars = copyBindVars(bindVars)
 
-	err = l.Input.StreamExecute(vcursor, bindVars, wantfields, func(qr *sqltypes.Result) error {
-		if len(qr.Fields) != 0 {
-			if err := callback(&sqltypes.Result{Fields: qr.Fields}); err != nil {
-				return err
+	// Adjust the upper limit so that the initial fetch includes both the offset and count.
+	// We do this because we want to skip the first `offset` rows locally rather than on the server side.
+	bindVars[UpperLimitStr] = sqltypes.Int64BindVariable(int64(count + offset))
+
+	var mu sync.Mutex
+	err = vcursor.StreamExecutePrimitive(ctx, l.Input, bindVars, wantfields, func(qr *sqltypes.Result) error {
+		mu.Lock()
+		defer mu.Unlock()
+
+		inputSize := len(qr.Rows)
+		// If we still need to skip `offset` rows before returning any to the client:
+		if offset > 0 {
+			if inputSize <= offset {
+				// not enough to return anything yet, but we still want to pass on metadata such as last_insert_id
+				offset -= inputSize
+				if !wantfields && !l.mustRetrieveAll(vcursor) {
+					return nil
+				}
+				if len(qr.Fields) > 0 {
+					wantfields = false
+				}
+				qr.Rows = nil
+				return callback(qr)
 			}
-		}
-		if len(qr.Rows) == 0 {
-			return nil
+			// Skip `offset` rows from this batch and reset offset to 0.
+			qr.Rows = qr.Rows[offset:]
+			offset = 0
 		}
 
+		// At this point, we've dealt with the offset. Now handle the count (limit).
 		if count == 0 {
-			// Unreachable: this is just a failsafe.
-			return io.EOF
+			// If count is zero, we've fetched everything we need.
+			if !wantfields && !l.mustRetrieveAll(vcursor) {
+				return io.EOF
+			}
+			if len(qr.Fields) > 0 {
+				wantfields = false
+			}
+
+			// If we require the complete input, or we are in a transaction, we cannot return io.EOF early.
+			// Instead, we return empty results as needed until input ends.
+			qr.Rows = nil
+			return callback(qr)
+		}
+
+		if len(qr.Fields) > 0 {
+			wantfields = false
 		}
 
 		// reduce count till 0.
-		result := &sqltypes.Result{Rows: qr.Rows}
-		if count > len(result.Rows) {
-			count -= len(result.Rows)
-			return callback(result)
+		resultSize := len(qr.Rows)
+		if count > resultSize {
+			count -= resultSize
+			return callback(qr)
 		}
-		result.Rows = result.Rows[:count]
+
+		qr.Rows = qr.Rows[:count]
 		count = 0
-		if err := callback(result); err != nil {
+		if err := callback(qr); err != nil {
 			return err
 		}
+
+		// If we required complete input or are in a transaction, we must not exit early.
+		// We'll return empty batches until the input is done.
+		if l.mustRetrieveAll(vcursor) {
+			return nil
+		}
+
 		return io.EOF
 	})
 
 	if err == io.EOF {
-		// We may get back the EOF we returned in the callback.
-		// If so, suppress it.
 		return nil
 	}
 	if err != nil {
@@ -156,42 +177,73 @@ func (l *Limit) StreamExecute(vcursor VCursor, bindVars map[string]*querypb.Bind
 	return nil
 }
 
-// GetFields satisfies the Primtive interface.
-func (l *Limit) GetFields(vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
-	return l.Input.GetFields(vcursor, bindVars)
+// GetFields implements the Primitive interface.
+func (l *Limit) GetFields(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
+	return l.Input.GetFields(ctx, vcursor, bindVars)
 }
 
-func (l *Limit) fetchCount(bindVars map[string]*querypb.BindVariable) (int, error) {
-	resolved, err := l.Count.ResolveValue(bindVars)
+// Inputs returns the input to limit
+func (l *Limit) Inputs() ([]Primitive, []map[string]any) {
+	return []Primitive{l.Input}, nil
+}
+
+// NeedsTransaction implements the Primitive interface.
+func (l *Limit) NeedsTransaction() bool {
+	return l.Input.NeedsTransaction()
+}
+
+func (l *Limit) getCountAndOffset(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable) (count int, offset int, err error) {
+	env := evalengine.NewExpressionEnv(ctx, bindVars, vcursor)
+	count, err = getIntFrom(env, vcursor, l.Count)
+	if err != nil {
+		return
+	}
+	offset, err = getIntFrom(env, vcursor, l.Offset)
+	if err != nil {
+		return
+	}
+	return
+}
+
+func getIntFrom(env *evalengine.ExpressionEnv, vcursor VCursor, expr evalengine.Expr) (int, error) {
+	if expr == nil {
+		return 0, nil
+	}
+	evalResult, err := env.Evaluate(expr)
 	if err != nil {
 		return 0, err
 	}
-	num, err := sqltypes.ToUint64(resolved)
-	if err != nil {
-		return 0, err
+	value := evalResult.Value(vcursor.ConnCollation())
+	if value.IsNull() {
+		return 0, nil
 	}
-	count := int(num)
-	if count < 0 {
-		return 0, fmt.Errorf("requested limit is out of range: %v", num)
+
+	if !value.IsIntegral() {
+		return 0, sqltypes.ErrIncompatibleTypeCast
+	}
+
+	count, err := strconv.Atoi(value.RawStr())
+	if err != nil || count < 0 {
+		return 0, fmt.Errorf("requested limit is out of range: %v", value.RawStr())
 	}
 	return count, nil
 }
 
-func (l *Limit) fetchOffset(bindVars map[string]*querypb.BindVariable) (int, error) {
-	if l.Offset.IsNull() {
-		return 0, nil
+func (l *Limit) description() PrimitiveDescription {
+	other := map[string]any{}
+
+	if l.Count != nil {
+		other["Count"] = sqlparser.String(l.Count)
 	}
-	resolved, err := l.Offset.ResolveValue(bindVars)
-	if err != nil {
-		return 0, err
+	if l.Offset != nil {
+		other["Offset"] = sqlparser.String(l.Offset)
 	}
-	num, err := sqltypes.ToUint64(resolved)
-	if err != nil {
-		return 0, err
+	if l.RequireCompleteInput {
+		other["RequireCompleteInput"] = true
 	}
-	offset := int(num)
-	if offset < 0 {
-		return 0, fmt.Errorf("requested limit is out of range: %v", num)
+
+	return PrimitiveDescription{
+		OperatorType: "Limit",
+		Other:        other,
 	}
-	return offset, nil
 }

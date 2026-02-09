@@ -17,10 +17,15 @@ limitations under the License.
 package engine
 
 import (
+	"bytes"
+	"context"
 	"fmt"
+	"maps"
+	"strings"
+	"sync"
+	"sync/atomic"
 
 	"vitess.io/vitess/go/sqltypes"
-
 	querypb "vitess.io/vitess/go/vt/proto/query"
 )
 
@@ -31,7 +36,7 @@ type Join struct {
 	Opcode JoinOpcode
 	// Left and Right are the LHS and RHS primitives
 	// of the Join. They can be any primitive.
-	Left, Right Primitive `json:",omitempty"`
+	Left, Right Primitive
 
 	// Cols defines which columns from the left
 	// or right results should be used to build the
@@ -40,27 +45,27 @@ type Join struct {
 	// For the right query, they're 1, 2, etc.
 	// If Cols is {-1, -2, 1, 2}, it means that
 	// the returned result will be {Left0, Left1, Right0, Right1}.
-	Cols []int `json:",omitempty"`
+	Cols []int
 
 	// Vars defines the list of joinVars that need to
 	// be built from the LHS result before invoking
 	// the RHS subqquery.
-	Vars map[string]int `json:",omitempty"`
+	Vars map[string]int
 }
 
-// Execute performs a non-streaming exec.
-func (jn *Join) Execute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error) {
+// TryExecute performs a non-streaming exec.
+func (jn *Join) TryExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error) {
 	joinVars := make(map[string]*querypb.BindVariable)
-	lresult, err := jn.Left.Execute(vcursor, bindVars, wantfields)
+	lresult, err := vcursor.ExecutePrimitive(ctx, jn.Left, bindVars, wantfields)
 	if err != nil {
 		return nil, err
 	}
 	result := &sqltypes.Result{}
 	if len(lresult.Rows) == 0 && wantfields {
-		for k := range jn.Vars {
-			joinVars[k] = sqltypes.NullBindVariable
+		for k, col := range jn.Vars {
+			joinVars[k] = bindvarForType(lresult.Fields[col])
 		}
-		rresult, err := jn.Right.GetFields(vcursor, combineVars(bindVars, joinVars))
+		rresult, err := jn.Right.GetFields(ctx, vcursor, combineVars(bindVars, joinVars))
 		if err != nil {
 			return nil, err
 		}
@@ -71,7 +76,7 @@ func (jn *Join) Execute(vcursor VCursor, bindVars map[string]*querypb.BindVariab
 		for k, col := range jn.Vars {
 			joinVars[k] = sqltypes.ValueBindVariable(lrow[col])
 		}
-		rresult, err := jn.Right.Execute(vcursor, combineVars(bindVars, joinVars), wantfields)
+		rresult, err := vcursor.ExecutePrimitive(ctx, jn.Right, combineVars(bindVars, joinVars), wantfields)
 		if err != nil {
 			return nil, err
 		}
@@ -84,68 +89,111 @@ func (jn *Join) Execute(vcursor VCursor, bindVars map[string]*querypb.BindVariab
 		}
 		if jn.Opcode == LeftJoin && len(rresult.Rows) == 0 {
 			result.Rows = append(result.Rows, joinRows(lrow, nil, jn.Cols))
-			result.RowsAffected++
-		} else {
-			result.RowsAffected += uint64(len(rresult.Rows))
 		}
-		if len(result.Rows) > vcursor.MaxMemoryRows() {
+		if vcursor.ExceedsMaxMemoryRows(len(result.Rows)) {
 			return nil, fmt.Errorf("in-memory row count exceeded allowed limit of %d", vcursor.MaxMemoryRows())
 		}
 	}
 	return result, nil
 }
 
-// StreamExecute performs a streaming exec.
-func (jn *Join) StreamExecute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
-	joinVars := make(map[string]*querypb.BindVariable)
-	err := jn.Left.StreamExecute(vcursor, bindVars, wantfields, func(lresult *sqltypes.Result) error {
+func bindvarForType(field *querypb.Field) *querypb.BindVariable {
+	bv := &querypb.BindVariable{
+		Type:  field.Type,
+		Value: nil,
+	}
+	switch field.Type {
+	case querypb.Type_INT8, querypb.Type_UINT8, querypb.Type_INT16, querypb.Type_UINT16,
+		querypb.Type_INT32, querypb.Type_UINT32, querypb.Type_INT64, querypb.Type_UINT64:
+		bv.Value = []byte("0")
+	case querypb.Type_FLOAT32, querypb.Type_FLOAT64:
+		bv.Value = []byte("0e0")
+	case querypb.Type_DECIMAL:
+		size := max(1, int(field.ColumnLength-field.Decimals))
+		scale := max(1, int(field.Decimals))
+		bv.Value = append(append(bytes.Repeat([]byte{'0'}, size), byte('.')), bytes.Repeat([]byte{'0'}, scale)...)
+	case querypb.Type_JSON:
+		bv.Value = []byte(`""`) // empty json object
+	default:
+		return sqltypes.NullBindVariable
+	}
+	return bv
+}
+
+// TryStreamExecute performs a streaming exec.
+func (jn *Join) TryStreamExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
+	var mu sync.Mutex
+	// We need to use this atomic since we're also reading this
+	// value outside of it being locked with the mu lock.
+	// This is still racy, but worst case it means that we may
+	// retrieve the right hand side fields twice instead of once.
+	var fieldsSent atomic.Bool
+	fieldsSent.Store(!wantfields)
+	err := vcursor.StreamExecutePrimitive(ctx, jn.Left, bindVars, wantfields, func(lresult *sqltypes.Result) error {
+		joinVars := make(map[string]*querypb.BindVariable)
 		for _, lrow := range lresult.Rows {
 			for k, col := range jn.Vars {
 				joinVars[k] = sqltypes.ValueBindVariable(lrow[col])
 			}
-			rowSent := false
-			err := jn.Right.StreamExecute(vcursor, combineVars(bindVars, joinVars), wantfields, func(rresult *sqltypes.Result) error {
+			var rowSent atomic.Bool
+			err := vcursor.StreamExecutePrimitive(ctx, jn.Right, combineVars(bindVars, joinVars), !fieldsSent.Load(), func(rresult *sqltypes.Result) error {
+				// This needs to be locking since it's not safe to just use
+				// fieldsSent. This is because we can't have a race between
+				// checking fieldsSent and then actually calling the callback
+				// and in parallel another goroutine doing the same. That
+				// can lead to out of order execution of the callback. So the callback
+				// itself and the check need to be covered by the same lock.
+				mu.Lock()
+				defer mu.Unlock()
 				result := &sqltypes.Result{}
-				if wantfields {
-					// This code is currently unreachable because the first result
-					// will always be just the field info, which will cause the outer
-					// wantfields code path to be executed. But this may change in the future.
-					wantfields = false
+				if fieldsSent.CompareAndSwap(false, true) {
 					result.Fields = joinFields(lresult.Fields, rresult.Fields, jn.Cols)
 				}
 				for _, rrow := range rresult.Rows {
 					result.Rows = append(result.Rows, joinRows(lrow, rrow, jn.Cols))
 				}
 				if len(rresult.Rows) != 0 {
-					rowSent = true
+					rowSent.Store(true)
 				}
 				return callback(result)
 			})
 			if err != nil {
 				return err
 			}
-			if jn.Opcode == LeftJoin && !rowSent {
+			if jn.Opcode == LeftJoin && !rowSent.Load() {
 				result := &sqltypes.Result{}
 				result.Rows = [][]sqltypes.Value{joinRows(
 					lrow,
 					nil,
 					jn.Cols,
 				)}
-				return callback(result)
+
+				if err := callback(result); err != nil {
+					return err
+				}
 			}
 		}
-		if wantfields {
-			wantfields = false
-			for k := range jn.Vars {
-				joinVars[k] = sqltypes.NullBindVariable
+		// This needs to be locking since it's not safe to just use
+		// fieldsSent. This is because we can't have a race between
+		// checking fieldsSent and then actually calling the callback
+		// and in parallel another goroutine doing the same. That
+		// can lead to out of order execution of the callback. So the callback
+		// itself and the check need to be covered by the same lock.
+		mu.Lock()
+		defer mu.Unlock()
+		if fieldsSent.CompareAndSwap(false, true) {
+			for k, v := range jn.Vars {
+				joinVars[k] = bindvarForType(lresult.Fields[v])
 			}
 			result := &sqltypes.Result{}
-			rresult, err := jn.Right.GetFields(vcursor, combineVars(bindVars, joinVars))
+			rresult, err := jn.Right.GetFields(ctx, vcursor, combineVars(bindVars, joinVars))
 			if err != nil {
 				return err
 			}
 			result.Fields = joinFields(lresult.Fields, rresult.Fields, jn.Cols)
-			return callback(result)
+			if err := callback(result); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
@@ -153,9 +201,9 @@ func (jn *Join) StreamExecute(vcursor VCursor, bindVars map[string]*querypb.Bind
 }
 
 // GetFields fetches the field info.
-func (jn *Join) GetFields(vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
+func (jn *Join) GetFields(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
 	joinVars := make(map[string]*querypb.BindVariable)
-	lresult, err := jn.Left.GetFields(vcursor, bindVars)
+	lresult, err := jn.Left.GetFields(ctx, vcursor, bindVars)
 	if err != nil {
 		return nil, err
 	}
@@ -163,7 +211,7 @@ func (jn *Join) GetFields(vcursor VCursor, bindVars map[string]*querypb.BindVari
 	for k := range jn.Vars {
 		joinVars[k] = sqltypes.NullBindVariable
 	}
-	rresult, err := jn.Right.GetFields(vcursor, combineVars(bindVars, joinVars))
+	rresult, err := jn.Right.GetFields(ctx, vcursor, combineVars(bindVars, joinVars))
 	if err != nil {
 		return nil, err
 	}
@@ -171,19 +219,24 @@ func (jn *Join) GetFields(vcursor VCursor, bindVars map[string]*querypb.BindVari
 	return result, nil
 }
 
+// Inputs returns the input primitives for this join
+func (jn *Join) Inputs() ([]Primitive, []map[string]any) {
+	return []Primitive{jn.Left, jn.Right}, nil
+}
+
 func joinFields(lfields, rfields []*querypb.Field, cols []int) []*querypb.Field {
 	fields := make([]*querypb.Field, len(cols))
 	for i, index := range cols {
 		if index < 0 {
-			fields[i] = lfields[-index-1]
+			fields[i] = lfields[-index-1].CloneVT()
 			continue
 		}
-		fields[i] = rfields[index-1]
+		fields[i] = rfields[index-1].CloneVT()
 	}
 	return fields
 }
 
-func joinRows(lrow, rrow []sqltypes.Value, cols []int) []sqltypes.Value {
+func joinRows(lrow, rrow sqltypes.Row, cols []int) sqltypes.Row {
 	row := make([]sqltypes.Value, len(cols))
 	for i, index := range cols {
 		if index < 0 {
@@ -204,12 +257,12 @@ type JoinOpcode int
 
 // This is the list of JoinOpcode values.
 const (
-	NormalJoin = JoinOpcode(iota)
+	InnerJoin = JoinOpcode(iota)
 	LeftJoin
 )
 
 func (code JoinOpcode) String() string {
-	if code == NormalJoin {
+	if code == InnerJoin {
 		return "Join"
 	}
 	return "LeftJoin"
@@ -218,34 +271,44 @@ func (code JoinOpcode) String() string {
 // MarshalJSON serializes the JoinOpcode as a JSON string.
 // It's used for testing and diagnostics.
 func (code JoinOpcode) MarshalJSON() ([]byte, error) {
-	return ([]byte)(fmt.Sprintf("\"%s\"", code.String())), nil
+	return fmt.Appendf(nil, "\"%s\"", code.String()), nil
 }
 
-// RouteType returns a description of the query routing type used by the primitive
-func (jn *Join) RouteType() string {
-	return "Join"
-}
-
-// GetKeyspaceName specifies the Keyspace that this primitive routes to.
-func (jn *Join) GetKeyspaceName() string {
-	if jn.Left.GetKeyspaceName() == jn.Right.GetKeyspaceName() {
-		return jn.Left.GetKeyspaceName()
-	}
-	return jn.Left.GetKeyspaceName() + "_" + jn.Right.GetKeyspaceName()
-}
-
-// GetTableName specifies the table that this primitive routes to.
-func (jn *Join) GetTableName() string {
-	return jn.Left.GetTableName() + "_" + jn.Right.GetTableName()
+// NeedsTransaction implements the Primitive interface
+func (jn *Join) NeedsTransaction() bool {
+	return jn.Right.NeedsTransaction() || jn.Left.NeedsTransaction()
 }
 
 func combineVars(bv1, bv2 map[string]*querypb.BindVariable) map[string]*querypb.BindVariable {
 	out := make(map[string]*querypb.BindVariable)
-	for k, v := range bv1 {
-		out[k] = v
-	}
-	for k, v := range bv2 {
-		out[k] = v
-	}
+	maps.Copy(out, bv1)
+	maps.Copy(out, bv2)
 	return out
+}
+
+func (jn *Join) description() PrimitiveDescription {
+	other := map[string]any{
+		"JoinColumnIndexes": jn.joinColsDescription(),
+	}
+	if len(jn.Vars) > 0 {
+		other["JoinVars"] = orderedStringIntMap(jn.Vars)
+	}
+	return PrimitiveDescription{
+		OperatorType: "Join",
+		Variant:      jn.Opcode.String(),
+		Other:        other,
+	}
+}
+
+func (jn *Join) joinColsDescription() string {
+	var joinCols []string
+	for _, col := range jn.Cols {
+		if col < 0 {
+			joinCols = append(joinCols, fmt.Sprintf("L:%d", -col-1))
+		} else {
+			joinCols = append(joinCols, fmt.Sprintf("R:%d", col-1))
+		}
+	}
+	joinColTxt := strings.Join(joinCols, ",")
+	return joinColTxt
 }

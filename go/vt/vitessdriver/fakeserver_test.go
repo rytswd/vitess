@@ -17,32 +17,42 @@ limitations under the License.
 package vitessdriver
 
 import (
-	"errors"
+	"context"
 	"fmt"
 	"reflect"
 
-	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
+	"google.golang.org/protobuf/proto"
 
 	"vitess.io/vitess/go/sqltypes"
-	"vitess.io/vitess/go/vt/vtgate/vtgateservice"
-
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	vtgatepb "vitess.io/vitess/go/vt/proto/vtgate"
+	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/vtgate/vtgateservice"
 )
 
 // fakeVTGateService has the server side of this fake
-type fakeVTGateService struct {
-}
+type (
+	fakeVTGateService struct {
+		execMap map[string]execMapResponse
+	}
 
-// queryExecute contains all the fields we use to test Execute
-type queryExecute struct {
-	SQL           string
-	BindVariables map[string]*querypb.BindVariable
-	Session       *vtgatepb.Session
-}
+	execMapResponse struct {
+		execQuery   *queryExecute
+		paramsCount uint16
+		result      *sqltypes.Result
+		session     *vtgatepb.Session
+		err         error
+	}
+
+	// queryExecute contains all the fields we use to test Execute
+	queryExecute struct {
+		SQL           string
+		BindVariables map[string]*querypb.BindVariable
+		Session       *vtgatepb.Session
+	}
+)
 
 func (q *queryExecute) Equal(q2 *queryExecute) bool {
 	return q.SQL == q2.SQL &&
@@ -51,8 +61,15 @@ func (q *queryExecute) Equal(q2 *queryExecute) bool {
 }
 
 // Execute is part of the VTGateService interface
-func (f *fakeVTGateService) Execute(ctx context.Context, session *vtgatepb.Session, sql string, bindVariables map[string]*querypb.BindVariable) (*vtgatepb.Session, *sqltypes.Result, error) {
-	execCase, ok := execMap[sql]
+func (f *fakeVTGateService) Execute(
+	ctx context.Context,
+	mysqlCtx vtgateservice.MySQLConnection,
+	session *vtgatepb.Session,
+	sql string,
+	bindVariables map[string]*querypb.BindVariable,
+	prepared bool,
+) (*vtgatepb.Session, *sqltypes.Result, error) {
+	execCase, ok := f.execMap[sql]
 	if !ok {
 		return session, nil, fmt.Errorf("no match for: %s", sql)
 	}
@@ -65,7 +82,8 @@ func (f *fakeVTGateService) Execute(ctx context.Context, session *vtgatepb.Sessi
 		return session, nil, fmt.Errorf("Execute request mismatch: got %+v, want %+v", query, execCase.execQuery)
 	}
 	if execCase.session != nil {
-		*session = *execCase.session
+		proto.Reset(session)
+		proto.Merge(session, execCase.session)
 	}
 	return session, execCase.result, nil
 }
@@ -73,7 +91,7 @@ func (f *fakeVTGateService) Execute(ctx context.Context, session *vtgatepb.Sessi
 // ExecuteBatch is part of the VTGateService interface
 func (f *fakeVTGateService) ExecuteBatch(ctx context.Context, session *vtgatepb.Session, sql []string, bindVariables []map[string]*querypb.BindVariable) (*vtgatepb.Session, []sqltypes.QueryResponse, error) {
 	if len(sql) == 1 {
-		execCase, ok := execMap[sql[0]]
+		execCase, ok := f.execMap[sql[0]]
 		if !ok {
 			return session, nil, fmt.Errorf("no match for: %s", sql)
 		}
@@ -89,7 +107,8 @@ func (f *fakeVTGateService) ExecuteBatch(ctx context.Context, session *vtgatepb.
 			return session, nil, fmt.Errorf("Execute request mismatch: got %+v, want %+v", query, execCase.execQuery)
 		}
 		if execCase.session != nil {
-			*session = *execCase.session
+			proto.Reset(session)
+			proto.Merge(session, execCase.session)
 		}
 		return session, []sqltypes.QueryResponse{
 			{QueryResult: execCase.result},
@@ -99,10 +118,10 @@ func (f *fakeVTGateService) ExecuteBatch(ctx context.Context, session *vtgatepb.
 }
 
 // StreamExecute is part of the VTGateService interface
-func (f *fakeVTGateService) StreamExecute(ctx context.Context, session *vtgatepb.Session, sql string, bindVariables map[string]*querypb.BindVariable, callback func(*sqltypes.Result) error) error {
-	execCase, ok := execMap[sql]
+func (f *fakeVTGateService) StreamExecute(ctx context.Context, mysqlCtx vtgateservice.MySQLConnection, session *vtgatepb.Session, sql string, bindVariables map[string]*querypb.BindVariable, callback func(*sqltypes.Result) error) (*vtgatepb.Session, error) {
+	execCase, ok := f.execMap[sql]
 	if !ok {
-		return fmt.Errorf("no match for: %s", sql)
+		return session, fmt.Errorf("no match for: %s", sql)
 	}
 	query := &queryExecute{
 		SQL:           sql,
@@ -110,139 +129,90 @@ func (f *fakeVTGateService) StreamExecute(ctx context.Context, session *vtgatepb
 		Session:       session,
 	}
 	if !query.Equal(execCase.execQuery) {
-		return fmt.Errorf("request mismatch: got %+v, want %+v", query, execCase.execQuery)
+		return session, fmt.Errorf("request mismatch: got %+v, want %+v", query, execCase.execQuery)
 	}
 	if execCase.result != nil {
 		result := &sqltypes.Result{
 			Fields: execCase.result.Fields,
 		}
 		if err := callback(result); err != nil {
-			return err
+			return execCase.session, err
 		}
 		for _, row := range execCase.result.Rows {
 			result := &sqltypes.Result{
 				Rows: [][]sqltypes.Value{row},
 			}
 			if err := callback(result); err != nil {
-				return err
+				return execCase.session, err
 			}
 		}
 	}
-	return nil
+	return execCase.session, nil
 }
 
-// ExecuteShards is part of the VTGateService interface
-func (f *fakeVTGateService) ExecuteShards(ctx context.Context, sql string, bindVariables map[string]*querypb.BindVariable, keyspace string, shards []string, tabletType topodatapb.TabletType, session *vtgatepb.Session, notInTransaction bool, options *querypb.ExecuteOptions) (*sqltypes.Result, error) {
-	return nil, nil
-}
-
-// ExecuteKeyspaceIds is part of the VTGateService interface
-func (f *fakeVTGateService) ExecuteKeyspaceIds(ctx context.Context, sql string, bindVariables map[string]*querypb.BindVariable, keyspace string, keyspaceIds [][]byte, tabletType topodatapb.TabletType, session *vtgatepb.Session, notInTransaction bool, options *querypb.ExecuteOptions) (*sqltypes.Result, error) {
-	return nil, nil
-}
-
-// ExecuteKeyRanges is part of the VTGateService interface
-func (f *fakeVTGateService) ExecuteKeyRanges(ctx context.Context, sql string, bindVariables map[string]*querypb.BindVariable, keyspace string, keyRanges []*topodatapb.KeyRange, tabletType topodatapb.TabletType, session *vtgatepb.Session, notInTransaction bool, options *querypb.ExecuteOptions) (*sqltypes.Result, error) {
-	return nil, nil
-}
-
-// ExecuteEntityIds is part of the VTGateService interface
-func (f *fakeVTGateService) ExecuteEntityIds(ctx context.Context, sql string, bindVariables map[string]*querypb.BindVariable, keyspace string, entityColumnName string, entityKeyspaceIDs []*vtgatepb.ExecuteEntityIdsRequest_EntityId, tabletType topodatapb.TabletType, session *vtgatepb.Session, notInTransaction bool, options *querypb.ExecuteOptions) (*sqltypes.Result, error) {
-	return nil, nil
-}
-
-// ExecuteBatchShard is part of the VTGateService interface
-func (f *fakeVTGateService) ExecuteBatchShards(ctx context.Context, queries []*vtgatepb.BoundShardQuery, tabletType topodatapb.TabletType, asTransaction bool, session *vtgatepb.Session, options *querypb.ExecuteOptions) ([]sqltypes.Result, error) {
-	return nil, nil
-}
-
-// ExecuteBatchKeyspaceIds is part of the VTGateService interface
-func (f *fakeVTGateService) ExecuteBatchKeyspaceIds(ctx context.Context, queries []*vtgatepb.BoundKeyspaceIdQuery, tabletType topodatapb.TabletType, asTransaction bool, session *vtgatepb.Session, options *querypb.ExecuteOptions) ([]sqltypes.Result, error) {
-	return nil, nil
-}
-
-// StreamExecuteShards is part of the VTGateService interface
-func (f *fakeVTGateService) StreamExecuteShards(ctx context.Context, sql string, bindVariables map[string]*querypb.BindVariable, keyspace string, shards []string, tabletType topodatapb.TabletType, options *querypb.ExecuteOptions, callback func(*sqltypes.Result) error) error {
-	return nil
-}
-
-// StreamExecuteKeyspaceIds is part of the VTGateService interface
-func (f *fakeVTGateService) StreamExecuteKeyspaceIds(ctx context.Context, sql string, bindVariables map[string]*querypb.BindVariable, keyspace string, keyspaceIds [][]byte, tabletType topodatapb.TabletType, options *querypb.ExecuteOptions, callback func(*sqltypes.Result) error) error {
-	return nil
-}
-
-// StreamExecuteKeyRanges is part of the VTGateService interface
-func (f *fakeVTGateService) StreamExecuteKeyRanges(ctx context.Context, sql string, bindVariables map[string]*querypb.BindVariable, keyspace string, keyRanges []*topodatapb.KeyRange, tabletType topodatapb.TabletType, options *querypb.ExecuteOptions, callback func(*sqltypes.Result) error) error {
-	return nil
-}
-
-// Begin is part of the VTGateService interface
-func (f *fakeVTGateService) Begin(ctx context.Context, singledb bool) (*vtgatepb.Session, error) {
-	return session1, nil
-}
-
-// Commit is part of the VTGateService interface
-func (f *fakeVTGateService) Commit(ctx context.Context, twopc bool, session *vtgatepb.Session) error {
-	if !proto.Equal(session, session2) {
-		return errors.New("commit: session mismatch")
+// Prepare is part of the VTGateService interface
+func (f *fakeVTGateService) Prepare(ctx context.Context, session *vtgatepb.Session, sql string) (*vtgatepb.Session, []*querypb.Field, uint16, error) {
+	execCase, ok := f.execMap[sql]
+	if !ok {
+		return session, nil, 0, fmt.Errorf("no match for: %s", sql)
 	}
-	return nil
-}
-
-// Rollback is part of the VTGateService interface
-func (f *fakeVTGateService) Rollback(ctx context.Context, session *vtgatepb.Session) error {
-	if !proto.Equal(session, session2) {
-		return errors.New("rollback: session mismatch")
+	query := &queryExecute{
+		SQL:     sql,
+		Session: session,
 	}
-	return nil
-}
-
-// ResolveTransaction is part of the VTGateService interface
-func (f *fakeVTGateService) ResolveTransaction(ctx context.Context, dtid string) error {
-	if dtid != dtid2 {
-		return errors.New("ResolveTransaction: dtid mismatch")
+	if !query.Equal(execCase.execQuery) {
+		return session, nil, 0, fmt.Errorf("Prepare request mismatch: got %+v, want %+v", query, execCase.execQuery)
 	}
+	if execCase.session != nil {
+		proto.Reset(session)
+		proto.Merge(session, execCase.session)
+	}
+	return session, execCase.result.Fields, execCase.paramsCount, nil
+}
+
+func (f *fakeVTGateService) CloseSession(ctx context.Context, session *vtgatepb.Session) error {
 	return nil
 }
 
-func (f *fakeVTGateService) MessageStream(ctx context.Context, keyspace string, shard string, keyRange *topodatapb.KeyRange, name string, callback func(*sqltypes.Result) error) error {
+func (f *fakeVTGateService) VStream(ctx context.Context, tabletType topodatapb.TabletType, vgtid *binlogdatapb.VGtid, filter *binlogdatapb.Filter, flags *vtgatepb.VStreamFlags, send func([]*binlogdatapb.VEvent) error) error {
 	return nil
 }
 
-func (f *fakeVTGateService) MessageAck(ctx context.Context, keyspace string, name string, ids []*querypb.Value) (int64, error) {
-	return 0, nil
+// ExecuteMulti is part of the VTGateService interface
+func (f *fakeVTGateService) ExecuteMulti(ctx context.Context, mysqlCtx vtgateservice.MySQLConnection, session *vtgatepb.Session, sqlString string) (newSession *vtgatepb.Session, qrs []*sqltypes.Result, err error) {
+	queries, err := sqlparser.NewTestParser().SplitStatementToPieces(sqlString)
+	if err != nil {
+		return session, nil, err
+	}
+	var result *sqltypes.Result
+	for _, query := range queries {
+		session, result, err = f.Execute(ctx, mysqlCtx, session, query, nil, false)
+		if err != nil {
+			return session, qrs, err
+		}
+		qrs = append(qrs, result)
+	}
+	return session, qrs, nil
 }
 
-func (f *fakeVTGateService) MessageAckKeyspaceIds(ctx context.Context, keyspace string, name string, idKeyspaceIDs []*vtgatepb.IdKeyspaceId) (int64, error) {
-	return 0, nil
-}
-
-// SplitQuery is part of the VTGateService interface
-func (f *fakeVTGateService) SplitQuery(
-	ctx context.Context,
-	keyspace string,
-	sql string,
-	bindVariables map[string]*querypb.BindVariable,
-	splitColumns []string,
-	splitCount int64,
-	numRowsPerQueryPart int64,
-	algorithm querypb.SplitQueryRequest_Algorithm,
-) ([]*vtgatepb.SplitQueryResponse_Part, error) {
-	return nil, nil
-}
-
-// GetSrvKeyspace is part of the VTGateService interface
-func (f *fakeVTGateService) GetSrvKeyspace(ctx context.Context, keyspace string) (*topodatapb.SrvKeyspace, error) {
-	return &topodatapb.SrvKeyspace{}, nil
-}
-
-func (f *fakeVTGateService) VStream(ctx context.Context, tabletType topodatapb.TabletType, vgtid *binlogdatapb.VGtid, filter *binlogdatapb.Filter, send func([]*binlogdatapb.VEvent) error) error {
-	return nil
-}
-
-// UpdateStream is part of the VTGateService interface
-func (f *fakeVTGateService) UpdateStream(ctx context.Context, keyspace string, shard string, keyRange *topodatapb.KeyRange, tabletType topodatapb.TabletType, timestamp int64, event *querypb.EventToken, callback func(*querypb.StreamEvent, int64) error) error {
-	return nil
+// StreamExecuteMulti is part of the VTGateService interface
+func (f *fakeVTGateService) StreamExecuteMulti(ctx context.Context, mysqlCtx vtgateservice.MySQLConnection, session *vtgatepb.Session, sqlString string, callback func(qr sqltypes.QueryResponse, more bool, firstPacket bool) error) (*vtgatepb.Session, error) {
+	queries, err := sqlparser.NewTestParser().SplitStatementToPieces(sqlString)
+	if err != nil {
+		return session, err
+	}
+	for idx, query := range queries {
+		firstPacket := true
+		session, err = f.StreamExecute(ctx, mysqlCtx, session, query, nil, func(result *sqltypes.Result) error {
+			err = callback(sqltypes.QueryResponse{QueryResult: result}, idx < len(queries)-1, firstPacket)
+			firstPacket = false
+			return err
+		})
+		if err != nil {
+			return session, err
+		}
+	}
+	return session, nil
 }
 
 // HandlePanic is part of the VTGateService interface
@@ -254,86 +224,127 @@ func (f *fakeVTGateService) HandlePanic(err *error) {
 
 // CreateFakeServer returns the fake server for the tests
 func CreateFakeServer() vtgateservice.VTGateService {
-	return &fakeVTGateService{}
+	return &fakeVTGateService{
+		execMap: createExecMap(),
+	}
 }
 
-var execMap = map[string]struct {
-	execQuery *queryExecute
-	result    *sqltypes.Result
-	session   *vtgatepb.Session
-	err       error
-}{
-	"request": {
-		execQuery: &queryExecute{
-			SQL: "request",
-			BindVariables: map[string]*querypb.BindVariable{
-				"v1": sqltypes.Int64BindVariable(0),
+func createExecMap() map[string]execMapResponse {
+	return map[string]execMapResponse{
+		"request": {
+			execQuery: &queryExecute{
+				SQL: "request",
+				BindVariables: map[string]*querypb.BindVariable{
+					"v1": sqltypes.Int64BindVariable(0),
+				},
+				Session: &vtgatepb.Session{
+					TargetString: "@rdonly",
+					Autocommit:   true,
+				},
 			},
-			Session: &vtgatepb.Session{
+			result:      &result1,
+			paramsCount: 1,
+			session:     nil,
+		},
+		"requestDates": {
+			execQuery: &queryExecute{
+				SQL: "requestDates",
+				BindVariables: map[string]*querypb.BindVariable{
+					"v1": sqltypes.Int64BindVariable(0),
+				},
+				Session: &vtgatepb.Session{
+					TargetString: "@rdonly",
+					Autocommit:   true,
+				},
+			},
+			result:      &result2,
+			paramsCount: 1,
+			session:     nil,
+		},
+		"txRequest": {
+			execQuery: &queryExecute{
+				SQL: "txRequest",
+				BindVariables: map[string]*querypb.BindVariable{
+					"v1": sqltypes.Int64BindVariable(0),
+				},
+				Session: session1,
+			},
+			result:      &sqltypes.Result{},
+			paramsCount: 1,
+			session:     session2,
+		},
+		"distributedTxRequest": {
+			execQuery: &queryExecute{
+				SQL: "distributedTxRequest",
+				BindVariables: map[string]*querypb.BindVariable{
+					"v1": sqltypes.Int64BindVariable(1),
+				},
+				Session: &vtgatepb.Session{
+					InTransaction: true,
+					ShardSessions: []*vtgatepb.Session_ShardSession{
+						{
+							Target: &querypb.Target{
+								Keyspace:   "ks",
+								Shard:      "1",
+								TabletType: topodatapb.TabletType_PRIMARY,
+							},
+							TransactionId: 1,
+						},
+					},
+					TargetString: "@rdonly",
+				},
+			},
+			result:      &sqltypes.Result{},
+			paramsCount: 1,
+			session:     session2,
+		},
+		"begin": {
+			execQuery: &queryExecute{
+				SQL: "begin",
+				Session: &vtgatepb.Session{
+					TargetString: "@primary",
+					Autocommit:   true,
+				},
+			},
+			result:  &sqltypes.Result{},
+			session: session1,
+		},
+		"commit": {
+			execQuery: &queryExecute{
+				SQL:     "commit",
+				Session: session2,
+			},
+			result: &sqltypes.Result{},
+			session: &vtgatepb.Session{
+				TargetString: "@primary",
+				Autocommit:   true,
+			},
+		},
+		"rollback": {
+			execQuery: &queryExecute{
+				SQL:     "rollback",
+				Session: session2,
+			},
+			result: &sqltypes.Result{},
+			session: &vtgatepb.Session{
+				TargetString: "@primary",
+			},
+		},
+		"use @rdonly": {
+			execQuery: &queryExecute{
+				SQL: "use @rdonly",
+				Session: &vtgatepb.Session{
+					TargetString: "@primary",
+					Autocommit:   true,
+				},
+			},
+			result: &sqltypes.Result{},
+			session: &vtgatepb.Session{
 				TargetString: "@rdonly",
-				Autocommit:   true,
+				SessionUUID:  "1111",
 			},
 		},
-		result:  &result1,
-		session: nil,
-	},
-	"requestDates": {
-		execQuery: &queryExecute{
-			SQL: "requestDates",
-			BindVariables: map[string]*querypb.BindVariable{
-				"v1": sqltypes.Int64BindVariable(0),
-			},
-			Session: &vtgatepb.Session{
-				TargetString: "@rdonly",
-				Autocommit:   true,
-			},
-		},
-		result:  &result2,
-		session: nil,
-	},
-	"txRequest": {
-		execQuery: &queryExecute{
-			SQL: "txRequest",
-			BindVariables: map[string]*querypb.BindVariable{
-				"v1": sqltypes.Int64BindVariable(0),
-			},
-			Session: session1,
-		},
-		result:  &sqltypes.Result{},
-		session: session2,
-	},
-	"begin": {
-		execQuery: &queryExecute{
-			SQL: "begin",
-			Session: &vtgatepb.Session{
-				TargetString: "@master",
-				Autocommit:   true,
-			},
-		},
-		result:  &sqltypes.Result{},
-		session: session1,
-	},
-	"commit": {
-		execQuery: &queryExecute{
-			SQL:     "commit",
-			Session: session2,
-		},
-		result: &sqltypes.Result{},
-		session: &vtgatepb.Session{
-			TargetString: "@master",
-			Autocommit:   true,
-		},
-	},
-	"rollback": {
-		execQuery: &queryExecute{
-			SQL:     "rollback",
-			Session: session2,
-		},
-		result: &sqltypes.Result{},
-		session: &vtgatepb.Session{
-			TargetString: "@master",
-		},
-	},
+	}
 }
 
 var result1 = sqltypes.Result{
@@ -398,12 +409,10 @@ var session2 = &vtgatepb.Session{
 			Target: &querypb.Target{
 				Keyspace:   "ks",
 				Shard:      "1",
-				TabletType: topodatapb.TabletType_MASTER,
+				TabletType: topodatapb.TabletType_PRIMARY,
 			},
 			TransactionId: 1,
 		},
 	},
 	TargetString: "@rdonly",
 }
-
-var dtid2 = "aa"

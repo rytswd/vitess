@@ -28,7 +28,7 @@ import (
 type timeoutThread struct {
 	sb *shardBuffer
 	// maxDuration enforces that a failover stops after
-	// -buffer_max_failover_duration at most.
+	// -buffer-max-failover-duration at most.
 	maxDuration *time.Timer
 	// stopChan will be closed when the thread should stop e.g. before the drain.
 	stopChan chan struct{}
@@ -43,10 +43,10 @@ type timeoutThread struct {
 	queueNotEmpty chan struct{}
 }
 
-func newTimeoutThread(sb *shardBuffer) *timeoutThread {
+func newTimeoutThread(sb *shardBuffer, maxFailoverDuration time.Duration) *timeoutThread {
 	return &timeoutThread{
 		sb:            sb,
-		maxDuration:   time.NewTimer(*maxFailoverDuration),
+		maxDuration:   time.NewTimer(maxFailoverDuration),
 		stopChan:      make(chan struct{}),
 		queueNotEmpty: make(chan struct{}),
 	}

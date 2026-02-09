@@ -17,7 +17,8 @@ limitations under the License.
 package memorytopo
 
 import (
-	"golang.org/x/net/context"
+	"context"
+
 	"vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/vterrors"
 
@@ -26,17 +27,23 @@ import (
 
 // ListDir is part of the topo.Conn interface.
 func (c *Conn) ListDir(ctx context.Context, dirPath string, full bool) ([]topo.DirEntry, error) {
+	c.factory.callstats.Add([]string{"ListDir"}, 1)
+
+	if err := c.dial(ctx); err != nil {
+		return nil, err
+	}
+
 	c.factory.mu.Lock()
 	defer c.factory.mu.Unlock()
 
 	if c.factory.err != nil {
 		return nil, c.factory.err
 	}
-
-	isRoot := false
-	if dirPath == "" || dirPath == "/" {
-		isRoot = true
+	if err := c.factory.getOperationError(ListDir, dirPath); err != nil {
+		return nil, err
 	}
+
+	isRoot := dirPath == "" || dirPath == "/"
 
 	// Get the node to list.
 	n := c.factory.nodeByPath(c.cell, dirPath)

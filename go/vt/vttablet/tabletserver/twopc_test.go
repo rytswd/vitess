@@ -22,22 +22,24 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/net/context"
+	"github.com/stretchr/testify/require"
 
 	"vitess.io/vitess/go/sqltypes"
-
+	"vitess.io/vitess/go/test/utils"
 	querypb "vitess.io/vitess/go/vt/proto/query"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/tx"
 )
 
 func TestReadAllRedo(t *testing.T) {
+	ctx := t.Context()
 	// Reuse code from tx_executor_test.
-	_, tsv, db := newTestTxExecutor(t)
-	defer db.Close()
-	defer tsv.StopService()
-	tpc := tsv.te.twoPC
-	ctx := context.Background()
+	_, tsv, db, closer := newTestTxExecutor(t, ctx)
+	defer closer()
 
-	conn, err := tsv.qe.conns.Get(ctx)
+	tpc := tsv.te.twoPC
+
+	conn, err := tsv.qe.conns.Get(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +50,7 @@ func TestReadAllRedo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var want []*PreparedTx
+	var want []*tx.PreparedTx
 	if !reflect.DeepEqual(prepared, want) {
 		t.Errorf("ReadAllRedo: %s, want %s", jsonStr(prepared), jsonStr(want))
 	}
@@ -62,19 +64,21 @@ func TestReadAllRedo(t *testing.T) {
 			{Type: sqltypes.Int64},
 			{Type: sqltypes.Int64},
 			{Type: sqltypes.VarChar},
+			{Type: sqltypes.Text},
 		},
 		Rows: [][]sqltypes.Value{{
 			sqltypes.NewVarBinary("dtid0"),
 			sqltypes.NewInt64(RedoStatePrepared),
 			sqltypes.NewVarBinary("1"),
 			sqltypes.NewVarBinary("stmt01"),
+			sqltypes.NULL,
 		}},
 	})
 	prepared, failed, err = tpc.ReadAllRedo(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want = []*PreparedTx{{
+	want = []*tx.PreparedTx{{
 		Dtid:    "dtid0",
 		Queries: []string{"stmt01"},
 		Time:    time.Unix(0, 1),
@@ -92,24 +96,27 @@ func TestReadAllRedo(t *testing.T) {
 			{Type: sqltypes.Int64},
 			{Type: sqltypes.Int64},
 			{Type: sqltypes.VarChar},
+			{Type: sqltypes.Text},
 		},
 		Rows: [][]sqltypes.Value{{
 			sqltypes.NewVarBinary("dtid0"),
 			sqltypes.NewInt64(RedoStatePrepared),
 			sqltypes.NewVarBinary("1"),
 			sqltypes.NewVarBinary("stmt01"),
+			sqltypes.NULL,
 		}, {
 			sqltypes.NewVarBinary("dtid0"),
 			sqltypes.NewInt64(RedoStatePrepared),
 			sqltypes.NewVarBinary("1"),
 			sqltypes.NewVarBinary("stmt02"),
+			sqltypes.NULL,
 		}},
 	})
 	prepared, failed, err = tpc.ReadAllRedo(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want = []*PreparedTx{{
+	want = []*tx.PreparedTx{{
 		Dtid:    "dtid0",
 		Queries: []string{"stmt01", "stmt02"},
 		Time:    time.Unix(0, 1),
@@ -127,29 +134,33 @@ func TestReadAllRedo(t *testing.T) {
 			{Type: sqltypes.Int64},
 			{Type: sqltypes.Int64},
 			{Type: sqltypes.VarChar},
+			{Type: sqltypes.Text},
 		},
 		Rows: [][]sqltypes.Value{{
 			sqltypes.NewVarBinary("dtid0"),
 			sqltypes.NewInt64(RedoStatePrepared),
 			sqltypes.NewVarBinary("1"),
 			sqltypes.NewVarBinary("stmt01"),
+			sqltypes.NULL,
 		}, {
 			sqltypes.NewVarBinary("dtid0"),
 			sqltypes.NewInt64(RedoStatePrepared),
 			sqltypes.NewVarBinary("1"),
 			sqltypes.NewVarBinary("stmt02"),
+			sqltypes.NULL,
 		}, {
 			sqltypes.NewVarBinary("dtid1"),
 			sqltypes.NewInt64(RedoStatePrepared),
 			sqltypes.NewVarBinary("1"),
 			sqltypes.NewVarBinary("stmt11"),
+			sqltypes.NULL,
 		}},
 	})
 	prepared, failed, err = tpc.ReadAllRedo(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want = []*PreparedTx{{
+	want = []*tx.PreparedTx{{
 		Dtid:    "dtid0",
 		Queries: []string{"stmt01", "stmt02"},
 		Time:    time.Unix(0, 1),
@@ -171,44 +182,51 @@ func TestReadAllRedo(t *testing.T) {
 			{Type: sqltypes.Int64},
 			{Type: sqltypes.Int64},
 			{Type: sqltypes.VarChar},
+			{Type: sqltypes.Text},
 		},
 		Rows: [][]sqltypes.Value{{
 			sqltypes.NewVarBinary("dtid0"),
 			sqltypes.NewInt64(RedoStatePrepared),
 			sqltypes.NewVarBinary("1"),
 			sqltypes.NewVarBinary("stmt01"),
+			sqltypes.NULL,
 		}, {
 			sqltypes.NewVarBinary("dtid0"),
 			sqltypes.NewInt64(RedoStatePrepared),
 			sqltypes.NewVarBinary("1"),
 			sqltypes.NewVarBinary("stmt02"),
+			sqltypes.NULL,
 		}, {
 			sqltypes.NewVarBinary("dtid1"),
-			sqltypes.NewVarBinary("Failed"),
+			sqltypes.NewInt64(RedoStateFailed),
 			sqltypes.NewVarBinary("1"),
 			sqltypes.NewVarBinary("stmt11"),
+			sqltypes.TestValue(sqltypes.Text, "error1"),
 		}, {
 			sqltypes.NewVarBinary("dtid2"),
-			sqltypes.NewVarBinary("Failed"),
+			sqltypes.NewInt64(RedoStateFailed),
 			sqltypes.NewVarBinary("1"),
 			sqltypes.NewVarBinary("stmt21"),
+			sqltypes.TestValue(sqltypes.Text, "error2"),
 		}, {
 			sqltypes.NewVarBinary("dtid2"),
-			sqltypes.NewVarBinary("Failed"),
+			sqltypes.NewInt64(RedoStateFailed),
 			sqltypes.NewVarBinary("1"),
 			sqltypes.NewVarBinary("stmt22"),
+			sqltypes.TestValue(sqltypes.Text, "error2"),
 		}, {
 			sqltypes.NewVarBinary("dtid3"),
 			sqltypes.NewInt64(RedoStatePrepared),
 			sqltypes.NewVarBinary("1"),
 			sqltypes.NewVarBinary("stmt31"),
+			sqltypes.NULL,
 		}},
 	})
 	prepared, failed, err = tpc.ReadAllRedo(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want = []*PreparedTx{{
+	want = []*tx.PreparedTx{{
 		Dtid:    "dtid0",
 		Queries: []string{"stmt01", "stmt02"},
 		Time:    time.Unix(0, 1),
@@ -217,31 +235,29 @@ func TestReadAllRedo(t *testing.T) {
 		Queries: []string{"stmt31"},
 		Time:    time.Unix(0, 1),
 	}}
-	if !reflect.DeepEqual(prepared, want) {
-		t.Errorf("ReadAllRedo: %s, want %s", jsonStr(prepared), jsonStr(want))
-	}
-	wantFailed := []*PreparedTx{{
+	utils.MustMatch(t, want, prepared)
+	wantFailed := []*tx.PreparedTx{{
 		Dtid:    "dtid1",
 		Queries: []string{"stmt11"},
 		Time:    time.Unix(0, 1),
+		Message: "error1",
 	}, {
 		Dtid:    "dtid2",
 		Queries: []string{"stmt21", "stmt22"},
 		Time:    time.Unix(0, 1),
+		Message: "error2",
 	}}
-	if !reflect.DeepEqual(failed, wantFailed) {
-		t.Errorf("ReadAllRedo failed): %s, want %s", jsonStr(failed), jsonStr(wantFailed))
-	}
+	utils.MustMatch(t, wantFailed, failed)
 }
 
 func TestReadAllTransactions(t *testing.T) {
-	_, tsv, db := newTestTxExecutor(t)
-	defer db.Close()
-	defer tsv.StopService()
-	tpc := tsv.te.twoPC
-	ctx := context.Background()
+	ctx := t.Context()
+	_, tsv, db, closer := newTestTxExecutor(t, ctx)
+	defer closer()
 
-	conn, err := tsv.qe.conns.Get(ctx)
+	tpc := tsv.te.twoPC
+
+	conn, err := tsv.qe.conns.Get(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,7 +268,7 @@ func TestReadAllTransactions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var want []*DistributedTx
+	var want []*tx.DistributedTx
 	if !reflect.DeepEqual(distributed, want) {
 		t.Errorf("ReadAllTransactions: %s, want %s", jsonStr(distributed), jsonStr(want))
 	}
@@ -277,7 +293,7 @@ func TestReadAllTransactions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want = []*DistributedTx{{
+	want = []*tx.DistributedTx{{
 		Dtid:    "dtid0",
 		State:   "PREPARE",
 		Created: time.Unix(0, 1),
@@ -316,7 +332,7 @@ func TestReadAllTransactions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want = []*DistributedTx{{
+	want = []*tx.DistributedTx{{
 		Dtid:    "dtid0",
 		State:   "PREPARE",
 		Created: time.Unix(0, 1),
@@ -364,7 +380,7 @@ func TestReadAllTransactions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want = []*DistributedTx{{
+	want = []*tx.DistributedTx{{
 		Dtid:    "dtid0",
 		State:   "PREPARE",
 		Created: time.Unix(0, 1),
@@ -389,7 +405,83 @@ func TestReadAllTransactions(t *testing.T) {
 	}
 }
 
-func jsonStr(v interface{}) string {
+func jsonStr(v any) string {
 	out, _ := json.Marshal(v)
 	return string(out)
+}
+
+// TestUnresolvedTransactions tests the retrieval of unresolved transactions from the database and
+// providing the output in proto format.
+func TestUnresolvedTransactions(t *testing.T) {
+	ctx := t.Context()
+	_, tsv, db, closer := newTestTxExecutor(t, ctx)
+	defer closer()
+
+	conn, err := tsv.qe.conns.Get(ctx, nil)
+	require.NoError(t, err)
+	defer conn.Recycle()
+
+	tcases := []struct {
+		name         string
+		unresolvedTx *sqltypes.Result
+		expectedTx   []*querypb.TransactionMetadata
+	}{{
+		name:         "no unresolved transactions",
+		unresolvedTx: &sqltypes.Result{},
+	}, {
+		name: "one unresolved transaction",
+		unresolvedTx: sqltypes.MakeTestResult(
+			sqltypes.MakeTestFields("dtid|state|time_created|keyspace|shard",
+				"VARBINARY|INT64|INT64|VARCHAR|VARCHAR"),
+			"dtid0|1|2|ks01|shard01",
+			"dtid0|1|2|ks01|shard02"),
+		expectedTx: []*querypb.TransactionMetadata{{
+			Dtid:        "dtid0",
+			State:       querypb.TransactionState_PREPARE,
+			TimeCreated: 2,
+			Participants: []*querypb.Target{
+				{Keyspace: "ks01", Shard: "shard01", TabletType: topodatapb.TabletType_PRIMARY},
+				{Keyspace: "ks01", Shard: "shard02", TabletType: topodatapb.TabletType_PRIMARY},
+			},
+		}},
+	}, {
+		name: "two unresolved transaction",
+		unresolvedTx: sqltypes.MakeTestResult(
+			sqltypes.MakeTestFields("dtid|state|time_created|keyspace|shard",
+				"VARBINARY|INT64|INT64|VARCHAR|VARCHAR"),
+			"dtid0|3|1|ks01|shard01",
+			"dtid0|3|1|ks01|shard02",
+			"dtid1|2|2|ks02|shard03",
+			"dtid1|2|2|ks01|shard02"),
+		expectedTx: []*querypb.TransactionMetadata{
+			{
+				Dtid:        "dtid0",
+				State:       querypb.TransactionState_COMMIT,
+				TimeCreated: 1,
+				Participants: []*querypb.Target{
+					{Keyspace: "ks01", Shard: "shard01", TabletType: topodatapb.TabletType_PRIMARY},
+					{Keyspace: "ks01", Shard: "shard02", TabletType: topodatapb.TabletType_PRIMARY},
+				},
+			}, {
+				Dtid:        "dtid1",
+				TimeCreated: 2,
+				State:       querypb.TransactionState_ROLLBACK,
+				Participants: []*querypb.Target{
+					{Keyspace: "ks02", Shard: "shard03", TabletType: topodatapb.TabletType_PRIMARY},
+					{Keyspace: "ks01", Shard: "shard02", TabletType: topodatapb.TabletType_PRIMARY},
+				},
+			},
+		},
+	}}
+
+	tpc := tsv.te.twoPC
+	txQueryPattern := `.*time_created < 1000.*`
+	for _, tcase := range tcases {
+		t.Run(tcase.name, func(t *testing.T) {
+			db.AddQueryPattern(txQueryPattern, tcase.unresolvedTx)
+			distributed, err := tpc.UnresolvedTransactions(ctx, time.UnixMicro(1))
+			require.NoError(t, err)
+			utils.MustMatch(t, tcase.expectedTx, distributed)
+		})
+	}
 }

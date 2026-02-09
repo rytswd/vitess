@@ -18,26 +18,43 @@ package mysql
 
 import (
 	"encoding/binary"
-	"fmt"
-	"strconv"
+	"errors"
+
+	"vitess.io/vitess/go/mysql/replication"
 )
 
 // filePosBinlogEvent wraps a raw packet buffer and provides methods to examine
 // it by implementing BinlogEvent. Some methods are pulled in from binlogEvent.
 type filePosBinlogEvent struct {
 	binlogEvent
+	semiSyncAckRequested bool
 }
 
-func (*filePosBinlogEvent) GTID(BinlogFormat) (GTID, bool, error) {
-	return nil, false, nil
+// newFilePosBinlogEventWithSemiSyncInfo creates a BinlogEvent from given byte array
+func newFilePosBinlogEventWithSemiSyncInfo(buf []byte, semiSyncAckRequested bool) *filePosBinlogEvent {
+	return &filePosBinlogEvent{binlogEvent: binlogEvent(buf), semiSyncAckRequested: semiSyncAckRequested}
+}
+
+// newFilePosBinlogEvent creates a BinlogEvent from given byte array
+func newFilePosBinlogEvent(buf []byte) *filePosBinlogEvent {
+	return &filePosBinlogEvent{binlogEvent: binlogEvent(buf)}
+}
+
+func (*filePosBinlogEvent) GTID(BinlogFormat) (replication.GTID, bool, int64, int64, error) {
+	return nil, false, 0, 0, nil
+}
+
+// IsSemiSyncAckRequested implements BinlogEvent.IsSemiSyncAckRequested().
+func (ev *filePosBinlogEvent) IsSemiSyncAckRequested() bool {
+	return ev.semiSyncAckRequested
 }
 
 func (*filePosBinlogEvent) IsGTID() bool {
 	return false
 }
 
-func (*filePosBinlogEvent) PreviousGTIDs(BinlogFormat) (Position, error) {
-	return Position{}, fmt.Errorf("filePos should not provide PREVIOUS_GTIDS_EVENT events")
+func (*filePosBinlogEvent) PreviousGTIDs(BinlogFormat) (replication.Position, error) {
+	return replication.Position{}, errors.New("filePos should not provide PREVIOUS_GTIDS_EVENT events")
 }
 
 // StripChecksum implements BinlogEvent.StripChecksum().
@@ -52,26 +69,28 @@ func (ev *filePosBinlogEvent) StripChecksum(f BinlogFormat) (BinlogEvent, []byte
 		length := len(data)
 		checksum := data[length-4:]
 		data = data[:length-4]
-		return &filePosBinlogEvent{binlogEvent: binlogEvent(data)}, checksum, nil
+		return newFilePosBinlogEvent(data), checksum, nil
 	}
 }
 
 // nextPosition returns the next file position of the binlog.
 // If no information is available, it returns 0.
-func (ev *filePosBinlogEvent) nextPosition(f BinlogFormat) int {
+func (ev *filePosBinlogEvent) nextPosition(f BinlogFormat) uint64 {
 	if f.HeaderLength <= 13 {
 		// Dead code. This is just a failsafe.
 		return 0
 	}
-	return int(binary.LittleEndian.Uint32(ev.Bytes()[13:17]))
+	// The header only uses 4 bytes for the next_position.
+	return uint64(binary.LittleEndian.Uint32(ev.Bytes()[13:17]))
 }
 
 // rotate implements BinlogEvent.Rotate().
 //
 // Expected format (L = total length of event data):
-//   # bytes  field
-//   8        position
-//   8:L      file
+//
+//	# bytes  field
+//	8        position
+//	8:L      file
 func (ev *filePosBinlogEvent) rotate(f BinlogFormat) (int, string) {
 	data := ev.Bytes()[f.HeaderLength:]
 	pos := binary.LittleEndian.Uint64(data[0:8])
@@ -106,13 +125,23 @@ func (ev filePosQueryEvent) Query(BinlogFormat) (Query, error) {
 	}, nil
 }
 
-//----------------------------------------------------------------------------
+func (ev filePosQueryEvent) StripChecksum(f BinlogFormat) (BinlogEvent, []byte, error) {
+	return ev, nil, nil
+}
 
-var _ BinlogEvent = filePosFakeEvent{}
+func (ev filePosQueryEvent) Bytes() []byte {
+	return []byte{}
+}
+
+//----------------------------------------------------------------------------
 
 // filePosFakeEvent is the base class for fake events.
 type filePosFakeEvent struct {
 	timestamp uint32
+}
+
+func (ev filePosFakeEvent) NextPosition() uint64 {
+	return 0
 }
 
 func (ev filePosFakeEvent) IsValid() bool {
@@ -128,6 +157,14 @@ func (ev filePosFakeEvent) IsQuery() bool {
 }
 
 func (ev filePosFakeEvent) IsXID() bool {
+	return false
+}
+
+func (ev filePosFakeEvent) IsStop() bool {
+	return false
+}
+
+func (ev filePosFakeEvent) IsSemiSyncAckRequested() bool {
 	return false
 }
 
@@ -151,6 +188,10 @@ func (ev filePosFakeEvent) IsPreviousGTIDs() bool {
 	return false
 }
 
+func (ev filePosFakeEvent) IsHeartbeat() bool {
+	return false
+}
+
 func (ev filePosFakeEvent) IsTableMap() bool {
 	return false
 }
@@ -163,6 +204,10 @@ func (ev filePosFakeEvent) IsUpdateRows() bool {
 	return false
 }
 
+func (ev filePosFakeEvent) IsPartialUpdateRows() bool {
+	return false
+}
+
 func (ev filePosFakeEvent) IsDeleteRows() bool {
 	return false
 }
@@ -171,12 +216,16 @@ func (ev filePosFakeEvent) Timestamp() uint32 {
 	return ev.timestamp
 }
 
+func (ev filePosFakeEvent) ServerID() uint32 {
+	return 1
+}
+
 func (ev filePosFakeEvent) Format() (BinlogFormat, error) {
 	return BinlogFormat{}, nil
 }
 
-func (ev filePosFakeEvent) GTID(BinlogFormat) (GTID, bool, error) {
-	return nil, false, nil
+func (ev filePosFakeEvent) GTID(BinlogFormat) (replication.GTID, bool, int64, int64, error) {
+	return nil, false, 0, 0, nil
 }
 
 func (ev filePosFakeEvent) Query(BinlogFormat) (Query, error) {
@@ -191,8 +240,8 @@ func (ev filePosFakeEvent) Rand(BinlogFormat) (uint64, uint64, error) {
 	return 0, 0, nil
 }
 
-func (ev filePosFakeEvent) PreviousGTIDs(BinlogFormat) (Position, error) {
-	return Position{}, nil
+func (ev filePosFakeEvent) PreviousGTIDs(BinlogFormat) (replication.Position, error) {
+	return replication.Position{}, nil
 }
 
 func (ev filePosFakeEvent) TableID(BinlogFormat) uint64 {
@@ -207,12 +256,24 @@ func (ev filePosFakeEvent) Rows(BinlogFormat, *TableMap) (Rows, error) {
 	return Rows{}, nil
 }
 
-func (ev filePosFakeEvent) StripChecksum(f BinlogFormat) (BinlogEvent, []byte, error) {
-	return ev, nil, nil
+func (ev filePosFakeEvent) TransactionPayload(BinlogFormat) (*TransactionPayload, error) {
+	return &TransactionPayload{}, nil
+}
+
+func (ev filePosFakeEvent) NextLogFile(BinlogFormat) (string, uint64, error) {
+	return "", 0, nil
 }
 
 func (ev filePosFakeEvent) IsPseudo() bool {
 	return false
+}
+
+func (ev filePosFakeEvent) IsTransactionPayload() bool {
+	return false
+}
+
+func (ev filePosFakeEvent) Bytes() []byte {
+	return []byte{}
 }
 
 //----------------------------------------------------------------------------
@@ -220,17 +281,17 @@ func (ev filePosFakeEvent) IsPseudo() bool {
 // filePosGTIDEvent is a fake GTID event for filePos.
 type filePosGTIDEvent struct {
 	filePosFakeEvent
-	gtid filePosGTID
+	gtid replication.FilePosGTID
 }
 
-func newFilePosGTIDEvent(file string, pos int, timestamp uint32) filePosGTIDEvent {
+func newFilePosGTIDEvent(file string, pos uint64, timestamp uint32) filePosGTIDEvent {
 	return filePosGTIDEvent{
 		filePosFakeEvent: filePosFakeEvent{
 			timestamp: timestamp,
 		},
-		gtid: filePosGTID{
-			file: file,
-			pos:  strconv.Itoa(pos),
+		gtid: replication.FilePosGTID{
+			File: file,
+			Pos:  pos,
 		},
 	}
 }
@@ -239,6 +300,10 @@ func (ev filePosGTIDEvent) IsGTID() bool {
 	return true
 }
 
-func (ev filePosGTIDEvent) GTID(BinlogFormat) (GTID, bool, error) {
-	return ev.gtid, false, nil
+func (ev filePosGTIDEvent) StripChecksum(f BinlogFormat) (BinlogEvent, []byte, error) {
+	return ev, nil, nil
+}
+
+func (ev filePosGTIDEvent) GTID(BinlogFormat) (replication.GTID, bool, int64, int64, error) {
+	return ev.gtid, false, 0, 0, nil
 }

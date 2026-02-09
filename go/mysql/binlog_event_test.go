@@ -17,7 +17,10 @@ limitations under the License.
 package mysql
 
 import (
+	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 )
@@ -32,10 +35,9 @@ func TestQueryString(t *testing.T) {
 		},
 		SQL: "sql",
 	}
-	want := `{Database: "test_database", Charset: client:12 conn:34 server:56 , SQL: "sql"}`
-	if got := input.String(); got != want {
-		t.Errorf("%#v.String() = %#v, want %#v", input, got, want)
-	}
+	want := `{Database: "test_database", Charset:`
+	got := input.String()
+	assert.True(t, strings.HasPrefix(got, want), "%#v.String() = %#v, want %#v", input, got, want)
 }
 
 func TestQueryStringNilCharset(t *testing.T) {

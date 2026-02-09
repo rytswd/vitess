@@ -78,7 +78,7 @@ func TestMain(m *testing.M) {
 			SchemaSQL: sqlSchema,
 			VSchema:   vSchema,
 		}
-		err = clusterInstance.StartUnshardedKeyspace(*keyspace, 1, true)
+		err = clusterInstance.StartUnshardedKeyspace(*keyspace, 1, true, clusterInstance.Cell)
 		if err != nil {
 			return 1
 		}
@@ -100,15 +100,16 @@ func TestMain(m *testing.M) {
 func testURL(t *testing.T, url string, testCaseName string) {
 	statusCode := getStatusForURL(url)
 	if got, want := statusCode, 200; got != want {
-		t.Errorf("select:\n%v want\n%v for %s", got, want, testCaseName)
+		t.Errorf("\nurl: %v\nstatus code: %v \nwant %v for %s", url, got, want, testCaseName)
 	}
 }
 
 // getStatusForUrl returns the status code for the URL
 func getStatusForURL(url string) int {
-	resp, _ := http.Get(url)
-	if resp != nil {
-		return resp.StatusCode
+	resp, err := http.Get(url)
+	if err != nil {
+		return 0
 	}
-	return 0
+	defer resp.Body.Close()
+	return resp.StatusCode
 }

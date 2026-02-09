@@ -1,41 +1,101 @@
 name: local_example
-on: [push, pull_request]
+on:
+  push:
+    branches:
+      - "main"
+      - "release-[0-9]+.[0-9]"
+    tags: '**'
+  pull_request:
+    branches: '**'
+permissions: read-all
+
+env:
+  BOOTSTRAP_VERSION: "ci"
+  BOOTSTRAP_FLAVOR: "mysql84"
+
 jobs:
 
   build:
-    name: Build
-    runs-on: ubuntu-latest
-    steps:
+    name: Local example using ${{ matrix.topo }} on Ubuntu
+    runs-on: oracle-vm-16cpu-64gb-x86-64
+    strategy:
+      matrix:
+        topo: [etcd,zk2]
 
-    - name: Set up Go
-      uses: actions/setup-go@v1
+    steps:
+    - name: Harden the runner (Audit all outbound calls)
+      uses: step-security/harden-runner@e3f713f2d8f53843e71c69a996d56f51aa9adfb9 # v2.14.1
       with:
-        go-version: 1.13
+        egress-policy: audit
+
+    - name: Skip CI
+      run: |
+        if [[ "${{contains( github.event.pull_request.labels.*.name, 'Skip CI')}}" == "true" ]]; then
+          echo "skipping CI due to the 'Skip CI' label"
+          exit 1
+        fi
 
     - name: Check out code
-      uses: actions/checkout@v1
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        persist-credentials: 'false'
+
+    - name: Check for changes in relevant files
+      uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+      id: changes
+      with:
+        token: ''
+        filters: |
+          examples:
+            - 'test/config.json'
+            - 'go/**/*.go'
+            - 'test.go'
+            - 'Makefile'
+            - 'build.env'
+            - 'go.sum'
+            - 'go.mod'
+            - 'proto/*.proto'
+            - 'tools/**'
+            - 'config/**'
+            - 'bootstrap.sh'
+            - 'examples/**'
+            - '.github/workflows/local_example.yml'
+
+    - name: Build bootstrap images
+      if: steps.changes.outputs.examples == 'true'
+      uses: ./.github/actions/build-bootstrap
+
+    - name: Set up Go
+      if: steps.changes.outputs.examples == 'true'
+      uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6.2.0
+      with:
+        go-version-file: go.mod
+
+    - name: Tune the OS
+      if: steps.changes.outputs.examples == 'true'
+      uses: ./.github/actions/tune-os
 
     - name: Get dependencies
+      if: steps.changes.outputs.examples == 'true'
       run: |
-        sudo apt-get install -y mysql-server mysql-client make unzip g++ etcd curl git wget
-        sudo service mysql stop
-        sudo service etcd stop
-        sudo ln -s /etc/apparmor.d/usr.sbin.mysqld /etc/apparmor.d/disable/
-        sudo apparmor_parser -R /etc/apparmor.d/usr.sbin.mysqld
         go mod download
 
-    - name: Run bootstrap.sh
+    - name: Run make minimaltools
+      if: steps.changes.outputs.examples == 'true'
       run: |
-        echo "Copying new bootstrap over location of legacy one."
-        cp .github/bootstrap.sh .
-        ./bootstrap.sh
+        make minimaltools
 
     - name: Build
+      if: steps.changes.outputs.examples == 'true'
       run: |
-        VTROOT=$PWD VTTOP=$PWD make build
+        make build
 
     - name: local_example
+      if: steps.changes.outputs.examples == 'true'
+      timeout-minutes: 30
       run: |
-        export PATH=$PWD/bin:$PATH
-        VTDATAROOT=/tmp/vtdataroot VTTOP=$PWD VTROOT=$PWD test/local_example.sh
-
+        export TOPO=${{matrix.topo}}
+        if [ "${{matrix.os}}" = "macos-latest" ]; then
+          export PATH="/usr/local/opt/mysql@5.7/bin:$PATH"
+        fi
+        go run test.go -print-log -follow -pull=false -flavor=${{ env.BOOTSTRAP_FLAVOR }} -bootstrap-version=${{ env.BOOTSTRAP_VERSION }} local_example

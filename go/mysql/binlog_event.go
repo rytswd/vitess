@@ -19,13 +19,16 @@ package mysql
 import (
 	"fmt"
 
+	"vitess.io/vitess/go/mysql/collations"
+	"vitess.io/vitess/go/mysql/replication"
+
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
 )
 
 // BinlogEvent represents a single event from a raw MySQL binlog dump stream.
 // The implementation is provided by each supported flavor in go/vt/mysqlctl.
 //
-// binlog.Streamer receives these events through a mysqlctl.SlaveConnection and
+// binlog.Streamer receives these events through a mysqlctl.BinlogConnection and
 // processes them, grouping statements into BinlogTransactions as appropriate.
 //
 // Methods that only access header fields can't fail as long as IsValid()
@@ -45,6 +48,7 @@ type BinlogEvent interface {
 	IsValid() bool
 
 	// General protocol events.
+	NextPosition() uint64
 
 	// IsFormatDescription returns true if this is a
 	// FORMAT_DESCRIPTION_EVENT. Do not call StripChecksum before
@@ -57,6 +61,8 @@ type BinlogEvent interface {
 	// IsXID returns true if this is an XID_EVENT, which is an alternate
 	// form of COMMIT.
 	IsXID() bool
+	// IsStop returns true if this is a STOP_EVENT.
+	IsStop() bool
 	// IsGTID returns true if this is a GTID_EVENT.
 	IsGTID() bool
 	// IsRotate returns true if this is a ROTATE_EVENT.
@@ -67,6 +73,10 @@ type BinlogEvent interface {
 	IsRand() bool
 	// IsPreviousGTIDs returns true if this event is a PREVIOUS_GTIDS_EVENT.
 	IsPreviousGTIDs() bool
+	// IsHeartbeat returns true if this event is a HEARTBEAT_EVENT.
+	IsHeartbeat() bool
+	// IsSemiSyncAckRequested returns true if the source requests a semi-sync ack for this event
+	IsSemiSyncAckRequested() bool
 
 	// RBR events.
 
@@ -76,11 +86,24 @@ type BinlogEvent interface {
 	IsWriteRows() bool
 	// IsUpdateRows returns true if this is a UPDATE_ROWS_EVENT.
 	IsUpdateRows() bool
+	// IsPartialUpdateRows returs true if a partial JSON update event
+	// is found. These events are only seen in MySQL 8.0 if the mysqld
+	// instance has binlog_row_value_options=PARTIAL_JSON set.
+	IsPartialUpdateRows() bool
 	// IsDeleteRows returns true if this is a DELETE_ROWS_EVENT.
 	IsDeleteRows() bool
 
+	// IsPseudo is for custom implementations of GTID.
+	IsPseudo() bool
+
+	// IsTransactionPayload returns true if a compressed transaction
+	// payload event is found (binlog_transaction_compression=ON).
+	IsTransactionPayload() bool
+
 	// Timestamp returns the timestamp from the event header.
 	Timestamp() uint32
+	// ServerID returns the server ID from the event header.
+	ServerID() uint32
 
 	// Format returns a BinlogFormat struct based on the event data.
 	// This is only valid if IsFormatDescription() returns true.
@@ -88,7 +111,7 @@ type BinlogEvent interface {
 	// GTID returns the GTID from the event, and if this event
 	// also serves as a BEGIN statement.
 	// This is only valid if IsGTID() returns true.
-	GTID(BinlogFormat) (GTID, bool, error)
+	GTID(BinlogFormat) (gtid replication.GTID, hasBegin bool, lastCommitted int64, sequenceNumber int64, err error)
 	// Query returns a Query struct representing data from a QUERY_EVENT.
 	// This is only valid if IsQuery() returns true.
 	Query(BinlogFormat) (Query, error)
@@ -100,7 +123,7 @@ type BinlogEvent interface {
 	Rand(BinlogFormat) (uint64, uint64, error)
 	// PreviousGTIDs returns the Position from the event.
 	// This is only valid if IsPreviousGTIDs() returns true.
-	PreviousGTIDs(BinlogFormat) (Position, error)
+	PreviousGTIDs(BinlogFormat) (replication.Position, error)
 
 	// TableID returns the table ID for a TableMap, UpdateRows,
 	// WriteRows or DeleteRows event.
@@ -111,30 +134,42 @@ type BinlogEvent interface {
 	TableMap(BinlogFormat) (*TableMap, error)
 	// Rows returns a Rows struct representing data from a
 	// {WRITE,UPDATE,DELETE}_ROWS_EVENT.  This is only valid if
-	// IsWriteRows(), IsUpdateRows(), or IsDeleteRows() returns
-	// true.
+	// IsWriteRows(), IsUpdateRows(), IsPartialUpdateRows(), or
+	// IsDeleteRows() returns true.
 	Rows(BinlogFormat, *TableMap) (Rows, error)
+	// TransactionPayload returns a TransactionPayload type which provides
+	// a GetNextEvent() method to iterate over the events contained within
+	// the uncompressed payload. You must call Close() when you are done
+	// with the TransactionPayload to ensure that the underlying resources
+	// used are cleaned up.
+	TransactionPayload(BinlogFormat) (*TransactionPayload, error)
+	// NextLogFile returns the name of the next binary log file & pos.
+	// This is only valid if IsRotate() returns true
+	NextLogFile(BinlogFormat) (string, uint64, error)
 
 	// StripChecksum returns the checksum and a modified event with the
 	// checksum stripped off, if any. If there is no checksum, it returns
 	// the same event and a nil checksum.
 	StripChecksum(BinlogFormat) (ev BinlogEvent, checksum []byte, err error)
 
-	// IsPseudo is for custom implementations of GTID.
-	IsPseudo() bool
+	// Bytes returns the binary representation of the event
+	Bytes() []byte
 }
 
 // BinlogFormat contains relevant data from the FORMAT_DESCRIPTION_EVENT.
 // This structure is passed to subsequent event types to let them know how to
 // parse themselves.
 type BinlogFormat struct {
+	// HeaderSizes is an array of sizes of the headers for each message.
+	HeaderSizes []byte
+
+	// ServerVersion is the name of the MySQL server version.
+	// It starts with something like 8.0.34-xxxx.
+	ServerVersion string
+
 	// FormatVersion is the version number of the binlog file format.
 	// We only support version 4.
 	FormatVersion uint16
-
-	// ServerVersion is the name of the MySQL server version.
-	// It starts with something like 5.6.33-xxxx.
-	ServerVersion string
 
 	// HeaderLength is the size in bytes of event headers other
 	// than FORMAT_DESCRIPTION_EVENT. Almost always 19.
@@ -143,9 +178,6 @@ type BinlogFormat struct {
 	// ChecksumAlgorithm is the ID number of the binlog checksum algorithm.
 	// See three possible values below.
 	ChecksumAlgorithm byte
-
-	// HeaderSizes is an array of sizes of the headers for each message.
-	HeaderSizes []byte
 }
 
 // IsZero returns true if the BinlogFormat has not been initialized.
@@ -195,6 +227,13 @@ type TableMap struct {
 	// - If the metadata is one byte, only the lower 8 bits are used.
 	// - If the metadata is two bytes, all 16 bits are used.
 	Metadata []uint16
+
+	// ColumnCollationIDs contains information about the inherited
+	// or implied column default collation and any explicit per-column
+	// override for text based columns ONLY. This means that the
+	// array position needs to be mapped to the ordered list of
+	// text based columns in the table.
+	ColumnCollationIDs []collations.ID
 }
 
 // Rows contains data from a {WRITE,UPDATE,DELETE}_ROWS_EVENT.
@@ -230,6 +269,12 @@ type Row struct {
 	// Identify is the raw data for the columns used to identify a row.
 	// It is only set for UPDATE and DELETE events.
 	Identify []byte
+
+	// If this row was from a PartialUpdateRows event and it contains
+	// 1 or more JSON columns with partial values, then this will be
+	// set as a bitmap of which JSON columns in the AFTER image have
+	// partial values.
+	JSONPartialValues Bitmap
 
 	// Data is the raw data.
 	// It is only set for WRITE and UPDATE events.
@@ -267,6 +312,11 @@ func (b *Bitmap) Count() int {
 	return b.count
 }
 
+// Bits returns the underlying bitmap.
+func (b *Bitmap) Bits() []byte {
+	return b.data[:]
+}
+
 // Bit returned the value of a given bit in the Bitmap.
 func (b *Bitmap) Bit(index int) bool {
 	byteIndex := index / 8
@@ -290,7 +340,7 @@ func (b *Bitmap) Set(index int, value bool) {
 // hence the non-efficient logic.
 func (b *Bitmap) BitCount() int {
 	sum := 0
-	for i := 0; i < b.count; i++ {
+	for i := range b.count {
 		if b.Bit(i) {
 			sum++
 		}

@@ -17,21 +17,18 @@ limitations under the License.
 package test
 
 import (
+	"context"
 	"testing"
 
-	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
+	"google.golang.org/protobuf/proto"
 
 	"vitess.io/vitess/go/vt/topo"
-	"vitess.io/vitess/go/vt/topo/topoproto"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 // checkTablet verifies the topo server API is correct for managing tablets.
-func checkTablet(t *testing.T, ts *topo.Server) {
-	ctx := context.Background()
-
+func checkTablet(t *testing.T, ctx context.Context, ts *topo.Server) {
 	tablet := &topodatapb.Tablet{
 		Alias: &topodatapb.TabletAlias{
 			Cell: LocalCellName,
@@ -45,10 +42,10 @@ func checkTablet(t *testing.T, ts *topo.Server) {
 
 		Tags:     map[string]string{"tag": "value"},
 		Keyspace: "test_keyspace",
-		Type:     topodatapb.TabletType_MASTER,
+		Type:     topodatapb.TabletType_PRIMARY,
 		KeyRange: newKeyRange("-10"),
 	}
-	topoproto.SetMysqlPort(tablet, 3334)
+	tablet.MysqlPort = 3334
 	if err := ts.CreateTablet(ctx, tablet); err != nil {
 		t.Fatalf("CreateTablet: %v", err)
 	}
@@ -71,11 +68,11 @@ func checkTablet(t *testing.T, ts *topo.Server) {
 		t.Errorf("put and got tablets are not identical:\n%#v\n%#v", tablet, t)
 	}
 
-	if _, err := ts.GetTabletsByCell(ctx, "666"); !topo.IsErrType(err, topo.NoNode) {
+	if _, err := ts.GetTabletAliasesByCell(ctx, "666"); !topo.IsErrType(err, topo.NoNode) {
 		t.Errorf("GetTabletsByCell(666): %v", err)
 	}
 
-	inCell, err := ts.GetTabletsByCell(ctx, LocalCellName)
+	inCell, err := ts.GetTabletAliasesByCell(ctx, LocalCellName)
 	if err != nil {
 		t.Fatalf("GetTabletsByCell: %v", err)
 	}
@@ -83,7 +80,7 @@ func checkTablet(t *testing.T, ts *topo.Server) {
 		t.Errorf("GetTabletsByCell: want [%v], got %v", tablet.Alias, inCell)
 	}
 
-	ti.Tablet.Hostname = "remotehost"
+	ti.Hostname = "remotehost"
 	if err := ts.UpdateTablet(ctx, ti); err != nil {
 		t.Errorf("UpdateTablet: %v", err)
 	}
@@ -92,8 +89,8 @@ func checkTablet(t *testing.T, ts *topo.Server) {
 	if err != nil {
 		t.Fatalf("GetTablet %v: %v", tablet.Alias, err)
 	}
-	if want := "remotehost"; ti.Tablet.Hostname != want {
-		t.Errorf("nt.Hostname: want %v, got %v", want, ti.Tablet.Hostname)
+	if want := "remotehost"; ti.Hostname != want {
+		t.Errorf("nt.Hostname: want %v, got %v", want, ti.Hostname)
 	}
 
 	// test UpdateTabletFields works
@@ -111,7 +108,7 @@ func checkTablet(t *testing.T, ts *topo.Server) {
 	if err != nil {
 		t.Fatalf("GetTablet %v: %v", tablet.Alias, err)
 	}
-	if got, want := ti.Tablet.Hostname, "anotherhost"; got != want {
+	if got, want := ti.Hostname, "anotherhost"; got != want {
 		t.Errorf("nt.Hostname = %q, want %q", got, want)
 	}
 
@@ -125,8 +122,8 @@ func checkTablet(t *testing.T, ts *topo.Server) {
 		t.Fatalf("GetTablet %v: %v %v", tablet.Alias, nti, nerr)
 	}
 
-	if want := "anotherhost"; ti.Tablet.Hostname != want {
-		t.Errorf("nt.Hostname: want %v, got %v", want, ti.Tablet.Hostname)
+	if want := "anotherhost"; ti.Hostname != want {
+		t.Errorf("nt.Hostname: want %v, got %v", want, ti.Hostname)
 	}
 
 	if err := ts.DeleteTablet(ctx, tablet.Alias); err != nil {
@@ -139,5 +136,4 @@ func checkTablet(t *testing.T, ts *topo.Server) {
 	if _, err := ts.GetTablet(ctx, tablet.Alias); !topo.IsErrType(err, topo.NoNode) {
 		t.Errorf("GetTablet: expected error, tablet was deleted: %v", err)
 	}
-
 }

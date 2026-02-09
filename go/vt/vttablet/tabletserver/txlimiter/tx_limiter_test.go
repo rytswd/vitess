@@ -20,14 +20,16 @@ import (
 	"testing"
 
 	"vitess.io/vitess/go/vt/callerid"
+	"vitess.io/vitess/go/vt/vtenv"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
 
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 )
 
-func resetVariables() {
-	rejections.ResetAll()
-	rejectionsDryRun.ResetAll()
+func resetVariables(txl *Impl) {
+	txl.rejections.ResetAll()
+	txl.rejectionsDryRun.ResetAll()
 }
 
 func createCallers(username, principal, component, subcomponent string) (*querypb.VTGateCallerID, *vtrpcpb.CallerID) {
@@ -37,30 +39,47 @@ func createCallers(username, principal, component, subcomponent string) (*queryp
 }
 
 func TestTxLimiter_DisabledAllowsAll(t *testing.T) {
-	limiter := New(10, 0.1, false, false, false, false, false, false)
+	cfg := tabletenv.NewDefaultConfig()
+	cfg.TxPool.Size = 10
+	cfg.TransactionLimitPerUser = 0.1
+	cfg.EnableTransactionLimit = false
+	cfg.EnableTransactionLimitDryRun = false
+	cfg.TransactionLimitByUsername = false
+	cfg.TransactionLimitByPrincipal = false
+	cfg.TransactionLimitByComponent = false
+	cfg.TransactionLimitBySubcomponent = false
+	limiter := New(tabletenv.NewEnv(vtenv.NewTestEnv(), cfg, "TabletServerTest"))
 	im, ef := createCallers("", "", "", "")
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		if got, want := limiter.Get(im, ef), true; got != want {
 			t.Errorf("Transaction number %d, Get(): got %v, want %v", i, got, want)
 		}
 	}
-
 }
 
 func TestTxLimiter_LimitsOnlyOffendingUser(t *testing.T) {
-	resetVariables()
+	cfg := tabletenv.NewDefaultConfig()
+	cfg.TxPool.Size = 10
+	cfg.TransactionLimitPerUser = 0.3
+	cfg.EnableTransactionLimit = true
+	cfg.EnableTransactionLimitDryRun = false
+	cfg.TransactionLimitByUsername = true
+	cfg.TransactionLimitByPrincipal = false
+	cfg.TransactionLimitByComponent = false
+	cfg.TransactionLimitBySubcomponent = false
 
 	// This should allow 3 slots to all users
-	newlimiter := New(10, 0.3, true, false, true, false, false, false)
+	newlimiter := New(tabletenv.NewEnv(vtenv.NewTestEnv(), cfg, "TabletServerTest"))
 	limiter, ok := newlimiter.(*Impl)
 	if !ok {
 		t.Fatalf("New returned limiter of unexpected type: got %T, want %T", newlimiter, limiter)
 	}
+	resetVariables(limiter)
 	im1, ef1 := createCallers("user1", "", "", "")
 	im2, ef2 := createCallers("user2", "", "", "")
 
 	// user1 uses 3 slots
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if got, want := limiter.Get(im1, ef1), true; got != want {
 			t.Errorf("Transaction number %d, Get(im1, ef1): got %v, want %v", i, got, want)
 		}
@@ -72,12 +91,12 @@ func TestTxLimiter_LimitsOnlyOffendingUser(t *testing.T) {
 	}
 
 	key1 := limiter.extractKey(im1, ef1)
-	if got, want := rejections.Counts()[key1], int64(1); got != want {
+	if got, want := limiter.rejections.Counts()[key1], int64(1); got != want {
 		t.Errorf("Rejections count for %s: got %d, want %d", key1, got, want)
 	}
 
 	// user2 uses 3 slots
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if got, want := limiter.Get(im2, ef2), true; got != want {
 			t.Errorf("Transaction number %d, Get(im2, ef2): got %v, want %v", i, got, want)
 		}
@@ -88,7 +107,7 @@ func TestTxLimiter_LimitsOnlyOffendingUser(t *testing.T) {
 		t.Errorf("Get(im2, ef2) after using up all allowed attempts: got %v, want %v", got, want)
 	}
 	key2 := limiter.extractKey(im2, ef2)
-	if got, want := rejections.Counts()[key2], int64(1); got != want {
+	if got, want := limiter.rejections.Counts()[key2], int64(1); got != want {
 		t.Errorf("Rejections count for %s: got %d, want %d", key2, got, want)
 	}
 
@@ -98,26 +117,35 @@ func TestTxLimiter_LimitsOnlyOffendingUser(t *testing.T) {
 		t.Errorf("Get(im1, ef1) after releasing: got %v, want %v", got, want)
 	}
 
-	// Rejection coutner for user 1 should still be 1.
-	if got, want := rejections.Counts()[key1], int64(1); got != want {
+	// Rejection count for user 1 should still be 1.
+	if got, want := limiter.rejections.Counts()[key1], int64(1); got != want {
 		t.Errorf("Rejections count for %s: got %d, want %d", key1, got, want)
 	}
 }
 
 func TestTxLimiterDryRun(t *testing.T) {
-	resetVariables()
+	cfg := tabletenv.NewDefaultConfig()
+	cfg.TxPool.Size = 10
+	cfg.TransactionLimitPerUser = 0.3
+	cfg.EnableTransactionLimit = true
+	cfg.EnableTransactionLimitDryRun = true
+	cfg.TransactionLimitByUsername = true
+	cfg.TransactionLimitByPrincipal = false
+	cfg.TransactionLimitByComponent = false
+	cfg.TransactionLimitBySubcomponent = false
 
 	// This should allow 3 slots to all users
-	newlimiter := New(10, 0.3, true, true, true, false, false, false)
+	newlimiter := New(tabletenv.NewEnv(vtenv.NewTestEnv(), cfg, "TabletServerTest"))
 	limiter, ok := newlimiter.(*Impl)
 	if !ok {
 		t.Fatalf("New returned limiter of unexpected type: got %T, want %T", newlimiter, limiter)
 	}
+	resetVariables(limiter)
 	im, ef := createCallers("user", "", "", "")
 	key := limiter.extractKey(im, ef)
 
 	// uses 3 slots
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if got, want := limiter.Get(im, ef), true; got != want {
 			t.Errorf("Transaction number %d, Get(im, ef): got %v, want %v", i, got, want)
 		}
@@ -128,10 +156,10 @@ func TestTxLimiterDryRun(t *testing.T) {
 		t.Errorf("Get(im, ef) after using up all allowed attempts: got %v, want %v", got, want)
 	}
 
-	if got, want := rejections.Counts()[key], int64(0); got != want {
+	if got, want := limiter.rejections.Counts()[key], int64(0); got != want {
 		t.Errorf("Rejections count for %s: got %d, want %d", key, got, want)
 	}
-	if got, want := rejectionsDryRun.Counts()[key], int64(1); got != want {
+	if got, want := limiter.rejectionsDryRun.Counts()[key], int64(1); got != want {
 		t.Errorf("RejectionsDryRun count for %s: got %d, want %d", key, got, want)
 	}
 }

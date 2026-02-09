@@ -21,8 +21,6 @@ import (
 	"sort"
 	"testing"
 
-	"golang.org/x/net/context"
-
 	"vitess.io/vitess/go/vt/topo/memorytopo"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
@@ -34,8 +32,9 @@ func TestCellsAliases(t *testing.T) {
 	// Create an alias
 
 	cell := "cell1"
-	ctx := context.Background()
-	ts := memorytopo.NewServer(cell)
+	ctx := t.Context()
+	ts := memorytopo.NewServer(ctx, cell)
+	defer ts.Close()
 
 	if err := ts.CreateCellsAlias(ctx, "alias", &topodatapb.CellsAlias{Cells: []string{"cell1", "cell2"}}); err != nil {
 		t.Fatalf("CreateCellsAlias failed: %v", err)
@@ -58,7 +57,6 @@ func TestCellsAliases(t *testing.T) {
 
 	if len(aliasesName) != 2 {
 		t.Fatalf("Expected to have 2 aliases. Got %v", len(aliasesName))
-
 	}
 
 	if aliasesName[0] != "alias" {

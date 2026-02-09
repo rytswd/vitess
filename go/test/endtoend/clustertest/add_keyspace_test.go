@@ -19,23 +19,23 @@ This adds sharded keyspace dynamically in this test only and test sql insert, se
 package clustertest
 
 import (
-	"context"
 	"fmt"
 	"testing"
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/test/endtoend/cluster"
+	"vitess.io/vitess/go/test/endtoend/utils"
+	"vitess.io/vitess/go/vt/log"
 )
 
-var (
-	testKeyspace = &cluster.Keyspace{
-		Name: "kstest",
-		SchemaSQL: `create table vt_user (
+var testKeyspace = &cluster.Keyspace{
+	Name: "kstest",
+	SchemaSQL: `create table vt_user (
 id bigint,
 name varchar(64),
 primary key (id)
 ) Engine=InnoDB`,
-		VSchema: `{
+	VSchema: `{
  "sharded": true,
  "vindexes": {
    "hash_index": {
@@ -53,12 +53,12 @@ primary key (id)
    }
  }
 }`,
-	}
-)
+}
 
 func TestAddKeyspace(t *testing.T) {
-	if err := clusterInstance.StartKeyspace(*testKeyspace, []string{"-80", "80-"}, 1, true); err != nil {
-		println(err.Error())
+	cell := clusterInstance.Cell
+	if err := clusterInstance.StartKeyspace(*testKeyspace, []string{"-80", "80-"}, 0, false, cell); err != nil {
+		log.Errorf("failed to AddKeyspace %v: %v", *testKeyspace, err)
 		t.Fatal(err)
 	}
 	// Restart vtgate process
@@ -66,7 +66,7 @@ func TestAddKeyspace(t *testing.T) {
 	_ = clusterInstance.VtgateProcess.Setup()
 	clusterInstance.WaitForTabletsToHealthyInVtgate()
 
-	ctx := context.Background()
+	ctx := t.Context()
 	vtParams := mysql.ConnParams{
 		Host: clusterInstance.Hostname,
 		Port: clusterInstance.VtgateMySQLPort,
@@ -77,9 +77,9 @@ func TestAddKeyspace(t *testing.T) {
 	}
 	defer conn.Close()
 
-	exec(t, conn, "insert into vt_user(id, name) values(1,'name1')")
+	utils.Exec(t, conn, "insert into vt_user(id, name) values(1,'name1')")
 
-	qr := exec(t, conn, "select id, name from vt_user")
+	qr := utils.Exec(t, conn, "select id, name from vt_user")
 	if got, want := fmt.Sprintf("%v", qr.Rows), `[[INT64(1) VARCHAR("name1")]]`; got != want {
 		t.Errorf("select:\n%v want\n%v", got, want)
 	}

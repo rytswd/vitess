@@ -17,13 +17,11 @@ limitations under the License.
 package schemamanager
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 
-	"golang.org/x/net/context"
-
 	"vitess.io/vitess/go/vt/log"
-	"vitess.io/vitess/go/vt/sqlparser"
 )
 
 // PlainController implements Controller interface.
@@ -33,15 +31,10 @@ type PlainController struct {
 }
 
 // NewPlainController creates a new PlainController instance.
-func NewPlainController(sqlStr string, keyspace string) *PlainController {
+func NewPlainController(sqls []string, keyspace string) *PlainController {
 	controller := &PlainController{
 		sqls:     make([]string, 0, 32),
 		keyspace: keyspace,
-	}
-
-	sqls, err := sqlparser.SplitStatementToPieces(sqlStr)
-	if err != nil {
-		panic(err.Error())
 	}
 
 	for _, sql := range sqls {

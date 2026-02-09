@@ -17,7 +17,6 @@
 package io.vitess.util;
 
 import com.google.protobuf.ByteString;
-
 import io.vitess.proto.Query;
 import io.vitess.proto.Topodata;
 
@@ -34,9 +33,9 @@ public class Constants {
   public static final String VITESS_PORT = "Port number of Vitess Server";
   public static final String VITESS_DB_NAME = "Database name";
   public static final String VITESS_TABLET_TYPE = "Tablet Type to which Vitess will connect"
-      + "(master, replica, rdonly)";
+      + "(primary, replica, rdonly)";
   public static final String DEFAULT_PORT = "15991";
-  public static final Topodata.TabletType DEFAULT_TABLET_TYPE = Topodata.TabletType.MASTER;
+  public static final Topodata.TabletType DEFAULT_TABLET_TYPE = Topodata.TabletType.PRIMARY;
   public static final String LITERAL_V = "v";
   public static final String LITERAL_SINGLE_QUOTE = "'";
   public static final int DRIVER_MAJOR_VERSION = 2;
@@ -61,6 +60,7 @@ public class Constants {
   }
 
 
+  /** SQLExceptionMessages contains standard SQL exception message strings. */
   public static final class SQLExceptionMessages {
 
     public static final String CONN_UNAVAILABLE = "Connection not available";
@@ -121,6 +121,7 @@ public class Constants {
   }
 
 
+  /** Property contains JDBC connection property name constants. */
   public static final class Property {
 
     @Deprecated
@@ -156,10 +157,12 @@ public class Constants {
   }
 
 
+  /** QueryExecuteType defines whether queries execute in simple or streaming mode. */
   public enum QueryExecuteType {
     SIMPLE, STREAM
   }
 
+  /** ZeroDateTimeBehavior defines how zero datetime values are handled. */
   public enum ZeroDateTimeBehavior {
     /**
      * This is the current behavior. It completely garbles null timestamps. It is mostly likely

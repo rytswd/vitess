@@ -17,14 +17,15 @@ limitations under the License.
 package logutil
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
+	"vitess.io/vitess/go/protoutil"
 	logutilpb "vitess.io/vitess/go/vt/proto/logutil"
 )
 
@@ -33,18 +34,18 @@ import (
 // call these methods simultaneously).
 type Logger interface {
 	// Infof logs at INFO level. A newline is appended if missing.
-	Infof(format string, v ...interface{})
+	Infof(format string, v ...any)
 	// Warningf logs at WARNING level. A newline is appended if missing.
-	Warningf(format string, v ...interface{})
+	Warningf(format string, v ...any)
 	// Errorf logs at ERROR level. A newline is appended if missing.
-	Errorf(format string, v ...interface{})
+	Errorf(format string, v ...any)
 	// Errorf2 logs an error with stack traces at ERROR level. A newline is appended if missing.
-	Errorf2(e error, message string, v ...interface{})
+	Errorf2(e error, message string, v ...any)
 
 	Error(e error)
 	// Printf will just display information on stdout when possible.
 	// No newline is appended.
-	Printf(format string, v ...interface{})
+	Printf(format string, v ...any)
 
 	// InfoDepth allows call frame depth to be adjusted when logging to INFO.
 	InfoDepth(depth int, s string)
@@ -56,7 +57,7 @@ type Logger interface {
 
 // EventToBuffer formats an individual Event into a buffer, without the
 // final '\n'
-func EventToBuffer(event *logutilpb.Event, buf *bytes.Buffer) {
+func EventToBuffer(event *logutilpb.Event, buf *strings.Builder) {
 	// Avoid Fprintf, for speed. The format is so simple that we
 	// can do it quickly by hand.  It's worth about 3X. Fprintf is hard.
 
@@ -73,7 +74,7 @@ func EventToBuffer(event *logutilpb.Event, buf *bytes.Buffer) {
 		return
 	}
 
-	t := ProtoToTime(event.Time)
+	t := protoutil.TimeFromProto(event.Time).UTC()
 	_, month, day := t.Date()
 	hour, minute, second := t.Clock()
 	twoDigits(buf, int(month))
@@ -97,8 +98,8 @@ func EventToBuffer(event *logutilpb.Event, buf *bytes.Buffer) {
 
 // EventString returns the line in one string
 func EventString(event *logutilpb.Event) string {
-	buf := new(bytes.Buffer)
-	EventToBuffer(event, buf)
+	var buf strings.Builder
+	EventToBuffer(event, &buf)
 	return buf.String()
 }
 
@@ -137,7 +138,7 @@ func NewCallbackLogger(f func(*logutilpb.Event)) *CallbackLogger {
 func (cl *CallbackLogger) InfoDepth(depth int, s string) {
 	file, line := fileAndLine(2 + depth)
 	cl.f(&logutilpb.Event{
-		Time:  TimeToProto(time.Now()),
+		Time:  protoutil.TimeToProto(time.Now()),
 		Level: logutilpb.Level_INFO,
 		File:  file,
 		Line:  line,
@@ -149,7 +150,7 @@ func (cl *CallbackLogger) InfoDepth(depth int, s string) {
 func (cl *CallbackLogger) WarningDepth(depth int, s string) {
 	file, line := fileAndLine(2 + depth)
 	cl.f(&logutilpb.Event{
-		Time:  TimeToProto(time.Now()),
+		Time:  protoutil.TimeToProto(time.Now()),
 		Level: logutilpb.Level_WARNING,
 		File:  file,
 		Line:  line,
@@ -161,7 +162,7 @@ func (cl *CallbackLogger) WarningDepth(depth int, s string) {
 func (cl *CallbackLogger) ErrorDepth(depth int, s string) {
 	file, line := fileAndLine(2 + depth)
 	cl.f(&logutilpb.Event{
-		Time:  TimeToProto(time.Now()),
+		Time:  protoutil.TimeToProto(time.Now()),
 		Level: logutilpb.Level_ERROR,
 		File:  file,
 		Line:  line,
@@ -170,22 +171,22 @@ func (cl *CallbackLogger) ErrorDepth(depth int, s string) {
 }
 
 // Infof is part of the Logger interface.
-func (cl *CallbackLogger) Infof(format string, v ...interface{}) {
+func (cl *CallbackLogger) Infof(format string, v ...any) {
 	cl.InfoDepth(1, fmt.Sprintf(format, v...))
 }
 
 // Warningf is part of the Logger interface.
-func (cl *CallbackLogger) Warningf(format string, v ...interface{}) {
+func (cl *CallbackLogger) Warningf(format string, v ...any) {
 	cl.WarningDepth(1, fmt.Sprintf(format, v...))
 }
 
 // Errorf is part of the Logger interface.
-func (cl *CallbackLogger) Errorf(format string, v ...interface{}) {
+func (cl *CallbackLogger) Errorf(format string, v ...any) {
 	cl.ErrorDepth(1, fmt.Sprintf(format, v...))
 }
 
 // Errorf2 is part of the Logger interface
-func (cl *CallbackLogger) Errorf2(err error, format string, v ...interface{}) {
+func (cl *CallbackLogger) Errorf2(err error, format string, v ...any) {
 	cl.ErrorDepth(1, fmt.Sprintf(format+": %+v", append(v, err)))
 }
 
@@ -195,36 +196,15 @@ func (cl *CallbackLogger) Error(err error) {
 }
 
 // Printf is part of the Logger interface.
-func (cl *CallbackLogger) Printf(format string, v ...interface{}) {
+func (cl *CallbackLogger) Printf(format string, v ...any) {
 	file, line := fileAndLine(2)
 	cl.f(&logutilpb.Event{
-		Time:  TimeToProto(time.Now()),
+		Time:  protoutil.TimeToProto(time.Now()),
 		Level: logutilpb.Level_CONSOLE,
 		File:  file,
 		Line:  line,
 		Value: fmt.Sprintf(format, v...),
 	})
-}
-
-// ChannelLogger is a Logger that sends the logging events through a channel for
-// consumption.
-type ChannelLogger struct {
-	CallbackLogger
-	C chan *logutilpb.Event
-}
-
-// NewChannelLogger returns a CallbackLogger which will write the data
-// on a channel
-func NewChannelLogger(size int) *ChannelLogger {
-	c := make(chan *logutilpb.Event, size)
-	return &ChannelLogger{
-		CallbackLogger: CallbackLogger{
-			f: func(e *logutilpb.Event) {
-				c <- e
-			},
-		},
-		C: c,
-	}
 }
 
 // MemoryLogger keeps the logging events in memory.
@@ -240,7 +220,7 @@ type MemoryLogger struct {
 // NewMemoryLogger returns a new MemoryLogger
 func NewMemoryLogger() *MemoryLogger {
 	ml := &MemoryLogger{}
-	ml.CallbackLogger.f = func(e *logutilpb.Event) {
+	ml.f = func(e *logutilpb.Event) {
 		ml.mu.Lock()
 		defer ml.mu.Unlock()
 		ml.Events = append(ml.Events, e)
@@ -250,11 +230,11 @@ func NewMemoryLogger() *MemoryLogger {
 
 // String returns all the lines in one String, separated by '\n'
 func (ml *MemoryLogger) String() string {
-	buf := new(bytes.Buffer)
+	var buf strings.Builder
 	ml.mu.Lock()
 	defer ml.mu.Unlock()
 	for _, event := range ml.Events {
-		EventToBuffer(event, buf)
+		EventToBuffer(event, &buf)
 		buf.WriteByte('\n')
 	}
 	return buf.String()
@@ -265,6 +245,12 @@ func (ml *MemoryLogger) Clear() {
 	ml.mu.Lock()
 	ml.Events = nil
 	ml.mu.Unlock()
+}
+
+func (ml *MemoryLogger) LogEvents() []*logutilpb.Event {
+	ml.mu.Lock()
+	defer ml.mu.Unlock()
+	return slices.Clone(ml.Events)
 }
 
 // LoggerWriter is an adapter that implements the io.Writer interface.
@@ -320,22 +306,22 @@ func (tl *TeeLogger) ErrorDepth(depth int, s string) {
 }
 
 // Infof is part of the Logger interface
-func (tl *TeeLogger) Infof(format string, v ...interface{}) {
+func (tl *TeeLogger) Infof(format string, v ...any) {
 	tl.InfoDepth(1, fmt.Sprintf(format, v...))
 }
 
 // Warningf is part of the Logger interface
-func (tl *TeeLogger) Warningf(format string, v ...interface{}) {
+func (tl *TeeLogger) Warningf(format string, v ...any) {
 	tl.WarningDepth(1, fmt.Sprintf(format, v...))
 }
 
 // Errorf is part of the Logger interface
-func (tl *TeeLogger) Errorf(format string, v ...interface{}) {
+func (tl *TeeLogger) Errorf(format string, v ...any) {
 	tl.ErrorDepth(1, fmt.Sprintf(format, v...))
 }
 
 // Errorf2 is part of the Logger interface
-func (tl *TeeLogger) Errorf2(err error, format string, v ...interface{}) {
+func (tl *TeeLogger) Errorf2(err error, format string, v ...any) {
 	tl.ErrorDepth(1, fmt.Sprintf(format+": %+v", append(v, err)))
 }
 
@@ -345,7 +331,7 @@ func (tl *TeeLogger) Error(err error) {
 }
 
 // Printf is part of the Logger interface
-func (tl *TeeLogger) Printf(format string, v ...interface{}) {
+func (tl *TeeLogger) Printf(format string, v ...any) {
 	tl.One.Printf(format, v...)
 	tl.Two.Printf(format, v...)
 }
@@ -354,7 +340,7 @@ func (tl *TeeLogger) Printf(format string, v ...interface{}) {
 const digits = "0123456789"
 
 // twoDigits adds a zero-prefixed two-digit integer to buf
-func twoDigits(buf *bytes.Buffer, value int) {
+func twoDigits(buf *strings.Builder, value int) {
 	buf.WriteByte(digits[value/10])
 	buf.WriteByte(digits[value%10])
 }
@@ -362,7 +348,7 @@ func twoDigits(buf *bytes.Buffer, value int) {
 // nDigits adds an n-digit integer d to buf
 // padding with pad on the left.
 // It assumes d >= 0.
-func nDigits(buf *bytes.Buffer, n, d int, pad byte) {
+func nDigits(buf *strings.Builder, n, d int, pad byte) {
 	tmp := make([]byte, n)
 	j := n - 1
 	for ; j >= 0 && d > 0; j-- {
@@ -376,7 +362,7 @@ func nDigits(buf *bytes.Buffer, n, d int, pad byte) {
 }
 
 // someDigits adds a zero-prefixed variable-width integer to buf
-func someDigits(buf *bytes.Buffer, d int64) {
+func someDigits(buf *strings.Builder, d int64) {
 	// Print into the top, then copy down.
 	tmp := make([]byte, 10)
 	j := 10

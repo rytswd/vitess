@@ -19,8 +19,11 @@ package tabletserver
 import (
 	"encoding/json"
 	"fmt"
-	"html/template"
 	"net/http"
+
+	"github.com/google/safehtml/template"
+
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/tx"
 
 	"vitess.io/vitess/go/acl"
 	"vitess.io/vitess/go/vt/log"
@@ -127,7 +130,7 @@ var (
 	`))
 )
 
-func twopczHandler(txe *TxExecutor, w http.ResponseWriter, r *http.Request) {
+func twopczHandler(txe *DTExecutor, w http.ResponseWriter, r *http.Request) {
 	if err := acl.CheckAccessHTTP(r, acl.DEBUGGING); err != nil {
 		acl.SendError(w, err)
 		return
@@ -160,8 +163,8 @@ func twopczHandler(txe *TxExecutor, w http.ResponseWriter, r *http.Request) {
 	if format == "json" {
 		w.Header().Set("Content-Type", "application/json")
 		js, err := json.Marshal(struct {
-			Distributed      []*DistributedTx
-			Prepared, Failed []*PreparedTx
+			Distributed      []*tx.DistributedTx
+			Prepared, Failed []*tx.PreparedTx
 		}{
 			Distributed: distributed,
 			Prepared:    prepared,
@@ -179,7 +182,7 @@ func twopczHandler(txe *TxExecutor, w http.ResponseWriter, r *http.Request) {
 	w.Write(gridTable)
 	w.Write([]byte("<h2>WARNING: Actions on this page can jeopardize data integrity.</h2>\n"))
 	if msg != "" {
-		w.Write([]byte(fmt.Sprintf("%s\n", msg)))
+		fmt.Fprintln(w, msg)
 	}
 
 	w.Write(startTable)

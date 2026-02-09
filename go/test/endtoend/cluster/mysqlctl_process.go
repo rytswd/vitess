@@ -17,69 +17,332 @@ limitations under the License.
 package cluster
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/google/safehtml/template"
+
+	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/syscallutil"
+	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/mysqlctl"
+	"vitess.io/vitess/go/vt/tlstest"
 )
 
 // MysqlctlProcess is a generic handle for a running mysqlctl command .
 // It can be spawned manually
 type MysqlctlProcess struct {
-	Name         string
-	Binary       string
-	LogDirectory string
-	TabletUID    int
-	MySQLPort    int
-	InitDBFile   string
+	Name            string
+	Binary          string
+	LogDirectory    string
+	TabletUID       int
+	MySQLPort       int
+	InitDBFile      string
+	ExtraArgs       []string
+	InitMysql       bool
+	SecureTransport bool
+	MajorVersion    int
 }
 
 // InitDb executes mysqlctl command to add cell info
 func (mysqlctl *MysqlctlProcess) InitDb() (err error) {
+	args := []string{
+		"--log_dir", mysqlctl.LogDirectory,
+		// todo: Remove underscore(_) flags in v25, replace them with dashed(-) notation
+		"--tablet_uid", strconv.Itoa(mysqlctl.TabletUID),
+		"--mysql_port", strconv.Itoa(mysqlctl.MySQLPort),
+		"init",
+	}
+	if mysqlctl.MajorVersion < 18 {
+		args = append(args, "--")
+	}
+
+	// TODO: Remove underscore(_) flags in v25, replace them with dashed(-) notation
+	args = append(args, "--init_db_sql_file", mysqlctl.InitDBFile)
+	if *isCoverage {
+		args = append([]string{"--test.coverprofile=" + getCoveragePath("mysql-initdb.out"), "--test.v"}, args...)
+	}
 	tmpProcess := exec.Command(
 		mysqlctl.Binary,
-		"-log_dir", mysqlctl.LogDirectory,
-		"-tablet_uid", fmt.Sprintf("%d", mysqlctl.TabletUID),
-		"-mysql_port", fmt.Sprintf("%d", mysqlctl.MySQLPort),
-		"init",
-		"-init_db_sql_file", mysqlctl.InitDBFile,
-	)
+		args...)
 	return tmpProcess.Run()
 }
 
 // Start executes mysqlctl command to start mysql instance
 func (mysqlctl *MysqlctlProcess) Start() (err error) {
-	tmpProcess := exec.Command(
-		mysqlctl.Binary,
-		"-log_dir", mysqlctl.LogDirectory,
-		"-tablet_uid", fmt.Sprintf("%d", mysqlctl.TabletUID),
-		"-mysql_port", fmt.Sprintf("%d", mysqlctl.MySQLPort),
-		"init",
-		"-init_db_sql_file", mysqlctl.InitDBFile,
-	)
-	return tmpProcess.Run()
+	tmpProcess, err := mysqlctl.startProcess(true)
+	if err != nil {
+		return err
+	}
+	return tmpProcess.Wait()
 }
 
-// Stop executes mysqlctl command to stop mysql instance
+// StartProvideInit executes mysqlctl command to start mysql instance
+func (mysqlctl *MysqlctlProcess) StartProvideInit(init bool) (err error) {
+	tmpProcess, err := mysqlctl.startProcess(init)
+	if err != nil {
+		return err
+	}
+	return tmpProcess.Wait()
+}
+
+// StartProcess starts the mysqlctl and returns the process reference
+func (mysqlctl *MysqlctlProcess) StartProcess() (*exec.Cmd, error) {
+	return mysqlctl.startProcess(true)
+}
+
+func (mysqlctl *MysqlctlProcess) startProcess(init bool) (*exec.Cmd, error) {
+	tmpProcess := exec.Command(
+		mysqlctl.Binary,
+		// TODO: Remove underscore(_) flags in v25, replace them with dashed(-) notation
+		"--log_dir", mysqlctl.LogDirectory,
+		"--tablet_uid", strconv.Itoa(mysqlctl.TabletUID),
+		"--mysql_port", strconv.Itoa(mysqlctl.MySQLPort),
+	)
+	if *isCoverage {
+		tmpProcess.Args = append(tmpProcess.Args, []string{"--test.coverprofile=" + getCoveragePath("mysql-start.out")}...)
+	}
+
+	if len(mysqlctl.ExtraArgs) > 0 {
+		tmpProcess.Args = append(tmpProcess.Args, mysqlctl.ExtraArgs...)
+	}
+	if mysqlctl.InitMysql {
+		if mysqlctl.SecureTransport {
+			// Set up EXTRA_MY_CNF for ssl
+			sslPath := path.Join(os.Getenv("VTDATAROOT"), fmt.Sprintf("/ssl_%010d", mysqlctl.TabletUID))
+			os.MkdirAll(sslPath, 0o755)
+
+			// create certificates
+			clientServerKeyPair := tlstest.CreateClientServerCertPairs(sslPath)
+
+			// use the certificate values in template to create cnf file
+			sslPathData := struct {
+				Dir        string
+				ServerCert string
+				ServerKey  string
+			}{
+				Dir:        sslPath,
+				ServerCert: clientServerKeyPair.ServerCert,
+				ServerKey:  clientServerKeyPair.ServerKey,
+			}
+
+			extraMyCNF := path.Join(sslPath, "ssl.cnf")
+			fout, err := os.Create(extraMyCNF)
+			if err != nil {
+				log.Error(err)
+				return nil, err
+			}
+
+			template.Must(template.New(fmt.Sprintf("%010d", mysqlctl.TabletUID)).Parse(`
+ssl_ca={{.Dir}}/ca-cert.pem
+ssl_cert={{.ServerCert}}
+ssl_key={{.ServerKey}}
+`)).Execute(fout, sslPathData)
+			if err := fout.Close(); err != nil {
+				return nil, err
+			}
+
+			tmpProcess.Env = append(tmpProcess.Env, "EXTRA_MY_CNF="+extraMyCNF)
+			tmpProcess.Env = append(tmpProcess.Env, "VTDATAROOT="+os.Getenv("VTDATAROOT"))
+		}
+
+		if init {
+			tmpProcess.Args = append(tmpProcess.Args, "init")
+			if mysqlctl.MajorVersion < 18 {
+				tmpProcess.Args = append(tmpProcess.Args, "--")
+			}
+			// TODO: Remove underscore(_) flags in v25, replace them with dashed(-) notation
+			tmpProcess.Args = append(tmpProcess.Args, "--init_db_sql_file", mysqlctl.InitDBFile)
+		} else {
+			tmpProcess.Args = append(tmpProcess.Args, "start")
+		}
+	} else {
+		tmpProcess.Args = append(tmpProcess.Args, "start")
+	}
+	tmpProcess.Env = append(tmpProcess.Env, os.Environ()...)
+	tmpProcess.Env = append(tmpProcess.Env, DefaultVttestEnv)
+	log.Infof("Starting mysqlctl with command: %v", tmpProcess.Args)
+	return tmpProcess, tmpProcess.Start()
+}
+
+// Stop executes mysqlctl command to stop mysql instance and kills the mysql instance
+// if it doesn't shutdown in 30 seconds.
 func (mysqlctl *MysqlctlProcess) Stop() (err error) {
-	tmpProcess := exec.Command(
-		mysqlctl.Binary,
-		"-tablet_uid", fmt.Sprintf("%d", mysqlctl.TabletUID),
-		"shutdown",
-	)
-	return tmpProcess.Start()
+	log.Infof("Shutting down MySQL: %d", mysqlctl.TabletUID)
+	defer log.Infof("MySQL shutdown complete: %d", mysqlctl.TabletUID)
+	tmpProcess, err := mysqlctl.StopProcess()
+	if err != nil {
+		return err
+	}
+	// On the CI it was noticed that MySQL shutdown hangs sometimes and
+	// on local investigation it was waiting on SEMI_SYNC acks for an internal command
+	// of Vitess even after closing the socket file.
+	// To prevent this process for hanging for 5 minutes, we will add a 30-second timeout.
+	exit := make(chan error)
+	go func() {
+		exit <- tmpProcess.Wait()
+	}()
+	select {
+	case <-time.After(30 * time.Second):
+		break
+	case err := <-exit:
+		if err == nil {
+			return nil
+		}
+		break
+	}
+	pidFile := path.Join(os.Getenv("VTDATAROOT"), fmt.Sprintf("/vt_%010d/mysql.pid", mysqlctl.TabletUID))
+	pidBytes, err := os.ReadFile(pidFile)
+	if err != nil {
+		// We can't read the file which means the PID file does not exist
+		// The server must have stopped
+		return nil
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(pidBytes)))
+	if err != nil {
+		return err
+	}
+	// We first need to try and kill any associated mysqld_safe process or
+	// else it will immediately restart the mysqld process when we kill it.
+	mspidb, err := exec.Command("sh", "-c",
+		fmt.Sprintf("ps auxww | grep -E 'mysqld_safe|mariadbd-safe' | grep vt_%010d | awk '{print $2}'", mysqlctl.TabletUID)).Output()
+	if err != nil {
+		return err
+	}
+	mysqldSafePID, err := strconv.Atoi(strings.TrimSpace(string(mspidb)))
+	// If we found a valid associated mysqld_safe process then let's kill
+	// it first.
+	if err == nil && mysqldSafePID > 0 {
+		if err = syscallutil.Kill(mysqldSafePID, syscall.SIGKILL); err != nil {
+			return err
+		}
+	}
+	return syscallutil.Kill(pid, syscall.SIGKILL)
 }
 
-// MysqlCtlProcessInstance returns a Mysqlctl handle for mysqlctl process
+// StopProcess executes mysqlctl command to stop mysql instance and returns process reference
+func (mysqlctl *MysqlctlProcess) StopProcess() (*exec.Cmd, error) {
+	tmpProcess := exec.Command(
+		mysqlctl.Binary,
+		// TODO: Remove underscore(_) flags in v25, replace them with dashed(-) notation
+		"--log_dir", mysqlctl.LogDirectory,
+		"--tablet_uid", strconv.Itoa(mysqlctl.TabletUID),
+	)
+	if *isCoverage {
+		tmpProcess.Args = append(tmpProcess.Args, []string{"--test.coverprofile=" + getCoveragePath("mysql-stop.out")}...)
+	}
+	if len(mysqlctl.ExtraArgs) > 0 {
+		tmpProcess.Args = append(tmpProcess.Args, mysqlctl.ExtraArgs...)
+	}
+	tmpProcess.Args = append(tmpProcess.Args, "shutdown")
+	return tmpProcess, tmpProcess.Start()
+}
+
+func (mysqlctl *MysqlctlProcess) BasePath() string {
+	return path.Join(os.Getenv("VTDATAROOT"), fmt.Sprintf("/vt_%010d", mysqlctl.TabletUID))
+}
+
+func (mysqlctl *MysqlctlProcess) BinaryLogsPath() string {
+	return path.Join(mysqlctl.BasePath(), "bin-logs")
+}
+
+// CleanupFiles clean the mysql files to make sure we can start the same process again
+func (mysqlctl *MysqlctlProcess) CleanupFiles(tabletUID int) {
+	os.RemoveAll(path.Join(os.Getenv("VTDATAROOT"), fmt.Sprintf("/vt_%010d", tabletUID)))
+}
+
+// MysqlCtlProcessInstanceOptionalInit returns a Mysqlctl handle for mysqlctl process
 // configured with the given Config.
-func MysqlCtlProcessInstance(tabletUID int, mySQLPort int, tmpDirectory string) *MysqlctlProcess {
+func MysqlCtlProcessInstanceOptionalInit(tabletUID int, mySQLPort int, tmpDirectory string, initMySQL bool) (*MysqlctlProcess, error) {
+	initFile, err := getInitDBFileUsed()
+	if err != nil {
+		return nil, err
+	}
+
+	version, err := GetMajorVersion("mysqlctl")
+	if err != nil {
+		log.Warningf("failed to get major mysqlctl version; backwards-compatibility for CLI changes may not work: %s", err)
+	}
 	mysqlctl := &MysqlctlProcess{
 		Name:         "mysqlctl",
 		Binary:       "mysqlctl",
 		LogDirectory: tmpDirectory,
-		InitDBFile:   path.Join(os.Getenv("VTROOT"), "/config/init_db.sql"),
+		InitDBFile:   initFile,
+		MajorVersion: version,
 	}
 	mysqlctl.MySQLPort = mySQLPort
 	mysqlctl.TabletUID = tabletUID
-	return mysqlctl
+	mysqlctl.InitMysql = initMySQL
+	mysqlctl.SecureTransport = false
+	return mysqlctl, nil
+}
+
+func getInitDBFileUsed() (string, error) {
+	versionStr, err := mysqlctl.GetVersionString()
+	if err != nil {
+		return "", err
+	}
+	flavor, _, err := mysqlctl.ParseVersionString(versionStr)
+	if err != nil {
+		return "", err
+	}
+	if flavor == mysqlctl.FlavorMySQL || flavor == mysqlctl.FlavorPercona {
+		return path.Join(os.Getenv("VTROOT"), "/config/init_db.sql"), nil
+	}
+	// Non-MySQL instances for example MariaDB, will use init_testserver_db.sql which does not contain super_read_only global variable.
+	// Even though MariaDB support is deprecated (https://github.com/vitessio/vitess/issues/9518) but we still support migration scenario.
+	return path.Join(os.Getenv("VTROOT"), "go/test/endtoend/vreplication/testdata/config/init_testserver_db.sql"), nil
+}
+
+// MysqlCtlProcessInstance returns a Mysqlctl handle for mysqlctl process
+// configured with the given Config.
+func MysqlCtlProcessInstance(tabletUID int, mySQLPort int, tmpDirectory string) (*MysqlctlProcess, error) {
+	return MysqlCtlProcessInstanceOptionalInit(tabletUID, mySQLPort, tmpDirectory, true)
+}
+
+// StartMySQL starts mysqlctl process
+func StartMySQL(ctx context.Context, tablet *Vttablet, username string, tmpDirectory string) error {
+	mysqlctlProcess, err := MysqlCtlProcessInstance(tablet.TabletUID, tablet.MySQLPort, tmpDirectory)
+	if err != nil {
+		return err
+	}
+	tablet.MysqlctlProcess = *mysqlctlProcess
+	return tablet.MysqlctlProcess.Start()
+}
+
+// StartMySQLAndGetConnection create a connection to tablet mysql
+func StartMySQLAndGetConnection(ctx context.Context, tablet *Vttablet, username string, tmpDirectory string) (*mysql.Conn, error) {
+	mysqlctlProcess, err := MysqlCtlProcessInstance(tablet.TabletUID, tablet.MySQLPort, tmpDirectory)
+	if err != nil {
+		return nil, err
+	}
+	tablet.MysqlctlProcess = *mysqlctlProcess
+	err = tablet.MysqlctlProcess.Start()
+	if err != nil {
+		return nil, err
+	}
+	params := mysql.ConnParams{
+		Uname:      username,
+		UnixSocket: path.Join(os.Getenv("VTDATAROOT"), fmt.Sprintf("/vt_%010d", tablet.TabletUID), "/mysql.sock"),
+	}
+
+	return mysql.Connect(ctx, &params)
+}
+
+// ExecuteCommandWithOutput executes any mysqlctl command and returns output
+func (mysqlctl *MysqlctlProcess) ExecuteCommandWithOutput(args ...string) (result string, err error) {
+	tmpProcess := exec.Command(
+		mysqlctl.Binary,
+		args...,
+	)
+	log.Info(fmt.Sprintf("Executing mysqlctl with arguments %v", strings.Join(tmpProcess.Args, " ")))
+	resultByte, err := tmpProcess.CombinedOutput()
+	return string(resultByte), err
 }

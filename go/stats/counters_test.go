@@ -18,16 +18,18 @@ package stats
 
 import (
 	"expvar"
-	"math/rand"
+	"math/rand/v2"
 	"reflect"
 	"sort"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestCounters(t *testing.T) {
-	clear()
+	clearStats()
 	c := NewCountersWithSingleLabel("counter1", "help", "label")
 	c.Add("c1", 1)
 	c.Add("c2", 1)
@@ -47,7 +49,7 @@ func TestCounters(t *testing.T) {
 }
 
 func TestCountersTags(t *testing.T) {
-	clear()
+	clearStats()
 	c := NewCountersWithSingleLabel("counterTag1", "help", "label")
 	want := map[string]int64{}
 	got := c.Counts()
@@ -64,7 +66,7 @@ func TestCountersTags(t *testing.T) {
 }
 
 func TestMultiCounters(t *testing.T) {
-	clear()
+	clearStats()
 	c := NewCountersWithMultiLabels("mapCounter1", "help", []string{"aaa", "bbb"})
 	c.Add([]string{"c1a", "c1b"}, 1)
 	c.Add([]string{"c2a", "c2b"}, 1)
@@ -93,15 +95,15 @@ func TestMultiCounters(t *testing.T) {
 }
 
 func TestMultiCountersDot(t *testing.T) {
-	clear()
+	clearStats()
 	c := NewCountersWithMultiLabels("mapCounter2", "help", []string{"aaa", "bbb"})
 	c.Add([]string{"c1.a", "c1b"}, 1)
 	c.Add([]string{"c2a", "c2.b"}, 1)
 	c.Add([]string{"c2a", "c2.b"}, 1)
 	c1a := safeLabel("c1.a")
-	c1aJSON := strings.Replace(c1a, "\\", "\\\\", -1)
+	c1aJSON := strings.ReplaceAll(c1a, "\\", "\\\\")
 	c2b := safeLabel("c2.b")
-	c2bJSON := strings.Replace(c2b, "\\", "\\\\", -1)
+	c2bJSON := strings.ReplaceAll(c2b, "\\", "\\\\")
 	want1 := `{"` + c1aJSON + `.c1b": 1, "c2a.` + c2bJSON + `": 2}`
 	want2 := `{"c2a.` + c2bJSON + `": 2, "` + c1aJSON + `.c1b": 1}`
 	if s := c.String(); s != want1 && s != want2 {
@@ -119,7 +121,7 @@ func TestMultiCountersDot(t *testing.T) {
 func TestCountersHook(t *testing.T) {
 	var gotname string
 	var gotv *CountersWithSingleLabel
-	clear()
+	clearStats()
 	Register(func(name string, v expvar.Var) {
 		gotname = name
 		gotv = v.(*CountersWithSingleLabel)
@@ -137,7 +139,7 @@ func TestCountersHook(t *testing.T) {
 var benchCounter = NewCountersWithSingleLabel("bench", "help", "label")
 
 func BenchmarkCounters(b *testing.B) {
-	clear()
+	clearStats()
 	benchCounter.Add("c1", 1)
 	b.ResetTimer()
 
@@ -151,7 +153,7 @@ func BenchmarkCounters(b *testing.B) {
 var benchMultiCounter = NewCountersWithMultiLabels("benchMulti", "help", []string{"call", "keyspace", "dbtype"})
 
 func BenchmarkMultiCounters(b *testing.B) {
-	clear()
+	clearStats()
 	key := []string{"execute-key-ranges", "keyspacename", "replica"}
 	benchMultiCounter.Add(key, 1)
 	b.ResetTimer()
@@ -167,7 +169,7 @@ func BenchmarkCountersTailLatency(b *testing.B) {
 	// For this one, ignore the time reported by 'go test'.
 	// The 99th Percentile log line is all that matters.
 	// (Cmd: go test -bench=BenchmarkCountersTailLatency -benchtime=30s -cpu=10)
-	clear()
+	clearStats()
 	benchCounter.Add("c1", 1)
 	c := make(chan time.Duration, 100)
 	done := make(chan struct{})
@@ -187,13 +189,11 @@ func BenchmarkCountersTailLatency(b *testing.B) {
 	b.ResetTimer()
 	b.SetParallelism(100) // The actual number of goroutines is 100*GOMAXPROCS
 	b.RunParallel(func(pb *testing.PB) {
-		r := rand.New(rand.NewSource(time.Now().UnixNano()))
-
 		var start time.Time
 
 		for pb.Next() {
 			// sleep between 0~200ms to simulate 10 QPS per goroutine.
-			time.Sleep(time.Duration(r.Int63n(200)) * time.Millisecond)
+			time.Sleep(time.Duration(rand.Int64N(200)) * time.Millisecond)
 			start = time.Now()
 			benchCounter.Add("c1", 1)
 			c <- time.Since(start)
@@ -206,7 +206,7 @@ func BenchmarkCountersTailLatency(b *testing.B) {
 }
 
 func TestCountersFuncWithMultiLabels(t *testing.T) {
-	clear()
+	clearStats()
 	f := NewCountersFuncWithMultiLabels("TestCountersFuncWithMultiLabels", "help", []string{"label1"}, func() map[string]int64 {
 		return map[string]int64{
 			"c1": 1,
@@ -224,7 +224,7 @@ func TestCountersFuncWithMultiLabels(t *testing.T) {
 func TestCountersFuncWithMultiLabels_Hook(t *testing.T) {
 	var gotname string
 	var gotv *CountersFuncWithMultiLabels
-	clear()
+	clearStats()
 	Register(func(name string, v expvar.Var) {
 		gotname = name
 		gotv = v.(*CountersFuncWithMultiLabels)
@@ -239,4 +239,33 @@ func TestCountersFuncWithMultiLabels_Hook(t *testing.T) {
 	if gotv != v {
 		t.Errorf("want %#v, got %#v", v, gotv)
 	}
+}
+
+func TestCountersCombineDimension(t *testing.T) {
+	clearStats()
+	// Empty labels shouldn't be combined.
+	c0 := NewCountersWithSingleLabel("counter_combine_dim0", "help", "")
+	c0.Add("c1", 1)
+	assert.Equal(t, `{"c1": 1}`, c0.String())
+
+	clearStats()
+	combineDimensions = "a,c"
+
+	c1 := NewCountersWithSingleLabel("counter_combine_dim1", "help", "label")
+	c1.Add("c1", 1)
+	assert.Equal(t, `{"c1": 1}`, c1.String())
+
+	c2 := NewCountersWithSingleLabel("counter_combine_dim2", "help", "a")
+	c2.Add("c1", 1)
+	assert.Equal(t, `{"all": 1}`, c2.String())
+
+	c3 := NewCountersWithSingleLabel("counter_combine_dim3", "help", "a")
+	assert.Equal(t, `{"all": 0}`, c3.String())
+
+	// Anything under "a" and "c" should get reported under a consolidated "all" value
+	// instead of the specific supplied values.
+	c4 := NewCountersWithMultiLabels("counter_combine_dim4", "help", []string{"a", "b", "c"})
+	c4.Add([]string{"c1", "c2", "c3"}, 1)
+	c4.Add([]string{"c4", "c2", "c5"}, 1)
+	assert.Equal(t, `{"all.c2.all": 2}`, c4.String())
 }

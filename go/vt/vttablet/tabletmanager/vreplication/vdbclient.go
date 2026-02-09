@@ -17,30 +17,40 @@ limitations under the License.
 package vreplication
 
 import (
+	"context"
 	"io"
+	"strings"
 	"time"
 
-	"golang.org/x/net/context"
-	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/mysql/sqlerror"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/binlog/binlogplayer"
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/vterrors"
 )
+
+const beginStmtLen = int64(len("begin;"))
 
 // vdbClient is a wrapper on binlogplayer.DBClient.
 // It allows us to retry a failed transactions on lock errors.
 type vdbClient struct {
 	binlogplayer.DBClient
-	stats         *binlogplayer.Stats
-	InTransaction bool
-	startTime     time.Time
-	queries       []string
+	stats            *binlogplayer.Stats
+	InTransaction    bool
+	startTime        time.Time
+	queries          []string
+	queriesPos       int64
+	batchSize        int64
+	maxBatchSize     int64
+	relayLogMaxItems int
 }
 
-func newVDBClient(dbclient binlogplayer.DBClient, stats *binlogplayer.Stats) *vdbClient {
+func newVDBClient(dbclient binlogplayer.DBClient, stats *binlogplayer.Stats, relayLogMaxItems int) *vdbClient {
 	return &vdbClient{
-		DBClient: dbclient,
-		stats:    stats,
+		DBClient:         dbclient,
+		stats:            stats,
+		relayLogMaxItems: relayLogMaxItems,
 	}
 }
 
@@ -48,8 +58,18 @@ func (vc *vdbClient) Begin() error {
 	if vc.InTransaction {
 		return nil
 	}
-	if err := vc.DBClient.Begin(); err != nil {
-		return err
+	if vc.maxBatchSize > 0 {
+		// We are batching the contents of the transaction, which
+		// starts with the BEGIN and ends with the COMMIT, so we
+		// do not send a BEGIN down the wire ahead of time.
+		vc.queriesPos = int64(len(vc.queries))
+		vc.batchSize = beginStmtLen
+	} else {
+		// We're not batching so we start the transaction here
+		// by sending the BEGIN down the wire.
+		if err := vc.DBClient.Begin(); err != nil {
+			return err
+		}
 	}
 	vc.queries = append(vc.queries, "begin")
 	vc.InTransaction = true
@@ -63,11 +83,34 @@ func (vc *vdbClient) Commit() error {
 	}
 	vc.InTransaction = false
 	vc.queries = nil
+	vc.batchSize = 0
 	vc.stats.Timings.Record(binlogplayer.BlplTransaction, vc.startTime)
 	return nil
 }
 
+// CommitTrxQueryBatch sends the current transaction's query batch -- which
+// is often the full contents of the transaction, unless we've crossed
+// the maxBatchSize one or more times -- down the wire to the database,
+// including the final commit.
+func (vc *vdbClient) CommitTrxQueryBatch() error {
+	vc.queries = append(vc.queries, "commit")
+	queries := strings.Join(vc.queries[vc.queriesPos:], ";")
+	for _, err := vc.ExecuteFetchMulti(queries, -1); err != nil; {
+		return err
+	}
+	vc.InTransaction = false
+	vc.queries = nil
+	vc.queriesPos = 0
+	vc.batchSize = 0
+	vc.stats.TrxQueryBatchCount.Add("with_commit", 1)
+	vc.stats.Timings.Record(binlogplayer.BlplBatchTransaction, vc.startTime)
+	return nil
+}
+
 func (vc *vdbClient) Rollback() error {
+	if !vc.InTransaction {
+		return nil
+	}
 	if err := vc.DBClient.Rollback(); err != nil {
 		return err
 	}
@@ -87,16 +130,53 @@ func (vc *vdbClient) ExecuteFetch(query string, maxrows int) (*sqltypes.Result, 
 	return vc.DBClient.ExecuteFetch(query, maxrows)
 }
 
+// AddQueryToTrxBatch adds the query to the current transaction's query
+// batch. If this new query would cause the current batch to exceed
+// the maxBatchSize, then the current unsent batch is sent down the
+// wire and this query will be included in the next batch.
+func (vc *vdbClient) AddQueryToTrxBatch(query string) error {
+	if !vc.InTransaction {
+		return vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "cannot batch query outside of a transaction: %s", query)
+	}
+
+	addedSize := int64(len(query)) + 1 // Plus 1 for the semicolon
+	if vc.batchSize+addedSize > vc.maxBatchSize {
+		if _, err := vc.ExecuteTrxQueryBatch(); err != nil {
+			return err
+		}
+	}
+	vc.queries = append(vc.queries, query)
+	vc.batchSize += addedSize
+
+	return nil
+}
+
+// ExecuteQueryBatch sends the transaction's current batch of queries
+// down the wire to the database.
+func (vc *vdbClient) ExecuteTrxQueryBatch() ([]*sqltypes.Result, error) {
+	defer vc.stats.Timings.Record(binlogplayer.BlplMultiQuery, time.Now())
+
+	qrs, err := vc.ExecuteFetchMulti(strings.Join(vc.queries[vc.queriesPos:], ";"), -1)
+	if err != nil {
+		return nil, err
+	}
+	vc.stats.TrxQueryBatchCount.Add("without_commit", 1)
+	vc.queriesPos += int64(len(vc.queries[vc.queriesPos:]))
+	vc.batchSize = 0
+
+	return qrs, nil
+}
+
 // Execute is ExecuteFetch without the maxrows.
 func (vc *vdbClient) Execute(query string) (*sqltypes.Result, error) {
-	// Number of rows should never exceed relayLogMaxSize.
-	return vc.ExecuteFetch(query, relayLogMaxSize)
+	// Number of rows should never exceed relayLogMaxItems.
+	return vc.ExecuteFetch(query, vc.relayLogMaxItems)
 }
 
 func (vc *vdbClient) ExecuteWithRetry(ctx context.Context, query string) (*sqltypes.Result, error) {
 	qr, err := vc.Execute(query)
 	for err != nil {
-		if sqlErr, ok := err.(*mysql.SQLError); ok && sqlErr.Number() == mysql.ERLockDeadlock || sqlErr.Number() == mysql.ERLockWaitTimeout {
+		if sqlErr, ok := err.(*sqlerror.SQLError); ok && (sqlErr.Number() == sqlerror.ERLockDeadlock || sqlErr.Number() == sqlerror.ERLockWaitTimeout) {
 			log.Infof("retryable error: %v, waiting for %v and retrying", sqlErr, dbLockRetryDelay)
 			if err := vc.Rollback(); err != nil {
 				return nil, err
@@ -125,8 +205,8 @@ func (vc *vdbClient) Retry() (*sqltypes.Result, error) {
 			}
 			continue
 		}
-		// Number of rows should never exceed relayLogMaxSize.
-		result, err := vc.DBClient.ExecuteFetch(q, relayLogMaxSize)
+		// Number of rows should never exceed relayLogMaxItems.
+		result, err := vc.DBClient.ExecuteFetch(q, vc.relayLogMaxItems)
 		if err != nil {
 			return nil, err
 		}

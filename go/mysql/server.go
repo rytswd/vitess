@@ -17,27 +17,34 @@ limitations under the License.
 package mysql
 
 import (
+	"context"
 	"crypto/tls"
 	"io"
 	"net"
 	"strings"
+	"sync/atomic"
 	"time"
 
+	"github.com/pires/go-proxyproto"
+
+	"vitess.io/vitess/go/mysql/collations"
+	"vitess.io/vitess/go/mysql/replication"
+	"vitess.io/vitess/go/mysql/sqlerror"
 	"vitess.io/vitess/go/netutil"
+	"vitess.io/vitess/go/sqlescape"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/stats"
-	"vitess.io/vitess/go/sync2"
 	"vitess.io/vitess/go/tb"
 	"vitess.io/vitess/go/vt/log"
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	"vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/vtenv"
 	"vitess.io/vitess/go/vt/vterrors"
 )
 
 const (
 	// DefaultServerVersion is the default server version we're sending to the client.
 	// Can be changed.
-	DefaultServerVersion = "5.7.9-Vitess"
 
 	// timing metric keys
 	connectTimingKey  = "Connect"
@@ -45,6 +52,7 @@ const (
 	versionTLS10      = "TLS10"
 	versionTLS11      = "TLS11"
 	versionTLS12      = "TLS12"
+	versionTLS13      = "TLS13"
 	versionTLSUnknown = "UnknownTLSVersion"
 	versionNoTLS      = "None"
 )
@@ -54,7 +62,8 @@ var (
 	timings    = stats.NewTimings("MysqlServerTimings", "MySQL server timings", "operation")
 	connCount  = stats.NewGauge("MysqlServerConnCount", "Active MySQL server connections")
 	connAccept = stats.NewCounter("MysqlServerConnAccepted", "Connections accepted by MySQL server")
-	connSlow   = stats.NewCounter("MysqlServerConnSlow", "Connections that took more than the configured mysql_slow_connect_warn_threshold to establish")
+	connRefuse = stats.NewCounter("MysqlServerConnRefused", "Connections refused by MySQL server")
+	connSlow   = stats.NewCounter("MysqlServerConnSlow", "Connections that took more than the configured mysql-slow-connect-warn-threshold to establish")
 
 	connCountByTLSVer = stats.NewGaugesWithSingleLabel("MysqlServerConnCountByTLSVer", "Active MySQL server connections by TLS version", "tls")
 	connCountPerUser  = stats.NewGaugesWithSingleLabel("MysqlServerConnCountPerUser", "Active MySQL server connections per user", "count")
@@ -85,12 +94,12 @@ type Handler interface {
 	// In particular, ServerStatusAutocommit might be set.
 	NewConnection(c *Conn)
 
+	// ConnectionReady is called after the connection handshake, but
+	// before we begin to process commands.
+	ConnectionReady(c *Conn)
+
 	// ConnectionClosed is called when a connection is closed.
 	ConnectionClosed(c *Conn)
-
-	// InitDB is called once at the beginning to set db name,
-	// and subsequently for every ComInitDB event.
-	ComInitDB(c *Conn, schemaName string)
 
 	// ComQuery is called when a connection receives a query.
 	// Note the contents of the query slice may change after
@@ -98,13 +107,25 @@ type Handler interface {
 	// hang on to the byte slice.
 	ComQuery(c *Conn, query string, callback func(*sqltypes.Result) error) error
 
+	// ComQueryMulti is a newer version of ComQuery that supports running multiple queries in a single call.
+	ComQueryMulti(c *Conn, sql string, callback func(qr sqltypes.QueryResponse, more bool, firstPacket bool) error) error
+
 	// ComPrepare is called when a connection receives a prepared
 	// statement query.
-	ComPrepare(c *Conn, query string) ([]*querypb.Field, error)
+	ComPrepare(c *Conn, query string) ([]*querypb.Field, uint16, error)
 
 	// ComStmtExecute is called when a connection receives a statement
 	// execute query.
 	ComStmtExecute(c *Conn, prepare *PrepareData, callback func(*sqltypes.Result) error) error
+
+	// ComRegisterReplica is called when a connection receives a ComRegisterReplica request
+	ComRegisterReplica(c *Conn, replicaHost string, replicaPort uint16, replicaUser string, replicaPassword string) error
+
+	// ComBinlogDump is called when a connection receives a ComBinlogDump request
+	ComBinlogDump(c *Conn, logFile string, binlogPos uint32) error
+
+	// ComBinlogDumpGTID is called when a connection receives a ComBinlogDumpGTID request
+	ComBinlogDumpGTID(c *Conn, logFile string, logPos uint64, gtidSet replication.GTIDSet) error
 
 	// WarningCount is called at the end of each query to obtain
 	// the value to be returned to the client in the EOF packet.
@@ -114,7 +135,20 @@ type Handler interface {
 	WarningCount(c *Conn) uint16
 
 	ComResetConnection(c *Conn)
+
+	Env() *vtenv.Environment
 }
+
+// UnimplementedHandler implemnts all of the optional callbacks so as to satisy
+// the Handler interface. Intended to be embedded into your custom Handler
+// implementation without needing to define every callback and to help be forwards
+// compatible when new functions are added.
+type UnimplementedHandler struct{}
+
+func (UnimplementedHandler) NewConnection(*Conn)      {}
+func (UnimplementedHandler) ConnectionReady(*Conn)    {}
+func (UnimplementedHandler) ConnectionClosed(*Conn)   {}
+func (UnimplementedHandler) ComResetConnection(*Conn) {}
 
 // Listener is the MySQL server protocol listener.
 type Listener struct {
@@ -139,16 +173,17 @@ type Listener struct {
 
 	// TLSConfig is the server TLS config. If set, we will advertise
 	// that we support SSL.
-	TLSConfig *tls.Config
+	// atomic value stores *tls.Config
+	TLSConfig atomic.Value
 
 	// AllowClearTextWithoutTLS needs to be set for the
 	// mysql_clear_password authentication method to be accepted
 	// by the server when TLS is not in use.
-	AllowClearTextWithoutTLS bool
+	AllowClearTextWithoutTLS atomic.Bool
 
 	// SlowConnectWarnThreshold if non-zero specifies an amount of time
 	// beyond which a warning is logged to identify the slow connection
-	SlowConnectWarnThreshold time.Duration
+	SlowConnectWarnThreshold atomic.Int64
 
 	// The following parameters are changed by the Accept routine.
 
@@ -163,47 +198,103 @@ type Listener struct {
 	// Reads are unbuffered if it's <=0.
 	connReadBufferSize int
 
+	// connBufferPooling configures if vtgate server pools connection buffers
+	connBufferPooling bool
+
+	multiQuery bool
+
+	// connKeepAlivePeriod is period between tcp keep-alives.
+	connKeepAlivePeriod time.Duration
+
 	// shutdown indicates that Shutdown method was called.
-	shutdown sync2.AtomicBool
+	shutdown atomic.Bool
 
 	// RequireSecureTransport configures the server to reject connections from insecure clients
 	RequireSecureTransport bool
+
+	// PreHandleFunc is called for each incoming connection, immediately after
+	// accepting a new connection. By default it's no-op. Useful for custom
+	// connection inspection or TLS termination. The returned connection is
+	// handled further by the MySQL handler. An non-nil error will stop
+	// processing the connection by the MySQL handler.
+	PreHandleFunc func(context.Context, net.Conn, uint32) (net.Conn, error)
+
+	// flushDelay is the delay after which buffered response will be flushed to the client.
+	flushDelay time.Duration
+
+	// charset is the default server side character set to use for the connection
+	charset collations.ID
+	// parser to use for this listener, configured with the correct version.
+	truncateErrLen int
 }
 
-// NewFromListener creares a new mysql listener from an existing net.Listener
-func NewFromListener(l net.Listener, authServer AuthServer, handler Handler, connReadTimeout time.Duration, connWriteTimeout time.Duration) (*Listener, error) {
+// NewFromListener creates a new mysql listener from an existing net.Listener
+func NewFromListener(
+	l net.Listener,
+	authServer AuthServer,
+	handler Handler,
+	connReadTimeout time.Duration,
+	connWriteTimeout time.Duration,
+	connBufferPooling bool,
+	keepAlivePeriod time.Duration,
+	flushDelay time.Duration,
+	multiQuery bool,
+) (*Listener, error) {
 	cfg := ListenerConfig{
-		Listener:           l,
-		AuthServer:         authServer,
-		Handler:            handler,
-		ConnReadTimeout:    connReadTimeout,
-		ConnWriteTimeout:   connWriteTimeout,
-		ConnReadBufferSize: connBufferSize,
+		Listener:            l,
+		AuthServer:          authServer,
+		Handler:             handler,
+		ConnReadTimeout:     connReadTimeout,
+		ConnWriteTimeout:    connWriteTimeout,
+		ConnReadBufferSize:  connBufferSize,
+		ConnBufferPooling:   connBufferPooling,
+		ConnKeepAlivePeriod: keepAlivePeriod,
+		FlushDelay:          flushDelay,
+		MultiQuery:          multiQuery,
 	}
 	return NewListenerWithConfig(cfg)
 }
 
 // NewListener creates a new Listener.
-func NewListener(protocol, address string, authServer AuthServer, handler Handler, connReadTimeout time.Duration, connWriteTimeout time.Duration) (*Listener, error) {
+func NewListener(
+	protocol, address string,
+	authServer AuthServer,
+	handler Handler,
+	connReadTimeout time.Duration,
+	connWriteTimeout time.Duration,
+	proxyProtocol bool,
+	connBufferPooling bool,
+	keepAlivePeriod time.Duration,
+	flushDelay time.Duration,
+	multiQuery bool,
+) (*Listener, error) {
 	listener, err := net.Listen(protocol, address)
 	if err != nil {
 		return nil, err
 	}
+	if proxyProtocol {
+		proxyListener := &proxyproto.Listener{Listener: listener}
+		return NewFromListener(proxyListener, authServer, handler, connReadTimeout, connWriteTimeout, connBufferPooling, keepAlivePeriod, flushDelay, multiQuery)
+	}
 
-	return NewFromListener(listener, authServer, handler, connReadTimeout, connWriteTimeout)
+	return NewFromListener(listener, authServer, handler, connReadTimeout, connWriteTimeout, connBufferPooling, keepAlivePeriod, flushDelay, multiQuery)
 }
 
 // ListenerConfig should be used with NewListenerWithConfig to specify listener parameters.
 type ListenerConfig struct {
 	// Protocol-Address pair and Listener are mutually exclusive parameters
-	Protocol           string
-	Address            string
-	Listener           net.Listener
-	AuthServer         AuthServer
-	Handler            Handler
-	ConnReadTimeout    time.Duration
-	ConnWriteTimeout   time.Duration
-	ConnReadBufferSize int
+	Protocol            string
+	Address             string
+	Listener            net.Listener
+	AuthServer          AuthServer
+	Handler             Handler
+	ConnReadTimeout     time.Duration
+	ConnWriteTimeout    time.Duration
+	ConnReadBufferSize  int
+	ConnBufferPooling   bool
+	ConnKeepAlivePeriod time.Duration
+	FlushDelay          time.Duration
+	MultiQuery          bool
 }
 
 // NewListenerWithConfig creates new listener using provided config. There are
@@ -221,14 +312,20 @@ func NewListenerWithConfig(cfg ListenerConfig) (*Listener, error) {
 	}
 
 	return &Listener{
-		authServer:         cfg.AuthServer,
-		handler:            cfg.Handler,
-		listener:           l,
-		ServerVersion:      DefaultServerVersion,
-		connectionID:       1,
-		connReadTimeout:    cfg.ConnReadTimeout,
-		connWriteTimeout:   cfg.ConnWriteTimeout,
-		connReadBufferSize: cfg.ConnReadBufferSize,
+		authServer:          cfg.AuthServer,
+		handler:             cfg.Handler,
+		listener:            l,
+		ServerVersion:       cfg.Handler.Env().MySQLVersion(),
+		connectionID:        1,
+		connReadTimeout:     cfg.ConnReadTimeout,
+		connWriteTimeout:    cfg.ConnWriteTimeout,
+		connReadBufferSize:  cfg.ConnReadBufferSize,
+		connBufferPooling:   cfg.ConnBufferPooling,
+		connKeepAlivePeriod: cfg.ConnKeepAlivePeriod,
+		flushDelay:          cfg.FlushDelay,
+		multiQuery:          cfg.MultiQuery,
+		truncateErrLen:      cfg.Handler.Env().TruncateErrLen(),
+		charset:             cfg.Handler.Env().CollationEnv().DefaultConnectionCharset(),
 	}, nil
 }
 
@@ -239,10 +336,13 @@ func (l *Listener) Addr() net.Addr {
 
 // Accept runs an accept loop until the listener is closed.
 func (l *Listener) Accept() {
+	ctx := context.Background()
+
 	for {
 		conn, err := l.listener.Accept()
 		if err != nil {
 			// Close() was probably called.
+			connRefuse.Add(1)
 			return
 		}
 
@@ -254,7 +354,17 @@ func (l *Listener) Accept() {
 		connCount.Add(1)
 		connAccept.Add(1)
 
-		go l.handle(conn, connectionID, acceptTime)
+		go func() {
+			if l.PreHandleFunc != nil {
+				conn, err = l.PreHandleFunc(ctx, conn, connectionID)
+				if err != nil {
+					log.Errorf("mysql_server pre hook: %s", err)
+					return
+				}
+			}
+
+			l.handle(conn, connectionID, acceptTime)
+		}()
 	}
 }
 
@@ -272,9 +382,13 @@ func (l *Listener) handle(conn net.Conn, connectionID uint32, acceptTime time.Ti
 		if x := recover(); x != nil {
 			log.Errorf("mysql_server caught panic:\n%v\n%s", x, tb.Stack(4))
 		}
-		// We call flush here in case there's a premature return after
+		// We call endWriterBuffering here in case there's a premature return after
 		// startWriterBuffering is called
-		c.flush()
+		c.endWriterBuffering()
+
+		if l.connBufferPooling {
+			c.returnReader()
+		}
 
 		conn.Close()
 	}()
@@ -287,7 +401,7 @@ func (l *Listener) handle(conn net.Conn, connectionID uint32, acceptTime time.Ti
 	defer connCount.Add(-1)
 
 	// First build and send the server handshake packet.
-	salt, err := c.writeHandshakeV10(l.ServerVersion, l.authServer, l.TLSConfig != nil)
+	serverAuthPluginData, err := c.writeHandshakeV10(l.ServerVersion, l.authServer, uint8(l.charset), l.TLSConfig.Load() != nil)
 	if err != nil {
 		if err != io.EOF {
 			log.Errorf("Cannot send HandshakeV10 packet to %s: %v", c, err)
@@ -305,7 +419,7 @@ func (l *Listener) handle(conn net.Conn, connectionID uint32, acceptTime time.Ti
 		}
 		return
 	}
-	user, authMethod, authResponse, err := l.parseClientHandshakePacket(c, true, response)
+	user, clientAuthMethod, clientAuthResponse, err := l.parseClientHandshakePacket(c, true, response)
 	if err != nil {
 		log.Errorf("Cannot parse client handshake response from %s: %v", c, err)
 		return
@@ -313,7 +427,7 @@ func (l *Listener) handle(conn net.Conn, connectionID uint32, acceptTime time.Ti
 
 	c.recycleReadPacket()
 
-	if c.Capabilities&CapabilityClientSSL > 0 {
+	if c.TLSEnabled() {
 		// SSL was enabled. We need to re-read the auth packet.
 		response, err = c.readEphemeralPacket()
 		if err != nil {
@@ -322,7 +436,7 @@ func (l *Listener) handle(conn net.Conn, connectionID uint32, acceptTime time.Ti
 		}
 
 		// Returns copies of the data, so we can recycle the buffer.
-		user, authMethod, authResponse, err = l.parseClientHandshakePacket(c, false, response)
+		user, clientAuthMethod, clientAuthResponse, err = l.parseClientHandshakePacket(c, false, response)
 		if err != nil {
 			log.Errorf("Cannot parse post-SSL client handshake response from %s: %v", c, err)
 			return
@@ -340,103 +454,92 @@ func (l *Listener) handle(conn net.Conn, connectionID uint32, acceptTime time.Ti
 	} else {
 		if l.RequireSecureTransport {
 			c.writeErrorPacketFromError(vterrors.Errorf(vtrpc.Code_UNAVAILABLE, "server does not allow insecure connections, client must use SSL/TLS"))
+			return
 		}
 		connCountByTLSVer.Add(versionNoTLS, 1)
 		defer connCountByTLSVer.Add(versionNoTLS, -1)
 	}
 
 	// See what auth method the AuthServer wants to use for that user.
-	authServerMethod, err := l.authServer.AuthMethod(user)
-	if err != nil {
-		c.writeErrorPacketFromError(err)
-		return
-	}
+	negotiatedAuthMethod, err := negotiateAuthMethod(c, l.authServer, user, clientAuthMethod)
 
-	// Compare with what the client sent back.
-	switch {
-	case authServerMethod == MysqlNativePassword && authMethod == MysqlNativePassword:
-		// Both server and client want to use MysqlNativePassword:
-		// the negotiation can be completed right away, using the
-		// ValidateHash() method.
-		userData, err := l.authServer.ValidateHash(salt, user, authResponse, conn.RemoteAddr())
+	// We need to send down an additional packet if we either have no negotiated method
+	// at all or incomplete authentication data.
+	//
+	// The latter case happens for example for MySQL 8.0 clients until 8.0.25 who advertise
+	// support for caching_sha2_password by default but with no plugin data.
+	if err != nil || len(clientAuthResponse) == 0 {
+		// If we have no negotiated method yet, we pick the first one
+		// we know about ourselves as that's the last resort option we have here.
 		if err != nil {
-			log.Warningf("Error authenticating user using MySQL native password: %v", err)
-			c.writeErrorPacketFromError(err)
+			// The client will disconnect if it doesn't understand
+			// the first auth method that we send, so we only have to send the
+			// first one that we allow for the user.
+			for _, m := range l.authServer.AuthMethods() {
+				if m.HandleUser(c, user) {
+					negotiatedAuthMethod = m
+					break
+				}
+			}
+		}
+
+		if negotiatedAuthMethod == nil {
+			c.writeErrorPacket(sqlerror.CRServerHandshakeErr, sqlerror.SSUnknownSQLState, "No authentication methods available for authentication.")
 			return
 		}
-		c.User = user
-		c.UserData = userData
 
-	case authServerMethod == MysqlNativePassword:
-		// The server really wants to use MysqlNativePassword,
-		// but the client returned a result for something else.
-
-		salt, err := l.authServer.Salt()
-		if err != nil {
+		if !l.AllowClearTextWithoutTLS.Load() && !c.TLSEnabled() && !negotiatedAuthMethod.AllowClearTextWithoutTLS() {
+			c.writeErrorPacket(sqlerror.CRServerHandshakeErr, sqlerror.SSUnknownSQLState, "Cannot use clear text authentication over non-SSL connections.")
 			return
 		}
-		//lint:ignore SA4006 This line is required because the binary protocol requires padding with 0
-		data := make([]byte, 21)
-		data = append(salt, byte(0x00))
-		if err := c.writeAuthSwitchRequest(MysqlNativePassword, data); err != nil {
+
+		serverAuthPluginData, err = negotiatedAuthMethod.AuthPluginData()
+		if err != nil {
+			log.Errorf("Error generating auth switch packet for %s: %v", c, err)
+			return
+		}
+
+		if err := c.writeAuthSwitchRequest(string(negotiatedAuthMethod.Name()), serverAuthPluginData); err != nil {
 			log.Errorf("Error writing auth switch packet for %s: %v", c, err)
 			return
 		}
 
-		response, err := c.readEphemeralPacket()
+		clientAuthResponse, err = c.readEphemeralPacket()
 		if err != nil {
 			log.Errorf("Error reading auth switch response for %s: %v", c, err)
 			return
 		}
 		c.recycleReadPacket()
-
-		userData, err := l.authServer.ValidateHash(salt, user, response, conn.RemoteAddr())
-		if err != nil {
-			log.Warningf("Error authenticating user using MySQL native password: %v", err)
-			c.writeErrorPacketFromError(err)
-			return
-		}
-		c.User = user
-		c.UserData = userData
-
-	default:
-		// The server wants to use something else, re-negotiate.
-
-		// The negotiation happens in clear text. Let's check we can.
-		if !l.AllowClearTextWithoutTLS && c.Capabilities&CapabilityClientSSL == 0 {
-			c.writeErrorPacket(CRServerHandshakeErr, SSUnknownSQLState, "Cannot use clear text authentication over non-SSL connections.")
-			return
-		}
-
-		// Switch our auth method to what the server wants.
-		// Dialog plugin expects an AskPassword prompt.
-		var data []byte
-		if authServerMethod == MysqlDialog {
-			data = authServerDialogSwitchData()
-		}
-		if err := c.writeAuthSwitchRequest(authServerMethod, data); err != nil {
-			log.Errorf("Error writing auth switch packet for %s: %v", c, err)
-			return
-		}
-
-		// Then hand over the rest of the negotiation to the
-		// auth server.
-		userData, err := l.authServer.Negotiate(c, user, conn.RemoteAddr())
-		if err != nil {
-			c.writeErrorPacketFromError(err)
-			return
-		}
-		c.User = user
-		c.UserData = userData
 	}
+
+	userData, err := negotiatedAuthMethod.HandleAuthPluginData(c, user, serverAuthPluginData, clientAuthResponse, conn.RemoteAddr())
+	if err != nil {
+		log.Warningf("Error authenticating user %s using: %s", user, negotiatedAuthMethod.Name())
+		c.writeErrorPacketFromError(err)
+		return
+	}
+
+	c.User = user
+	c.UserData = userData
 
 	if c.User != "" {
 		connCountPerUser.Add(c.User, 1)
 		defer connCountPerUser.Add(c.User, -1)
 	}
 
+	// Set initial db name.
+	if c.schemaName != "" {
+		err = l.handler.ComQuery(c, "use "+sqlescape.EscapeID(c.schemaName), func(result *sqltypes.Result) error {
+			return nil
+		})
+		if err != nil {
+			c.writeErrorPacketFromError(err)
+			return
+		}
+	}
+
 	// Negotiation worked, send OK packet.
-	if err := c.writeOKPacket(0, 0, c.StatusFlags, 0); err != nil {
+	if err := c.writeOKPacket(&PacketOK{statusFlags: c.StatusFlags}); err != nil {
 		log.Errorf("Cannot write OK packet to %s: %v", c, err)
 		return
 	}
@@ -445,18 +548,20 @@ func (l *Listener) handle(conn net.Conn, connectionID uint32, acceptTime time.Ti
 	timings.Record(connectTimingKey, acceptTime)
 
 	// Log a warning if it took too long to connect
-	connectTime := time.Since(acceptTime)
-	if l.SlowConnectWarnThreshold != 0 && connectTime > l.SlowConnectWarnThreshold {
+	connectTime := time.Since(acceptTime).Nanoseconds()
+	if threshold := l.SlowConnectWarnThreshold.Load(); threshold != 0 && connectTime > threshold {
 		connSlow.Add(1)
 		log.Warningf("Slow connection from %s: %v", c, connectTime)
 	}
 
-	// Set initial db name.
-	l.handler.ComInitDB(c, c.schemaName)
+	// Tell our handler that we're finished handshake and are ready to
+	// process commands.
+	l.handler.ConnectionReady(c)
 
 	for {
-		err := c.handleNextCommand(l.handler)
-		if err != nil {
+		kontinue := c.handleNextCommand(l.handler)
+		// before going for next command check if the connection should be closed or not.
+		if !kontinue || c.IsMarkedForClose() {
 			return
 		}
 	}
@@ -475,14 +580,11 @@ func (l *Listener) Shutdown() {
 	}
 }
 
-func (l *Listener) isShutdown() bool {
-	return l.shutdown.Get()
-}
-
 // writeHandshakeV10 writes the Initial Handshake Packet, server side.
 // It returns the salt data.
-func (c *Conn) writeHandshakeV10(serverVersion string, authServer AuthServer, enableTLS bool) ([]byte, error) {
+func (c *Conn) writeHandshakeV10(serverVersion string, authServer AuthServer, charset uint8, enableTLS bool) ([]byte, error) {
 	capabilities := CapabilityClientLongPassword |
+		CapabilityClientFoundRows |
 		CapabilityClientLongFlag |
 		CapabilityClientConnectWithDB |
 		CapabilityClientProtocol41 |
@@ -498,23 +600,33 @@ func (c *Conn) writeHandshakeV10(serverVersion string, authServer AuthServer, en
 		capabilities |= CapabilityClientSSL
 	}
 
-	length :=
-		1 + // protocol version
-			lenNullString(serverVersion) +
-			4 + // connection ID
-			8 + // first part of salt data
-			1 + // filler byte
-			2 + // capability flags (lower 2 bytes)
-			1 + // character set
-			2 + // status flag
-			2 + // capability flags (upper 2 bytes)
-			1 + // length of auth plugin data
-			10 + // reserved (0)
-			13 + // auth-plugin-data
-			lenNullString(MysqlNativePassword) // auth-plugin-name
+	// Grab the default auth method. This can only be either
+	// mysql_native_password or caching_sha2_password. Both
+	// need the salt as well to be present too.
+	//
+	// Any other auth method will cause clients to throw a
+	// handshake error.
+	authMethod := authServer.DefaultAuthMethodDescription()
 
-	data := c.startEphemeralPacket(length)
-	pos := 0
+	if authMethod != MysqlNativePassword && authMethod != CachingSha2Password {
+		authMethod = MysqlNativePassword
+	}
+
+	length := 1 + // protocol version
+		lenNullString(serverVersion) +
+		4 + // connection ID
+		8 + // first part of plugin auth data
+		1 + // filler byte
+		2 + // capability flags (lower 2 bytes)
+		1 + // character set
+		2 + // status flag
+		2 + // capability flags (upper 2 bytes)
+		1 + // length of auth plugin data
+		10 + // reserved (0)
+		13 + // auth-plugin-data
+		lenNullString(string(authMethod)) // auth-plugin-name
+
+	data, pos := c.startEphemeralPacketWithHeader(length)
 
 	// Protocol version.
 	pos = writeByte(data, pos, protocolVersion)
@@ -525,13 +637,17 @@ func (c *Conn) writeHandshakeV10(serverVersion string, authServer AuthServer, en
 	// Add connectionID in.
 	pos = writeUint32(data, pos, c.ConnectionID)
 
-	// Generate the salt, put 8 bytes in.
-	salt, err := authServer.Salt()
+	// Generate the salt as the plugin data. Will be reused
+	// later on if no auth method switch happens and the real
+	// auth method is also mysql_native_password or caching_sha2_password.
+	pluginData, err := newSalt()
 	if err != nil {
 		return nil, err
 	}
+	// Plugin data is always defined as having a trailing NULL
+	pluginData = append(pluginData, 0)
 
-	pos += copy(data[pos:], salt[:8])
+	pos += copy(data[pos:], pluginData[:8])
 
 	// One filler byte, always 0.
 	pos = writeByte(data, pos, 0)
@@ -540,7 +656,7 @@ func (c *Conn) writeHandshakeV10(serverVersion string, authServer AuthServer, en
 	pos = writeUint16(data, pos, uint16(capabilities))
 
 	// Character set.
-	pos = writeByte(data, pos, CharacterSetUtf8)
+	pos = writeByte(data, pos, charset)
 
 	// Status flag.
 	pos = writeUint16(data, pos, c.StatusFlags)
@@ -556,12 +672,11 @@ func (c *Conn) writeHandshakeV10(serverVersion string, authServer AuthServer, en
 	pos = writeZeroes(data, pos, 10)
 
 	// Second part of auth plugin data.
-	pos += copy(data[pos:], salt[8:])
-	data[pos] = 0
-	pos++
+	pos += copy(data[pos:], pluginData[8:])
 
-	// Copy authPluginName. We always start with mysql_native_password.
-	pos = writeNullString(data, pos, MysqlNativePassword)
+	// Copy authPluginName. We always start with the first
+	// registered auth method name.
+	pos = writeNullString(data, pos, string(authMethod))
 
 	// Sanity check.
 	if pos != len(data) {
@@ -578,13 +693,13 @@ func (c *Conn) writeHandshakeV10(serverVersion string, authServer AuthServer, en
 		return nil, err
 	}
 
-	return salt, nil
+	return pluginData, nil
 }
 
 // parseClientHandshakePacket parses the handshake sent by the client.
-// Returns the username, auth method, auth data, error.
+// Returns the username, auth method, auth data, connection attributes, error.
 // The original data is not pointed at, and can be freed.
-func (l *Listener) parseClientHandshakePacket(c *Conn, firstTime bool, data []byte) (string, string, []byte, error) {
+func (l *Listener) parseClientHandshakePacket(c *Conn, firstTime bool, data []byte) (string, AuthMethodDescription, []byte, error) {
 	pos := 0
 
 	// Client flags, 4 bytes.
@@ -620,15 +735,15 @@ func (l *Listener) parseClientHandshakePacket(c *Conn, firstTime bool, data []by
 	if !ok {
 		return "", "", nil, vterrors.Errorf(vtrpc.Code_INTERNAL, "parseClientHandshakePacket: can't read characterSet")
 	}
-	c.CharacterSet = characterSet
+	c.CharacterSet = collations.ID(characterSet)
 
 	// 23x reserved zero bytes.
 	pos += 23
 
 	// Check for SSL.
-	if firstTime && l.TLSConfig != nil && clientFlags&CapabilityClientSSL > 0 {
+	if firstTime && l.TLSConfig.Load() != nil && clientFlags&CapabilityClientSSL > 0 {
 		// Need to switch to TLS, and then re-read the packet.
-		conn := tls.Server(c.conn, l.TLSConfig)
+		conn := tls.Server(c.conn, l.TLSConfig.Load().(*tls.Config))
 		c.conn = conn
 		c.bufferedReader.Reset(conn)
 		c.Capabilities |= CapabilityClientSSL
@@ -653,7 +768,6 @@ func (l *Listener) parseClientHandshakePacket(c *Conn, firstTime bool, data []by
 		if !ok {
 			return "", "", nil, vterrors.Errorf(vtrpc.Code_INTERNAL, "parseClientHandshakePacket: can't read auth-response")
 		}
-
 	} else if clientFlags&CapabilityClientSecureConnection != 0 {
 		var l byte
 		l, pos, ok = readByte(data, pos)
@@ -687,71 +801,56 @@ func (l *Listener) parseClientHandshakePacket(c *Conn, firstTime bool, data []by
 	// authMethod (with default)
 	authMethod := MysqlNativePassword
 	if clientFlags&CapabilityClientPluginAuth != 0 {
-		authMethod, pos, ok = readNullString(data, pos)
+		var authMethodStr string
+		authMethodStr, pos, ok = readNullString(data, pos)
 		if !ok {
 			return "", "", nil, vterrors.Errorf(vtrpc.Code_INTERNAL, "parseClientHandshakePacket: can't read authMethod")
 		}
-	}
-
-	// The JDBC driver sometimes sends an empty string as the auth method when it wants to use mysql_native_password
-	if authMethod == "" {
-		authMethod = MysqlNativePassword
+		// The JDBC driver sometimes sends an empty string as the auth method when it wants to use mysql_native_password
+		if authMethodStr != "" {
+			authMethod = AuthMethodDescription(authMethodStr)
+		}
 	}
 
 	// Decode connection attributes send by the client
 	if clientFlags&CapabilityClientConnAttr != 0 {
-		if _, _, err := parseConnAttrs(data, pos); err != nil {
+		clientAttributes, _, err := parseConnAttrs(data, pos)
+		if err != nil {
 			log.Warningf("Decode connection attributes send by the client: %v", err)
 		}
+
+		c.Attributes = clientAttributes
 	}
 
-	return username, authMethod, authResponse, nil
+	return username, AuthMethodDescription(authMethod), authResponse, nil
 }
 
-func parseConnAttrs(data []byte, pos int) (map[string]string, int, error) {
-	var attrLen uint64
+func parseConnAttrs(data []byte, pos int) (ConnectionAttributes, int, error) {
+	attrs := make(map[string]string)
 
 	attrLen, pos, ok := readLenEncInt(data, pos)
 	if !ok {
 		return nil, 0, vterrors.Errorf(vtrpc.Code_INTERNAL, "parseClientHandshakePacket: can't read connection attributes variable length")
 	}
 
-	var attrLenRead uint64
+	addrEndPos := pos + int(attrLen)
 
-	attrs := make(map[string]string)
-
-	for attrLenRead < attrLen {
-		var keyLen byte
-		keyLen, pos, ok = readByte(data, pos)
-		if !ok {
-			return nil, 0, vterrors.Errorf(vtrpc.Code_INTERNAL, "parseClientHandshakePacket: can't read connection attribute key length")
-		}
-		attrLenRead += uint64(keyLen) + 1
-
-		var connAttrKey []byte
-		connAttrKey, pos, ok = readBytesCopy(data, pos, int(keyLen))
+	var key, value string
+	for pos < addrEndPos {
+		key, pos, ok = readLenEncString(data, pos)
 		if !ok {
 			return nil, 0, vterrors.Errorf(vtrpc.Code_INTERNAL, "parseClientHandshakePacket: can't read connection attribute key")
 		}
 
-		var valLen byte
-		valLen, pos, ok = readByte(data, pos)
-		if !ok {
-			return nil, 0, vterrors.Errorf(vtrpc.Code_INTERNAL, "parseClientHandshakePacket: can't read connection attribute value length")
-		}
-		attrLenRead += uint64(valLen) + 1
-
-		var connAttrVal []byte
-		connAttrVal, pos, ok = readBytesCopy(data, pos, int(valLen))
+		value, pos, ok = readLenEncString(data, pos)
 		if !ok {
 			return nil, 0, vterrors.Errorf(vtrpc.Code_INTERNAL, "parseClientHandshakePacket: can't read connection attribute value")
 		}
 
-		attrs[string(connAttrKey[:])] = string(connAttrVal[:])
+		attrs[key] = value
 	}
 
 	return attrs, pos, nil
-
 }
 
 // writeAuthSwitchRequest writes an auth switch request packet.
@@ -760,8 +859,7 @@ func (c *Conn) writeAuthSwitchRequest(pluginName string, pluginData []byte) erro
 		len(pluginName) + 1 + // 0-terminated pluginName
 		len(pluginData)
 
-	data := c.startEphemeralPacket(length)
-	pos := 0
+	data, pos := c.startEphemeralPacketWithHeader(length)
 
 	// Packet header.
 	pos = writeByte(data, pos, AuthSwitchRequestPacket)
@@ -788,6 +886,8 @@ func tlsVersionToString(version uint16) string {
 		return versionTLS11
 	case tls.VersionTLS12:
 		return versionTLS12
+	case tls.VersionTLS13:
+		return versionTLS13
 	default:
 		return versionTLSUnknown
 	}

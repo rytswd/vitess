@@ -25,7 +25,7 @@ import io.vitess.client.RpcClient;
 import io.vitess.client.RpcClientTest;
 import io.vitess.client.grpc.GrpcClientFactory;
 import io.vitess.client.grpc.StaticAuthCredentials;
-import io.vitess.proto.Vtgate.GetSrvKeyspaceRequest;
+import io.vitess.proto.Vtgate.ExecuteRequest;
 
 import org.joda.time.Duration;
 
@@ -62,11 +62,11 @@ public class GrpcClientStaticAuthTest extends RpcClientTest {
 
     vtgateclienttest = new ProcessBuilder(Arrays.asList(
         vtRoot + "/bin/vtgateclienttest",
-        "-logtostderr",
-        "-grpc_port", Integer.toString(port),
-        "-service_map", "grpc-vtgateservice",
-        "-grpc_auth_mode", "static",
-        "-grpc_auth_static_password_file", staticAuthFile.getPath()
+        "--logtostderr",
+        "--grpc-port", Integer.toString(port),
+        "--service-map", "grpc-vtgateservice",
+        "--grpc-auth-mode", "static",
+        "--grpc-auth-static-password-file", staticAuthFile.getPath()
     )).inheritIO().start();
 
     Context ctx = Context.getDefault().withDeadlineAfter(Duration.millis(5000L));
@@ -92,7 +92,7 @@ public class GrpcClientStaticAuthTest extends RpcClientTest {
         .setCallCredentials(new StaticAuthCredentials("test-username", "WRONG-password"))
         .create(Context.getDefault(), "localhost:" + port);
     try {
-      client.getSrvKeyspace(Context.getDefault(), GetSrvKeyspaceRequest.getDefaultInstance()).get();
+      client.execute(Context.getDefault(), ExecuteRequest.getDefaultInstance()).get();
       Assert.fail();
     } catch (ExecutionException e) {
       StatusRuntimeException cause = (StatusRuntimeException) Throwables.getRootCause(e);

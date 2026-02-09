@@ -72,28 +72,28 @@ public class TestEnv {
    * Get setup command to launch a cluster.
    */
   public List<String> getSetupCommand(int port) {
-    String vtTop = System.getenv("VTTOP");
-    if (vtTop == null) {
-      throw new RuntimeException("cannot find env variable: VTTOP");
+    String vtRoot = System.getenv("VTROOT");
+    if (vtRoot == null) {
+      throw new RuntimeException("cannot find env variable: VTROOT");
     }
     String schemaDir = getTestDataPath() + "/schema";
     List<String> command = new ArrayList<String>();
-    command.add(vtTop + "/py/vttest/run_local_database.py");
+    command.add(vtRoot + "/py-vtdb/vttest/run_local_database.py");
     command.add("--port");
     command.add(Integer.toString(port));
-    command.add("--proto_topo");
+    command.add("--proto-topo");
     command.add(getTopology().toString());
-    command.add("--schema_dir");
+    command.add("--schema-dir");
     command.add(schemaDir);
     return command;
   }
 
   public String getTestDataPath() {
-    String vtTop = System.getenv("VTTOP");
-    if (vtTop == null) {
-      throw new RuntimeException("cannot find env variable: VTTOP");
+    String vtRoot = System.getenv("VTROOT");
+    if (vtRoot == null) {
+      throw new RuntimeException("cannot find env variable: VTROOT");
     }
-    return vtTop + "/data/test";
+    return vtRoot + "/data/test";
   }
 
   public String getTestOutputPath() {

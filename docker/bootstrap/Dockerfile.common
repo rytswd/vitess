@@ -1,69 +1,57 @@
-FROM golang:1.12-stretch
+# syntax=docker/dockerfile:1.7
+
+FROM --platform=linux/amd64 golang:1.25.7-bookworm@sha256:db60aab8dc5b066b5018f1bcad7e70b688f31e2fa3427c1623585b680557f975
 
 # Install Vitess build dependencies
-RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y && apt-get install -y --no-install-recommends \
     # TODO(mberlin): Group these to make it easier to understand which library actually requires them.
-    automake \
-    bison \
-    bzip2 \
-    chromium=70.0.3538.110-1~deb9u1 \
+    ant \
+    ca-certificates \
     curl \
+    default-jdk-headless \
     g++ \
     git \
-    libgconf-2-4 \
-    libtool \
+    gnupg \
     make \
-    openjdk-8-jdk \
-    python-crypto \
-    python-dev \
-    python-mysqldb \
-    python-pip \
-    ruby \
-    ruby-dev \
-    software-properties-common \
-    virtualenv \
     unzip \
-    xvfb \
     zip \
-    libz-dev \
-    ant \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Maven 3.1+
-RUN mkdir -p /vt/dist && \
-    cd /vt/dist && \
-    curl -sL --connect-timeout 10 --retry 3 \
-        http://www-us.apache.org/dist/maven/maven-3/3.3.9/binaries/apache-maven-3.3.9-bin.tar.gz | tar -xz && \
-    mv apache-maven-3.3.9 maven
-
 # Set up Vitess environment (equivalent to '. dev.env')
-ENV VTTOP /vt/src/vitess.io/vitess
-ENV VTROOT /vt
-ENV VTDATAROOT $VTROOT/vtdataroot
+ENV VTROOT /vt/src/vitess.io/vitess
+ENV VTDATAROOT /vt/vtdataroot
 ENV VTPORTSTART 15000
-ENV PYTHONPATH $VTROOT/dist/grpc/usr/local/lib/python2.7/site-packages:$VTROOT/dist/py-mock-1.0.1/lib/python2.7/site-packages:$VTROOT/py-vtdb:$VTROOT/dist/selenium/lib/python2.7/site-packages
-ENV PATH $VTROOT/bin:$VTROOT/dist/maven/bin:$VTROOT/dist/chromedriver:$PATH
+ENV PATH $VTROOT/bin:$VTROOT/dist/maven/bin:$PATH
 ENV USER vitess
 
 # Copy files needed for bootstrap
 COPY bootstrap.sh dev.env build.env go.mod go.sum /vt/src/vitess.io/vitess/
 COPY config /vt/src/vitess.io/vitess/config
-COPY third_party /vt/src/vitess.io/vitess/third_party
 COPY tools /vt/src/vitess.io/vitess/tools
-COPY travis /vt/src/vitess.io/vitess/travis
 
 # Create vitess user
-RUN groupadd -r vitess && useradd -r -g vitess vitess && \
+RUN groupadd -r -g 1000 vitess && \
+    useradd -r -u 1000 -g 1000 vitess && \
     mkdir -p /vt/vtdataroot /home/vitess && \
     chown -R vitess:vitess /vt /home/vitess
 
 # Download vendored Go dependencies
-RUN cd /vt/src/vitess.io/vitess && \
- su vitess -c "/usr/local/go/bin/go mod download"
+RUN --mount=type=cache,target=/go/pkg/mod,uid=1000,gid=1000 \
+    cd /vt/src/vitess.io/vitess && \
+    su vitess -c "/usr/local/go/bin/go mod download"
 
 # Create mount point for actual data (e.g. MySQL data dir)
 VOLUME /vt/vtdataroot
 
+# The docker lite images copy from the builder in /vt/bin
+# Add compatibility to the previous layout for now
+RUN su vitess -c "mkdir -p /vt/src/vitess.io/vitess/bin && rm -rf /vt/bin && ln -s /vt/src/vitess.io/vitess/bin /vt/bin"
+
+# Bootstrap Vitess
+WORKDIR /vt/src/vitess.io/vitess
+
+USER vitess
+RUN BUILD_CONSUL=0 ./bootstrap.sh
+
 # If the user doesn't specify a command, load a shell.
 CMD ["/bin/bash"]
-

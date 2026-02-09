@@ -21,7 +21,7 @@ use the topology service in a serving environment.
 package srvtopo
 
 import (
-	"golang.org/x/net/context"
+	"context"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
@@ -37,13 +37,18 @@ type Server interface {
 
 	// GetSrvKeyspaceNames returns the list of keyspaces served in
 	// the provided cell.
-	GetSrvKeyspaceNames(ctx context.Context, cell string) ([]string, error)
+	GetSrvKeyspaceNames(ctx context.Context, cell string, staleOK bool) ([]string, error)
 
 	// GetSrvKeyspace returns the SrvKeyspace for a cell/keyspace.
 	GetSrvKeyspace(ctx context.Context, cell, keyspace string) (*topodatapb.SrvKeyspace, error)
 
+	// WatchSrvKeyspace starts watching the SrvKeyspace object for changes. The callback function is called upon change.
+	// The callback function should return `true` if it wishes to continue watching for further changes, or `false` if it
+	// is done and wants to stop watching.
+	WatchSrvKeyspace(ctx context.Context, cell, keyspace string, callback func(*topodatapb.SrvKeyspace, error) bool)
+
 	// WatchSrvVSchema starts watching the SrvVSchema object for
 	// the provided cell.  It will call the callback when
 	// a new value or an error occurs.
-	WatchSrvVSchema(ctx context.Context, cell string, callback func(*vschemapb.SrvVSchema, error))
+	WatchSrvVSchema(ctx context.Context, cell string, callback func(*vschemapb.SrvVSchema, error) bool)
 }

@@ -16,30 +16,42 @@ limitations under the License.
 
 /*
 Package topocustomrule implements a topo service backed listener for query rules.
-One usage is to allow fast propagation of table blacklists.
+One usage is to allow fast propagation of table denylists.
 */
 package topocustomrule
 
 import (
 	"context"
-	"flag"
+	"errors"
 	"fmt"
 	"reflect"
 	"sync"
 	"time"
 
+	"github.com/spf13/pflag"
+
 	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/servenv"
 	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/utils"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/rules"
 )
 
 var (
 	// Commandline flag to specify rule cell and path.
-	ruleCell = flag.String("topocustomrule_cell", "global", "topo cell for customrules file.")
-	rulePath = flag.String("topocustomrule_path", "", "path for customrules file. Disabled if empty.")
+	ruleCell = "global"
+	rulePath string
 )
+
+func registerFlags(fs *pflag.FlagSet) {
+	utils.SetFlagStringVar(fs, &ruleCell, "topocustomrule-cell", ruleCell, "topo cell for customrules file.")
+	utils.SetFlagStringVar(fs, &rulePath, "topocustomrule-path", rulePath, "path for customrules file. Disabled if empty.")
+}
+
+func init() {
+	servenv.OnParseFor("vttablet", registerFlags)
+}
 
 // topoCustomRuleSource is topo based custom rule source name
 const topoCustomRuleSource string = "TOPO_CUSTOM_RULE"
@@ -138,10 +150,11 @@ func (cr *topoCustomRule) oneWatch() error {
 		cr.mu.Unlock()
 	}()
 
-	ctx := context.Background()
-	current, wdChannel, cancel := cr.conn.Watch(ctx, cr.filePath)
-	if current.Err != nil {
-		return current.Err
+	ctx, cancel := context.WithCancel(context.Background())
+	current, wdChannel, err := cr.conn.Watch(ctx, cr.filePath)
+	if err != nil {
+		cancel()
+		return err
 	}
 
 	cr.mu.Lock()
@@ -179,18 +192,17 @@ func (cr *topoCustomRule) oneWatch() error {
 			}
 			return err
 		}
-
 	}
 
-	return fmt.Errorf("watch terminated with no error")
+	return errors.New("watch terminated with no error")
 }
 
 // activateTopoCustomRules activates topo dynamic custom rule mechanism.
 func activateTopoCustomRules(qsc tabletserver.Controller) {
-	if *rulePath != "" {
+	if rulePath != "" {
 		qsc.RegisterQueryRuleSource(topoCustomRuleSource)
 
-		cr, err := newTopoCustomRule(qsc, *ruleCell, *rulePath)
+		cr, err := newTopoCustomRule(qsc, ruleCell, rulePath)
 		if err != nil {
 			log.Fatalf("cannot start TopoCustomRule: %v", err)
 		}

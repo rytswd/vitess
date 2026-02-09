@@ -17,15 +17,16 @@ limitations under the License.
 package vtctl
 
 import (
-	"flag"
-	"fmt"
+	"context"
+	"errors"
 	"strings"
 
-	"golang.org/x/net/context"
+	"github.com/spf13/pflag"
 
 	"vitess.io/vitess/go/vt/wrangler"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	vtctldatapb "vitess.io/vitess/go/vt/proto/vtctldata"
 )
 
 // This file contains the CellsAliases command group for vtctl.
@@ -36,91 +37,99 @@ func init() {
 	addCommandGroup(cellsAliasesGroupName)
 
 	addCommand(cellsAliasesGroupName, command{
-		"AddCellsAlias",
-		commandAddCellsAlias,
-		"[-cells <cell,cell2...>] <alias>",
-		"Defines a group of cells within which replica/rdonly traffic can be routed across cells. Between cells that are not in the same group (alias), only master traffic can be routed."})
+		name:   "AddCellsAlias",
+		method: commandAddCellsAlias,
+		params: "[--cells <cell,cell2...>] <alias>",
+		help:   "Defines a group of cells within which replica/rdonly traffic can be routed across cells. Between cells that are not in the same group (alias), only primary traffic can be routed.",
+	})
 
 	addCommand(cellsAliasesGroupName, command{
-		"UpdateCellsAlias",
-		commandUpdateCellsAlias,
-		"[-cells <cell,cell2,...>] <alias>",
-		"Updates the content of a CellsAlias with the provided parameters. If a value is empty, it is not updated. The CellsAlias will be created if it doesn't exist."})
+		name:   "UpdateCellsAlias",
+		method: commandUpdateCellsAlias,
+		params: "[--cells <cell,cell2,...>] <alias>",
+		help:   "Updates the content of a CellsAlias with the provided parameters. If a value is empty, it is not updated. The CellsAlias will be created if it doesn't exist.",
+	})
 
 	addCommand(cellsAliasesGroupName, command{
-		"DeleteCellsAlias",
-		commandDeleteCellsAlias,
-		"<alias>",
-		"Deletes the CellsAlias for the provided alias."})
+		name:   "DeleteCellsAlias",
+		method: commandDeleteCellsAlias,
+		params: "<alias>",
+		help:   "Deletes the CellsAlias for the provided alias.",
+	})
 
 	addCommand(cellsAliasesGroupName, command{
-		"GetCellsAliases",
-		commandGetCellsAliases,
-		"",
-		"Lists all the cells for which we have a CellsAlias object."})
-}
-
-func commandAddCellsAlias(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
-	cellsString := subFlags.String("cells", "", "The list of cell names that are members of this alias.")
-	if err := subFlags.Parse(args); err != nil {
-		return err
-	}
-	if subFlags.NArg() != 1 {
-		return fmt.Errorf("the <alias> argument is required for the AddCellsAlias command")
-	}
-
-	cells := strings.Split(*cellsString, ",")
-	for i, cell := range cells {
-		cells[i] = strings.TrimSpace(cell)
-	}
-
-	alias := subFlags.Arg(0)
-
-	return wr.TopoServer().CreateCellsAlias(ctx, alias, &topodatapb.CellsAlias{
-		Cells: cells,
+		name:   "GetCellsAliases",
+		method: commandGetCellsAliases,
+		params: "",
+		help:   "Lists all the cells for which we have a CellsAlias object.",
 	})
 }
 
-func commandUpdateCellsAlias(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
-	cellsString := subFlags.String("cells", "", "The list of cell names that are members of this alias.")
+func commandAddCellsAlias(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
+	cells := subFlags.StringSlice("cells", nil, "The list of cell names that are members of this alias.")
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
 	if subFlags.NArg() != 1 {
-		return fmt.Errorf("the <alias> argument is required for the UpdateCellsAlias command")
+		return errors.New("the <alias> argument is required for the AddCellsAlias command")
 	}
 
-	cells := strings.Split(*cellsString, ",")
-	for i, cell := range cells {
-		cells[i] = strings.TrimSpace(cell)
+	for i, cell := range *cells {
+		(*cells)[i] = strings.TrimSpace(cell)
 	}
 
 	alias := subFlags.Arg(0)
-
-	return wr.TopoServer().UpdateCellsAlias(ctx, alias, func(ca *topodatapb.CellsAlias) error {
-		ca.Cells = cells
-		return nil
+	_, err := wr.VtctldServer().AddCellsAlias(ctx, &vtctldatapb.AddCellsAliasRequest{
+		Name:  alias,
+		Cells: *cells,
 	})
+	return err
 }
 
-func commandDeleteCellsAlias(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandUpdateCellsAlias(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
+	cells := subFlags.StringSlice("cells", nil, "The list of cell names that are members of this alias.")
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
 	if subFlags.NArg() != 1 {
-		return fmt.Errorf("the <alias> argument is required for the DeleteCellsAlias command")
+		return errors.New("the <alias> argument is required for the UpdateCellsAlias command")
+	}
+
+	for i, cell := range *cells {
+		(*cells)[i] = strings.TrimSpace(cell)
+	}
+
+	alias := subFlags.Arg(0)
+	_, err := wr.VtctldServer().UpdateCellsAlias(ctx, &vtctldatapb.UpdateCellsAliasRequest{
+		Name: alias,
+		CellsAlias: &topodatapb.CellsAlias{
+			Cells: *cells,
+		},
+	})
+	return err
+}
+
+func commandDeleteCellsAlias(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
+	if err := subFlags.Parse(args); err != nil {
+		return err
+	}
+	if subFlags.NArg() != 1 {
+		return errors.New("the <alias> argument is required for the DeleteCellsAlias command")
 	}
 	alias := subFlags.Arg(0)
 
-	return wr.TopoServer().DeleteCellsAlias(ctx, alias)
+	_, err := wr.VtctldServer().DeleteCellsAlias(ctx, &vtctldatapb.DeleteCellsAliasRequest{
+		Name: alias,
+	})
+	return err
 }
 
-func commandGetCellsAliases(ctx context.Context, wr *wrangler.Wrangler, subFlags *flag.FlagSet, args []string) error {
+func commandGetCellsAliases(ctx context.Context, wr *wrangler.Wrangler, subFlags *pflag.FlagSet, args []string) error {
 	if err := subFlags.Parse(args); err != nil {
 		return err
 	}
 	if subFlags.NArg() != 0 {
-		return fmt.Errorf("GetCellsAliases command takes no parameter")
+		return errors.New("GetCellsAliases command takes no parameter")
 	}
 	aliases, err := wr.TopoServer().GetCellsAliases(ctx, true /*strongRead*/)
 	if err != nil {

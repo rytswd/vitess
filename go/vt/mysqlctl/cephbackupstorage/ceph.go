@@ -19,8 +19,9 @@ limitations under the License.
 package cephbackupstorage
 
 import (
+	"context"
 	"encoding/json"
-	"flag"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -28,21 +29,31 @@ import (
 	"strings"
 	"sync"
 
-	"errors"
-
 	minio "github.com/minio/minio-go"
-	"golang.org/x/net/context"
+	"github.com/spf13/pflag"
 
-	"vitess.io/vitess/go/vt/concurrency"
-	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/mysqlctl/backupstorage"
+	"vitess.io/vitess/go/vt/utils"
+
+	"vitess.io/vitess/go/vt/log"
+	errorsbackup "vitess.io/vitess/go/vt/mysqlctl/errors"
+	"vitess.io/vitess/go/vt/servenv"
 )
 
-var (
-	// configFilePath is where the configs/credentials for backups will be stored.
-	configFilePath = flag.String("ceph_backup_storage_config", "ceph_backup_config.json",
-		"Path to JSON config file for ceph backup storage")
-)
+// configFilePath is where the configs/credentials for backups will be stored.
+var configFilePath string
+
+func registerFlags(fs *pflag.FlagSet) {
+	utils.SetFlagStringVar(fs, &configFilePath, "ceph-backup-storage-config", "ceph_backup_config.json",
+		"Path to JSON config file for ceph backup storage.")
+}
+
+func init() {
+	servenv.OnParseFor("vtbackup", registerFlags)
+	servenv.OnParseFor("vtctl", registerFlags)
+	servenv.OnParseFor("vtctld", registerFlags)
+	servenv.OnParseFor("vttablet", registerFlags)
+}
 
 var storageConfig struct {
 	AccessKey string `json:"accessKey"`
@@ -58,8 +69,8 @@ type CephBackupHandle struct {
 	dir       string
 	name      string
 	readOnly  bool
-	errors    concurrency.AllErrorRecorder
 	waitGroup sync.WaitGroup
+	errorsbackup.PerFileErrorRecorder
 }
 
 // Directory implements BackupHandle.
@@ -75,15 +86,12 @@ func (bh *CephBackupHandle) Name() string {
 // AddFile implements BackupHandle.
 func (bh *CephBackupHandle) AddFile(ctx context.Context, filename string, filesize int64) (io.WriteCloser, error) {
 	if bh.readOnly {
-		return nil, fmt.Errorf("AddFile cannot be called on read-only backup")
+		return nil, errors.New("AddFile cannot be called on read-only backup")
 	}
 	reader, writer := io.Pipe()
-	bh.waitGroup.Add(1)
-	go func() {
-		defer bh.waitGroup.Done()
-
+	bh.waitGroup.Go(func() {
 		// ceph bucket name is where the backups will go
-		//backup handle dir field contains keyspace/shard value
+		// backup handle dir field contains keyspace/shard value
 		bucket := alterBucketName(bh.dir)
 
 		// Give PutObject() the read end of the pipe.
@@ -94,9 +102,9 @@ func (bh *CephBackupHandle) AddFile(ctx context.Context, filename string, filesi
 			// Signal the writer that an error occurred, in case it's not done writing yet.
 			reader.CloseWithError(err)
 			// In case the error happened after the writer finished, we need to remember it.
-			bh.errors.RecordError(err)
+			bh.RecordError(filename, err)
 		}
-	}()
+	})
 	// Give our caller the write end of the pipe.
 	return writer, nil
 }
@@ -104,17 +112,17 @@ func (bh *CephBackupHandle) AddFile(ctx context.Context, filename string, filesi
 // EndBackup implements BackupHandle.
 func (bh *CephBackupHandle) EndBackup(ctx context.Context) error {
 	if bh.readOnly {
-		return fmt.Errorf("EndBackup cannot be called on read-only backup")
+		return errors.New("EndBackup cannot be called on read-only backup")
 	}
 	bh.waitGroup.Wait()
 	// Return the saved PutObject() errors, if any.
-	return bh.errors.Error()
+	return bh.Error()
 }
 
 // AbortBackup implements BackupHandle.
 func (bh *CephBackupHandle) AbortBackup(ctx context.Context) error {
 	if bh.readOnly {
-		return fmt.Errorf("AbortBackup cannot be called on read-only backup")
+		return errors.New("AbortBackup cannot be called on read-only backup")
 	}
 	return bh.bs.RemoveBackup(ctx, bh.dir, bh.name)
 }
@@ -122,7 +130,7 @@ func (bh *CephBackupHandle) AbortBackup(ctx context.Context) error {
 // ReadFile implements BackupHandle.
 func (bh *CephBackupHandle) ReadFile(ctx context.Context, filename string) (io.ReadCloser, error) {
 	if !bh.readOnly {
-		return nil, fmt.Errorf("ReadFile cannot be called on read-write backup")
+		return nil, errors.New("ReadFile cannot be called on read-write backup")
 	}
 	// ceph bucket name
 	bucket := alterBucketName(bh.dir)
@@ -192,7 +200,6 @@ func (bs *CephBackupStorage) StartBackup(ctx context.Context, dir, name string) 
 	bucket := alterBucketName(dir)
 
 	found, err := c.BucketExists(bucket)
-
 	if err != nil {
 		log.Info("Error from BucketExists: %v, quitting", bucket)
 		return nil, errors.New("Error checking whether bucket exists: " + bucket)
@@ -255,6 +262,11 @@ func (bs *CephBackupStorage) Close() error {
 	return nil
 }
 
+func (bs *CephBackupStorage) WithParams(params backupstorage.Params) backupstorage.BackupStorage {
+	// TODO(maxeng): return a new CephBackupStorage that uses params.
+	return bs
+}
+
 // client returns the Ceph Storage client instance.
 // If there isn't one yet, it tries to create one.
 func (bs *CephBackupStorage) client() (*minio.Client, error) {
@@ -262,7 +274,7 @@ func (bs *CephBackupStorage) client() (*minio.Client, error) {
 	defer bs.mu.Unlock()
 
 	if bs._client == nil {
-		configFile, err := os.Open(*configFilePath)
+		configFile, err := os.Open(configFilePath)
 		if err != nil {
 			return nil, fmt.Errorf("file not present : %v", err)
 		}
@@ -292,7 +304,6 @@ func init() {
 
 // objName joins path parts into an object name.
 // Unlike path.Join, it doesn't collapse ".." or strip trailing slashes.
-// It also adds the value of the -gcs_backup_storage_root flag if set.
 func objName(parts ...string) string {
 	return strings.Join(parts, "/")
 }
@@ -302,6 +313,6 @@ func objName(parts ...string) string {
 func alterBucketName(dir string) string {
 	bucket := strings.ToLower(dir)
 	bucket = strings.Split(bucket, "/")[0]
-	bucket = strings.Replace(bucket, "_", "-", -1)
+	bucket = strings.ReplaceAll(bucket, "_", "-")
 	return bucket
 }

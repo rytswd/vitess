@@ -18,17 +18,20 @@ limitations under the License.
 package tabletservermock
 
 import (
+	"context"
 	"sync"
-
-	"golang.org/x/net/context"
-
 	"time"
 
 	"vitess.io/vitess/go/vt/dbconfigs"
+	"vitess.io/vitess/go/vt/mysqlctl"
+	"vitess.io/vitess/go/vt/proto/tabletmanagerdata"
+	"vitess.io/vitess/go/vt/servenv"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/vttablet/queryservice"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/rules"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/schema"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/throttle"
 
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
@@ -58,6 +61,8 @@ type StateChange struct {
 
 // Controller is a mock tabletserver.Controller
 type Controller struct {
+	stats *tabletenv.Stats
+
 	// BroadcastData is a channel where we send BroadcastHealth data.
 	// Set at construction time.
 	BroadcastData chan *BroadcastData
@@ -66,8 +71,7 @@ type Controller struct {
 	// Set at construction time.
 	StateChanges chan *StateChange
 
-	// CurrentTarget stores the last known target.
-	CurrentTarget querypb.Target
+	target *querypb.Target
 
 	// SetServingTypeError is the return value for SetServingType.
 	SetServingTypeError error
@@ -88,20 +92,33 @@ type Controller struct {
 
 	// queryRulesMap has the latest query rules.
 	queryRulesMap map[string]*rules.Rules
+
+	MethodCalled map[string]bool
 }
 
 // NewController returns a mock of tabletserver.Controller
 func NewController() *Controller {
 	return &Controller{
+		stats:               tabletenv.NewStats(servenv.NewExporter("MockController", "Tablet")),
 		queryServiceEnabled: false,
 		BroadcastData:       make(chan *BroadcastData, 10),
 		StateChanges:        make(chan *StateChange, 10),
 		queryRulesMap:       make(map[string]*rules.Rules),
+		MethodCalled:        make(map[string]bool),
 	}
+}
+
+// Stats is part of the tabletserver.Controller interface
+func (tqsc *Controller) Stats() *tabletenv.Stats {
+	return tqsc.stats
 }
 
 // Register is part of the tabletserver.Controller interface
 func (tqsc *Controller) Register() {
+}
+
+// AddStatusHeader is part of the tabletserver.Controller interface
+func (tqsc *Controller) AddStatusHeader() {
 }
 
 // AddStatusPart is part of the tabletserver.Controller interface
@@ -109,33 +126,28 @@ func (tqsc *Controller) AddStatusPart() {
 }
 
 // InitDBConfig is part of the tabletserver.Controller interface
-func (tqsc *Controller) InitDBConfig(target querypb.Target, dbcfgs *dbconfigs.DBConfigs) error {
+func (tqsc *Controller) InitDBConfig(target *querypb.Target, dbcfgs *dbconfigs.DBConfigs, _ mysqlctl.MysqlDaemon) error {
 	tqsc.mu.Lock()
 	defer tqsc.mu.Unlock()
-
-	tqsc.CurrentTarget = target
+	tqsc.target = target.CloneVT()
 	return nil
 }
 
 // SetServingType is part of the tabletserver.Controller interface
-func (tqsc *Controller) SetServingType(tabletType topodatapb.TabletType, serving bool, alsoAllow []topodatapb.TabletType) (bool, error) {
+func (tqsc *Controller) SetServingType(tabletType topodatapb.TabletType, ptsTime time.Time, serving bool, reason string) error {
 	tqsc.mu.Lock()
 	defer tqsc.mu.Unlock()
 
-	stateChanged := false
 	if tqsc.SetServingTypeError == nil {
-		stateChanged = tqsc.queryServiceEnabled != serving || tqsc.CurrentTarget.TabletType != tabletType
-		tqsc.CurrentTarget.TabletType = tabletType
+		tqsc.target.TabletType = tabletType
 		tqsc.queryServiceEnabled = serving
 	}
-	if stateChanged {
-		tqsc.StateChanges <- &StateChange{
-			Serving:    serving,
-			TabletType: tabletType,
-		}
+	tqsc.StateChanges <- &StateChange{
+		Serving:    serving,
+		TabletType: tabletType,
 	}
 	tqsc.isInLameduck = false
-	return stateChanged, tqsc.SetServingTypeError
+	return tqsc.SetServingTypeError
 }
 
 // IsServing is part of the tabletserver.Controller interface
@@ -144,6 +156,13 @@ func (tqsc *Controller) IsServing() bool {
 	defer tqsc.mu.Unlock()
 
 	return tqsc.queryServiceEnabled
+}
+
+// CurrentTarget returns the current target.
+func (tqsc *Controller) CurrentTarget() *querypb.Target {
+	tqsc.mu.Lock()
+	defer tqsc.mu.Unlock()
+	return tqsc.target.CloneVT()
 }
 
 // IsHealthy is part of the tabletserver.Controller interface
@@ -156,7 +175,7 @@ func (tqsc *Controller) ReloadSchema(ctx context.Context) error {
 	return nil
 }
 
-//ClearQueryPlanCache is part of the tabletserver.Controller interface
+// ClearQueryPlanCache is part of the tabletserver.Controller interface
 func (tqsc *Controller) ClearQueryPlanCache() {
 }
 
@@ -187,25 +206,83 @@ func (tqsc *Controller) SchemaEngine() *schema.Engine {
 }
 
 // BroadcastHealth is part of the tabletserver.Controller interface
-func (tqsc *Controller) BroadcastHealth(terTimestamp int64, stats *querypb.RealtimeStats, maxCache time.Duration) {
+func (tqsc *Controller) BroadcastHealth() {
 	tqsc.mu.Lock()
 	defer tqsc.mu.Unlock()
 
 	tqsc.BroadcastData <- &BroadcastData{
-		TERTimestamp:  terTimestamp,
-		RealtimeStats: *stats,
-		Serving:       tqsc.queryServiceEnabled && (!tqsc.isInLameduck),
+		Serving: tqsc.queryServiceEnabled && (!tqsc.isInLameduck),
 	}
-}
-
-// HeartbeatLag is part of the tabletserver.Controller interface.
-func (tqsc *Controller) HeartbeatLag() (time.Duration, error) {
-	return 0, nil
 }
 
 // TopoServer is part of the tabletserver.Controller interface.
 func (tqsc *Controller) TopoServer() *topo.Server {
 	return tqsc.TS
+}
+
+// CheckThrottler is part of the tabletserver.Controller interface
+func (tqsc *Controller) CheckThrottler(ctx context.Context, appName string, flags *throttle.CheckFlags) *throttle.CheckResult {
+	return nil
+}
+
+// GetThrottlerStatus is part of the tabletserver.Controller interface
+func (tqsc *Controller) GetThrottlerStatus(ctx context.Context) *throttle.ThrottlerStatus {
+	return nil
+}
+
+// RedoPreparedTransactions is part of the tabletserver.Controller interface
+func (tqsc *Controller) RedoPreparedTransactions() {}
+
+// SetTwoPCAllowed sets whether TwoPC is allowed or not. It also takes the reason of why it is being set.
+// The reason should be an enum value defined in the tabletserver.
+func (tqsc *Controller) SetTwoPCAllowed(int, bool) {
+}
+
+// UnresolvedTransactions is part of the tabletserver.Controller interface
+func (tqsc *Controller) UnresolvedTransactions(context.Context, *querypb.Target, int64) ([]*querypb.TransactionMetadata, error) {
+	tqsc.MethodCalled["UnresolvedTransactions"] = true
+	return nil, nil
+}
+
+// ReadTransaction is part of the tabletserver.Controller interface
+func (tqsc *Controller) ReadTransaction(ctx context.Context, target *querypb.Target, dtid string) (*querypb.TransactionMetadata, error) {
+	tqsc.MethodCalled["ReadTransaction"] = true
+	return nil, nil
+}
+
+// GetTransactionInfo is part of the tabletserver.Controller interface
+func (tqsc *Controller) GetTransactionInfo(ctx context.Context, target *querypb.Target, dtid string) (*tabletmanagerdata.GetTransactionInfoResponse, error) {
+	tqsc.MethodCalled["GetTransactionInfo"] = true
+	return nil, nil
+}
+
+// ConcludeTransaction is part of the tabletserver.Controller interface
+func (tqsc *Controller) ConcludeTransaction(context.Context, *querypb.Target, string) error {
+	tqsc.MethodCalled["ConcludeTransaction"] = true
+	return nil
+}
+
+// RollbackPrepared is part of the tabletserver.Controller interface
+func (tqsc *Controller) RollbackPrepared(context.Context, *querypb.Target, string, int64) error {
+	tqsc.MethodCalled["RollbackPrepared"] = true
+	return nil
+}
+
+// WaitForPreparedTwoPCTransactions is part of the tabletserver.Controller interface
+func (tqsc *Controller) WaitForPreparedTwoPCTransactions(context.Context) error {
+	tqsc.MethodCalled["WaitForPreparedTwoPCTransactions"] = true
+	return nil
+}
+
+// SetDemotePrimaryStalled is part of the tabletserver.Controller interface
+func (tqsc *Controller) SetDemotePrimaryStalled(bool) {
+	tqsc.MethodCalled["SetDemotePrimaryStalled"] = true
+}
+
+// IsDiskStalled is part of the tabletserver.Controller interface
+func (tqsc *Controller) IsDiskStalled() bool {
+	tqsc.MethodCalled["IsDiskStalled"] = true
+	return false
 }
 
 // EnterLameduck implements tabletserver.Controller.

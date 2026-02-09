@@ -21,8 +21,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"path"
 	"testing"
+
+	"vitess.io/vitess/go/vt/log"
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sqltypes"
@@ -32,11 +33,10 @@ import (
 )
 
 var (
-	cluster        *vttest.LocalCluster
-	vtParams       mysql.ConnParams
-	mysqlParams    mysql.ConnParams
-	grpcAddress    string
-	tabletHostName = flag.String("tablet_hostname", "", "the tablet hostname")
+	cluster     *vttest.LocalCluster
+	vtParams    mysql.ConnParams
+	mysqlParams mysql.ConnParams
+	grpcAddress string
 
 	schema = `
 create table t1(
@@ -127,7 +127,6 @@ func TestMain(m *testing.M) {
 				}},
 			}},
 		}
-		cfg.ExtraMyCnf = []string{path.Join(os.Getenv("VTTOP"), "config/mycnf/rbr.cnf")}
 		if err := cfg.InitSchemas("ks", schema, vschema); err != nil {
 			fmt.Fprintf(os.Stderr, "%v\n", err)
 			os.RemoveAll(cfg.SchemaDir)
@@ -135,14 +134,15 @@ func TestMain(m *testing.M) {
 		}
 		defer os.RemoveAll(cfg.SchemaDir)
 
-		cfg.TabletHostName = *tabletHostName
-
 		cluster = &vttest.LocalCluster{
 			Config: cfg,
 		}
 		if err := cluster.Setup(); err != nil {
 			fmt.Fprintf(os.Stderr, "%v\n", err)
-			cluster.TearDown()
+			// log error
+			if err := cluster.TearDown(); err != nil {
+				log.Errorf("cluster.TearDown() did not work: ", err)
+			}
 			return 1
 		}
 		defer cluster.TearDown()

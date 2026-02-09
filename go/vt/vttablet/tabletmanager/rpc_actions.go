@@ -17,17 +17,14 @@ limitations under the License.
 package tabletmanager
 
 import (
+	"context"
 	"fmt"
-	"regexp"
 	"time"
 
-	"vitess.io/vitess/go/vt/logutil"
+	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/vt/vterrors"
 
-	"golang.org/x/net/context"
-
 	"vitess.io/vitess/go/vt/hook"
-	"vitess.io/vitess/go/vt/log"
 	"vitess.io/vitess/go/vt/mysqlctl"
 	"vitess.io/vitess/go/vt/topotools"
 
@@ -35,132 +32,183 @@ import (
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
-// This file contains the implementations of RPCAgent methods.
+// DBAction is used to tell ChangeTabletType whether to call SetReadOnly on change to
+// PRIMARY tablet type
+type DBAction int
+
+// Allowed values for DBAction
+const (
+	DBActionNone = DBAction(iota)
+	DBActionSetReadWrite
+)
+
+// SemiSyncAction is used to tell fixSemiSync whether to change the semi-sync
+// settings or not.
+type SemiSyncAction int
+
+// Allowed values for SemiSyncAction
+const (
+	SemiSyncActionNone = SemiSyncAction(iota)
+	SemiSyncActionSet
+	SemiSyncActionUnset
+)
+
+// This file contains the implementations of RPCTM methods.
 // Major groups of methods are broken out into files named "rpc_*.go".
 
 // Ping makes sure RPCs work, and refreshes the tablet record.
-func (agent *ActionAgent) Ping(ctx context.Context, args string) string {
+func (tm *TabletManager) Ping(ctx context.Context, args string) string {
 	return args
 }
 
 // GetPermissions returns the db permissions.
-func (agent *ActionAgent) GetPermissions(ctx context.Context) (*tabletmanagerdatapb.Permissions, error) {
-	return mysqlctl.GetPermissions(agent.MysqlDaemon)
+func (tm *TabletManager) GetPermissions(ctx context.Context) (*tabletmanagerdatapb.Permissions, error) {
+	return mysqlctl.GetPermissions(tm.MysqlDaemon)
+}
+
+// GetGlobalStatusVars returns the server's global status variables asked for.
+// An empty/nil variable name parameter slice means you want all of them.
+func (tm *TabletManager) GetGlobalStatusVars(ctx context.Context, variables []string) (map[string]string, error) {
+	return tm.MysqlDaemon.GetGlobalStatusVars(ctx, variables)
 }
 
 // SetReadOnly makes the mysql instance read-only or read-write.
-func (agent *ActionAgent) SetReadOnly(ctx context.Context, rdonly bool) error {
-	if err := agent.lock(ctx); err != nil {
+func (tm *TabletManager) SetReadOnly(ctx context.Context, rdonly bool) error {
+	if err := tm.lock(ctx); err != nil {
 		return err
 	}
-	defer agent.unlock()
-
-	return agent.MysqlDaemon.SetReadOnly(rdonly)
-}
-
-// ChangeType changes the tablet type
-func (agent *ActionAgent) ChangeType(ctx context.Context, tabletType topodatapb.TabletType) error {
-	if err := agent.lock(ctx); err != nil {
-		return err
-	}
-	defer agent.unlock()
-
-	// We don't want to allow multiple callers to claim a tablet as drained. There is a race that could happen during
-	// horizontal resharding where two vtworkers will try to DRAIN the same tablet. This check prevents that race from
-	// causing errors.
-	if tabletType == topodatapb.TabletType_DRAINED && agent.Tablet().Type == topodatapb.TabletType_DRAINED {
-		return fmt.Errorf("Tablet: %v, is already drained", agent.TabletAlias)
-	}
-
-	agentMasterTermStartTime := time.Time{}
-	// If we have been told we're master, set master term start time to Now
-	if tabletType == topodatapb.TabletType_MASTER {
-		agentMasterTermStartTime = time.Now()
-	}
-	// change our type in the topology, and set masterTermStartTime on tablet record if applicable
-	_, err := topotools.ChangeType(ctx, agent.TopoServer, agent.TabletAlias, tabletType, logutil.TimeToProto(agentMasterTermStartTime))
+	defer tm.unlock()
+	superRo, err := tm.MysqlDaemon.IsSuperReadOnly(ctx)
 	if err != nil {
 		return err
 	}
-	// We only update agent's masterTermStartTime if we were able to update the topo.
-	// This ensures that in case of a failure, we are never in a situation where the
-	// tablet's timestamp is ahead of the topo's timestamp.
-	if tabletType == topodatapb.TabletType_MASTER {
-		agent.setMasterTermStartTime(agentMasterTermStartTime)
+
+	if !rdonly && superRo {
+		// If super read only is set, then we need to prepare the transactions before setting read_only OFF.
+		// We need to redo the prepared transactions in read only mode using the dba user to ensure we don't lose them.
+		// setting read_only OFF will also set super_read_only OFF if it was set.
+		// If super read only is already off, then we probably called this function from PRS or some other place
+		// because it is idempotent. We only need to redo prepared transactions the first time we transition from super read only
+		// to read write.
+		return tm.redoPreparedTransactionsAndSetReadWrite(ctx)
+	}
+	return tm.MysqlDaemon.SetReadOnly(ctx, rdonly)
+}
+
+// ChangeTags changes the tablet tags
+func (tm *TabletManager) ChangeTags(ctx context.Context, tabletTags map[string]string, replace bool) (map[string]string, error) {
+	if err := tm.lock(ctx); err != nil {
+		return nil, err
+	}
+	defer tm.unlock()
+
+	tags := tm.tmState.Tablet().Tags
+	if replace || len(tags) == 0 {
+		tags = tabletTags
+	} else {
+		for key, val := range tabletTags {
+			if val == "" {
+				delete(tags, key)
+				continue
+			}
+			tags[key] = val
+		}
 	}
 
-	// let's update our internal state (stop query service and other things)
-	if err := agent.refreshTablet(ctx, "ChangeType"); err != nil {
+	tm.tmState.ChangeTabletTags(ctx, tags)
+	return tags, nil
+}
+
+// ChangeType changes the tablet type
+func (tm *TabletManager) ChangeType(ctx context.Context, tabletType topodatapb.TabletType, semiSync bool) error {
+	if err := tm.lock(ctx); err != nil {
+		return err
+	}
+	defer tm.unlock()
+
+	semiSyncAction, err := tm.convertBoolToSemiSyncAction(ctx, semiSync)
+	if err != nil {
+		return err
+	}
+
+	return tm.changeTypeLocked(ctx, tabletType, DBActionNone, semiSyncAction)
+}
+
+// changeTypeLocked changes the tablet type under a lock
+func (tm *TabletManager) changeTypeLocked(ctx context.Context, tabletType topodatapb.TabletType, action DBAction, semiSync SemiSyncAction) error {
+	// We don't want to allow multiple callers to claim a tablet as drained.
+	if tabletType == topodatapb.TabletType_DRAINED && tm.Tablet().Type == topodatapb.TabletType_DRAINED {
+		return fmt.Errorf("Tablet: %v, is already drained", tm.tabletAlias)
+	}
+
+	if err := tm.tmState.ChangeTabletType(ctx, tabletType, action); err != nil {
 		return err
 	}
 
 	// Let's see if we need to fix semi-sync acking.
-	if err := agent.fixSemiSyncAndReplication(agent.Tablet().Type); err != nil {
+	if err := tm.fixSemiSyncAndReplication(ctx, tm.Tablet().Type, semiSync); err != nil {
 		return vterrors.Wrap(err, "fixSemiSyncAndReplication failed, may not ack correctly")
 	}
-
-	// and re-run health check
-	agent.runHealthCheckLocked()
 	return nil
 }
 
 // Sleep sleeps for the duration
-func (agent *ActionAgent) Sleep(ctx context.Context, duration time.Duration) {
-	if err := agent.lock(ctx); err != nil {
+func (tm *TabletManager) Sleep(ctx context.Context, duration time.Duration) {
+	if err := tm.lock(ctx); err != nil {
 		// client gave up
 		return
 	}
-	defer agent.unlock()
+	defer tm.unlock()
 
 	time.Sleep(duration)
 }
 
 // ExecuteHook executes the provided hook locally, and returns the result.
-func (agent *ActionAgent) ExecuteHook(ctx context.Context, hk *hook.Hook) *hook.HookResult {
-	if err := agent.lock(ctx); err != nil {
+func (tm *TabletManager) ExecuteHook(ctx context.Context, hk *hook.Hook) *hook.HookResult {
+	if err := tm.lock(ctx); err != nil {
 		// client gave up
 		return &hook.HookResult{}
 	}
-	defer agent.unlock()
+	defer tm.unlock()
 
 	// Execute the hooks
-	topotools.ConfigureTabletHook(hk, agent.TabletAlias)
-	hr := hk.Execute()
-
-	// We never know what the hook did, so let's refresh our state.
-	if err := agent.refreshTablet(ctx, "ExecuteHook"); err != nil {
-		log.Errorf("refreshTablet after ExecuteHook failed: %v", err)
-	}
-
-	return hr
+	topotools.ConfigureTabletHook(hk, tm.tabletAlias)
+	return hk.Execute()
 }
 
 // RefreshState reload the tablet record from the topo server.
-func (agent *ActionAgent) RefreshState(ctx context.Context) error {
-	if err := agent.lock(ctx); err != nil {
+func (tm *TabletManager) RefreshState(ctx context.Context) error {
+	if err := tm.lock(ctx); err != nil {
 		return err
 	}
-	defer agent.unlock()
+	defer tm.unlock()
 
-	return agent.refreshTablet(ctx, "RefreshState")
+	return tm.tmState.RefreshFromTopo(ctx)
 }
 
 // RunHealthCheck will manually run the health check on the tablet.
-func (agent *ActionAgent) RunHealthCheck(ctx context.Context) {
-	agent.runHealthCheck()
+func (tm *TabletManager) RunHealthCheck(ctx context.Context) {
+	tm.QueryServiceControl.BroadcastHealth()
 }
 
-// IgnoreHealthError sets the regexp for health check errors to ignore.
-func (agent *ActionAgent) IgnoreHealthError(ctx context.Context, pattern string) error {
-	var expr *regexp.Regexp
-	if pattern != "" {
-		var err error
-		if expr, err = regexp.Compile(fmt.Sprintf("^%s$", pattern)); err != nil {
-			return err
+func (tm *TabletManager) convertBoolToSemiSyncAction(ctx context.Context, semiSync bool) (SemiSyncAction, error) {
+	semiSyncExtensionLoaded, err := tm.MysqlDaemon.SemiSyncExtensionLoaded(ctx)
+	if err != nil {
+		return SemiSyncActionNone, err
+	}
+
+	switch semiSyncExtensionLoaded {
+	case mysql.SemiSyncTypeSource, mysql.SemiSyncTypeMaster:
+		if semiSync {
+			return SemiSyncActionSet, nil
+		} else {
+			return SemiSyncActionUnset, nil
+		}
+	default:
+		if semiSync {
+			return SemiSyncActionNone, vterrors.VT09013()
+		} else {
+			return SemiSyncActionNone, nil
 		}
 	}
-	agent.mutex.Lock()
-	agent._ignoreHealthErrorExpr = expr
-	agent.mutex.Unlock()
-	return nil
 }

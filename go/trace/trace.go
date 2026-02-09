@@ -20,53 +20,46 @@ limitations under the License.
 package trace
 
 import (
-	"flag"
+	"context"
+	"fmt"
 	"io"
 	"strings"
 
-	"golang.org/x/net/context"
+	"github.com/spf13/pflag"
 	"google.golang.org/grpc"
+
+	"vitess.io/vitess/go/viperutil"
 	"vitess.io/vitess/go/vt/log"
-	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vterrors"
 )
 
 // Span represents a unit of work within a trace. After creating a Span with
 // NewSpan(), call one of the Start methods to mark the beginning of the work
 // represented by this Span. Call Finish() when that work is done to record the
-// Span. A Span may be reused by calling Start again.
+// Span.
 type Span interface {
 	Finish()
 	// Annotate records a key/value pair associated with a Span. It should be
-	// called between Start and Finish.
-	Annotate(key string, value interface{})
+	// called before Finish.
+	Annotate(key string, value any)
 }
 
 // NewSpan creates a new Span with the currently installed tracing plugin.
 // If no tracing plugin is installed, it returns a fake Span that does nothing.
-func NewSpan(inCtx context.Context, label string) (Span, context.Context) {
-	parent, _ := currentTracer.FromContext(inCtx)
-	span := currentTracer.New(parent, label)
-	outCtx := currentTracer.NewContext(inCtx, span)
-
-	return span, outCtx
+func NewSpan(ctx context.Context, label string) (Span, context.Context) {
+	return currentTracer.New(ctx, label)
 }
 
 // NewFromString creates a new Span with the currently installed tracing plugin, extracting the span context from
 // the provided string.
 func NewFromString(inCtx context.Context, parent, label string) (Span, context.Context, error) {
-	span, err := currentTracer.NewFromString(parent, label)
-	if err != nil {
-		return nil, nil, err
-	}
-	outCtx := currentTracer.NewContext(inCtx, span)
-	return span, outCtx, nil
+	return currentTracer.NewFromString(inCtx, parent, label)
 }
 
 // AnnotateSQL annotates information about a sql query in the span. This is done in a way
 // so as to not leak personally identifying information (PII), or sensitive personal information (SPI)
-func AnnotateSQL(span Span, sql string) {
-	span.Annotate("sql-statement-type", sqlparser.Preview(sql).String())
+func AnnotateSQL(span Span, strippedSQL fmt.Stringer) {
+	span.Annotate("sql-statement-type", strippedSQL.String())
 }
 
 // FromContext returns the Span from a Context if present. The bool return
@@ -102,10 +95,10 @@ func AddGrpcClientOptions(addInterceptors func(s grpc.StreamClientInterceptor, u
 // tracingService is an interface for creating spans or extracting them from Contexts.
 type tracingService interface {
 	// New creates a new span from an existing one, if provided. The parent can also be nil
-	New(parent Span, label string) Span
+	New(ctx context.Context, label string) (Span, context.Context)
 
 	// NewFromString creates a new span and uses the provided string to reconstitute the parent span
-	NewFromString(parent, label string) (Span, error)
+	NewFromString(ctx context.Context, parent, label string) (Span, context.Context, error)
 
 	// FromContext extracts a span from a context, making it possible to annotate the span with additional information
 	FromContext(ctx context.Context) (Span, bool)
@@ -124,37 +117,70 @@ type tracingService interface {
 // object to make sure that all spans are sent to the backend before the process exits.
 type TracerFactory func(serviceName string) (tracingService, io.Closer, error)
 
-// tracingBackendFactories should be added to by a plugin during init() to install itself
-var tracingBackendFactories = make(map[string]TracerFactory)
-
-var currentTracer tracingService = noopTracingServer{}
+const configKeyPrefix = "trace"
 
 var (
-	tracingServer = flag.String("tracer", "noop", "tracing service to use")
+	// tracingBackendFactories should be added to by a plugin during init() to install itself
+	tracingBackendFactories = make(map[string]TracerFactory)
+
+	currentTracer tracingService = noopTracingServer{}
+
+	/* flags */
+
+	configKey = viperutil.KeyPrefixFunc(configKeyPrefix)
+
+	tracingServer = viperutil.Configure(
+		configKey("service"),
+		viperutil.Options[string]{
+			Default:  "noop",
+			FlagName: "tracer",
+		},
+	)
+	enableLogging = viperutil.Configure(
+		configKey("enable-logging"),
+		viperutil.Options[bool]{
+			FlagName: "tracing-enable-logging",
+		},
+	)
+
+	pluginFlags []func(fs *pflag.FlagSet)
 )
+
+func RegisterFlags(fs *pflag.FlagSet) {
+	fs.String("tracer", tracingServer.Default(), "tracing service to use")
+	fs.Bool("tracing-enable-logging", false, "whether to enable logging in the tracing service")
+
+	viperutil.BindFlags(fs, tracingServer, enableLogging)
+
+	for _, fn := range pluginFlags {
+		fn(fs)
+	}
+}
 
 // StartTracing enables tracing for a named service
 func StartTracing(serviceName string) io.Closer {
-	factory, ok := tracingBackendFactories[*tracingServer]
+	tracingBackend := tracingServer.Get()
+	factory, ok := tracingBackendFactories[tracingBackend]
 	if !ok {
 		return fail(serviceName)
 	}
 
 	tracer, closer, err := factory(serviceName)
 	if err != nil {
-		log.Error(vterrors.Wrapf(err, "failed to create a %s tracer", *tracingServer))
+		log.Error(vterrors.Wrapf(err, "failed to create a %s tracer", tracingBackend))
 		return &nilCloser{}
 	}
 
 	currentTracer = tracer
-
-	log.Infof("successfully started tracing with [%s]", *tracingServer)
+	if tracingBackend != "noop" {
+		log.Infof("successfully started tracing with [%s]", tracingBackend)
+	}
 
 	return closer
 }
 
 func fail(serviceName string) io.Closer {
-	options := make([]string, len(tracingBackendFactories))
+	options := make([]string, 0, len(tracingBackendFactories))
 	for k := range tracingBackendFactories {
 		options = append(options, k)
 	}
@@ -163,7 +189,6 @@ func fail(serviceName string) io.Closer {
 	return &nilCloser{}
 }
 
-type nilCloser struct {
-}
+type nilCloser struct{}
 
 func (c *nilCloser) Close() error { return nil }

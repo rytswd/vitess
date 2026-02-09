@@ -28,7 +28,12 @@ import (
 const (
 	// DefaultVtDataRoot is the default value for VTROOT environment variable
 	DefaultVtDataRoot = "/vt"
+	// DefaultVtRoot is only required for hooks
+	DefaultVtRoot  = "/usr/local/vitess"
+	mysqldSbinPath = "/usr/sbin/mysqld"
 )
+
+var errMysqldNotFound = errors.New("VT_MYSQL_ROOT is not set and no mysqld could be found in your PATH")
 
 // VtRoot returns $VTROOT or tries to guess its value if it's not set.
 // This is the root for the 'vt' distribution, which contains bin/vttablet
@@ -46,8 +51,7 @@ func VtRoot() (root string, err error) {
 	if strings.HasSuffix(dir, "/bin") {
 		return path.Dir(dir), nil
 	}
-	err = errors.New("VTROOT could not be guessed from the executable location. Please set $VTROOT")
-	return
+	return DefaultVtRoot, nil
 }
 
 // VtDataRoot returns $VTDATAROOT or the default if $VTDATAROOT is not
@@ -62,21 +66,30 @@ func VtDataRoot() string {
 }
 
 // VtMysqlRoot returns the root for the mysql distribution,
-// which contains bin/mysql CLI for instance.
-// If it is not set, look for mysqld in the path.
+// which contains the bin/mysql CLI for instance.
+// If $VT_MYSQL_ROOT is not set, look for mysqld in the $PATH.
 func VtMysqlRoot() (string, error) {
-	// if the environment variable is set, use that
+	// If the environment variable is set, use that.
 	if root := os.Getenv("VT_MYSQL_ROOT"); root != "" {
 		return root, nil
 	}
 
-	// otherwise let's use the mysqld in the PATH
-	path, err := exec.LookPath("mysqld")
-	if err != nil {
-		return "", errors.New("VT_MYSQL_ROOT is not set and no mysqld could be found in your PATH")
+	getRoot := func(path string) string {
+		return filepath.Dir(filepath.Dir(path)) // Strip mysqld and [s]bin parts
 	}
-	path = filepath.Dir(filepath.Dir(path)) // strip mysqld, and the sbin
-	return path, nil
+	binpath, err := exec.LookPath("mysqld")
+	if err != nil {
+		// First see if /usr/sbin/mysqld exists as it might not be in
+		// the PATH by default and this is often the default location
+		// used by mysqld OS system packages (apt, dnf, etc).
+		fi, err := os.Stat(mysqldSbinPath)
+		if err == nil /* file exists */ && fi.Mode().IsRegular() /* not a DIR or other special file */ &&
+			fi.Mode()&0o111 != 0 /* executable by anyone */ {
+			return getRoot(mysqldSbinPath), nil
+		}
+		return "", errMysqldNotFound
+	}
+	return getRoot(binpath), nil
 }
 
 // VtMysqlBaseDir returns the Mysql base directory, which

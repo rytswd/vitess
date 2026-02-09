@@ -1,4 +1,4 @@
-// +build !race
+//go:build !race
 
 /*
 Copyright 2019 The Vitess Authors.

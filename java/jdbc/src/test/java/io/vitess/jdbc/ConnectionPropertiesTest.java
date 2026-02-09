@@ -23,7 +23,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
-import static org.mockito.Matchers.anyString;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
@@ -263,14 +263,14 @@ public class ConnectionPropertiesTest {
     Properties info = new Properties();
     info.setProperty(Constants.Property.KEYSPACE, "test_keyspace");
     props.initializeProperties(info);
-    assertEquals("target", "test_keyspace@master", props.getTarget());
+    assertEquals("target", "test_keyspace@primary", props.getTarget());
 
     // Setting keyspace and shard
     info = new Properties();
     info.setProperty(Constants.Property.KEYSPACE, "test_keyspace");
     info.setProperty(Constants.Property.SHARD, "80-c0");
     props.initializeProperties(info);
-    assertEquals("target", "test_keyspace:80-c0@master", props.getTarget());
+    assertEquals("target", "test_keyspace:80-c0@primary", props.getTarget());
 
     // Setting tablet type
     info = new Properties();
@@ -282,7 +282,7 @@ public class ConnectionPropertiesTest {
     info = new Properties();
     info.setProperty(Constants.Property.SHARD, "80-c0");
     props.initializeProperties(info);
-    assertEquals("target", "@master", props.getTarget());
+    assertEquals("target", "@primary", props.getTarget());
 
     // Setting shard and tablet type. Shard will have no impact.
     info = new Properties();

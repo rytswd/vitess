@@ -17,27 +17,30 @@ limitations under the License.
 package servenv
 
 import (
-	"flag"
+	"github.com/spf13/pflag"
 
-	"vitess.io/vitess/go/flagutil"
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/utils"
 )
 
 var (
-	serviceMapFlag flagutil.StringListValue
+	serviceMapFlag []string
 
 	// serviceMap is the used version of the service map.
 	// init() functions can add default values to it (using InitServiceMap).
-	// service_map command line parameter will alter the map.
+	// service-map command line parameter will alter the map.
 	// Can only be used after servenv.Init has been called.
 	serviceMap = make(map[string]bool)
 )
 
-func init() {
-	flag.Var(&serviceMapFlag, "service_map", "comma separated list of services to enable (or disable if prefixed with '-') Example: grpc-vtworker")
-	OnInit(func() {
-		updateServiceMap()
+// RegisterServiceMapFlag registers an OnParse hook to install the
+// `--service-map` flag for a given cmd. It must be called before ParseFlags or
+// ParseFlagsWithArgs.
+func RegisterServiceMapFlag() {
+	OnParse(func(fs *pflag.FlagSet) {
+		utils.SetFlagStringSliceVar(fs, &serviceMapFlag, "service-map", serviceMapFlag, "comma separated list of services to enable (or disable if prefixed with '-') Example: grpc-queryservice")
 	})
+	OnInit(updateServiceMap)
 }
 
 // InitServiceMap will set the default value for a protocol/name to be served.
@@ -57,13 +60,13 @@ func updateServiceMap() {
 	}
 }
 
-// CheckServiceMap returns if we should register a RPC service
+// checkServiceMap returns if we should register a RPC service
 // (and also logs how to enable / disable it)
-func CheckServiceMap(protocol, name string) bool {
+func checkServiceMap(protocol, name string) bool {
 	if serviceMap[protocol+"-"+name] {
-		log.Infof("Registering %v for %v, disable it with -%v-%v service_map parameter", name, protocol, protocol, name)
+		log.Infof("Registering %v for %v, disable it with -%v-%v service-map parameter", name, protocol, protocol, name)
 		return true
 	}
-	log.Infof("Not registering %v for %v, enable it with %v-%v service_map parameter", name, protocol, protocol, name)
+	log.Infof("Not registering %v for %v, enable it with %v-%v service-map parameter", name, protocol, protocol, name)
 	return false
 }

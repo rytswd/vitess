@@ -18,13 +18,14 @@ package prometheusbackend
 
 import (
 	"expvar"
-	"net/http"
 	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	"vitess.io/vitess/go/stats"
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/servenv"
 )
 
 // PromBackend implements PullBackend using Prometheus as the backing metrics storage.
@@ -32,18 +33,16 @@ type PromBackend struct {
 	namespace string
 }
 
-var (
-	be PromBackend
-)
+var be PromBackend
 
 // Init initializes the Prometheus be with the given namespace.
 func Init(namespace string) {
-	http.Handle("/metrics", promhttp.Handler())
+	servenv.HTTPHandle("/metrics", promhttp.Handler())
 	be.namespace = namespace
 	stats.Register(be.publishPrometheusMetric)
 }
 
-// PublishPromMetric is used to publish the metric to Prometheus.
+// publishPrometheusMetric is used to publish the metric to Prometheus.
 func (be PromBackend) publishPrometheusMetric(name string, v expvar.Var) {
 	switch st := v.(type) {
 	case *stats.Counter:
@@ -52,6 +51,8 @@ func (be PromBackend) publishPrometheusMetric(name string, v expvar.Var) {
 		newMetricFuncCollector(st, be.buildPromName(name), prometheus.CounterValue, func() float64 { return float64(st.F()) })
 	case *stats.Gauge:
 		newMetricFuncCollector(st, be.buildPromName(name), prometheus.GaugeValue, func() float64 { return float64(st.Get()) })
+	case *stats.GaugeFloat64:
+		newMetricFuncCollector(st, be.buildPromName(name), prometheus.GaugeValue, func() float64 { return st.Get() })
 	case *stats.GaugeFunc:
 		newMetricFuncCollector(st, be.buildPromName(name), prometheus.GaugeValue, func() float64 { return float64(st.F()) })
 	case stats.FloatFunc:
@@ -82,7 +83,9 @@ func (be PromBackend) publishPrometheusMetric(name string, v expvar.Var) {
 		newMultiTimingsCollector(st, be.buildPromName(name))
 	case *stats.Histogram:
 		newHistogramCollector(st, be.buildPromName(name))
-	case *stats.String, stats.StringFunc, stats.StringMapFunc, *stats.Rates:
+	case *stats.StringMapFuncWithMultiLabels:
+		newStringMapFuncWithMultiLabelsCollector(st, be.buildPromName(name))
+	case *stats.String, stats.StringFunc, stats.StringMapFunc, *stats.Rates, *stats.RatesFunc, *stats.GaugesFunc:
 		// Silently ignore these types since they don't make sense to
 		// export to Prometheus' data model.
 	default:
@@ -104,7 +107,7 @@ func labelsToSnake(labels []string) []string {
 	return output
 }
 
-// normalizeMetricForPrometheus produces a compliant name by applying
+// normalizeMetric produces a compliant name by applying
 // special case conversions and then applying a camel case to snake case converter.
 func normalizeMetric(name string) string {
 	// Special cases

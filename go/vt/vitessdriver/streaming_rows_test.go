@@ -24,6 +24,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
 	"vitess.io/vitess/go/sqltypes"
 	querypb "vitess.io/vitess/go/vt/proto/query"
 )
@@ -102,9 +104,7 @@ func TestStreamingRows(t *testing.T) {
 	}
 	gotRow := make([]driver.Value, 3)
 	err := ri.Next(gotRow)
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 	if !reflect.DeepEqual(gotRow, wantRow) {
 		t.Errorf("row1: %v, want %v", gotRow, wantRow)
 	}
@@ -115,9 +115,7 @@ func TestStreamingRows(t *testing.T) {
 		[]byte("value2"),
 	}
 	err = ri.Next(gotRow)
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 	if !reflect.DeepEqual(gotRow, wantRow) {
 		t.Errorf("row1: %v, want %v", gotRow, wantRow)
 	}
@@ -146,9 +144,7 @@ func TestStreamingRowsReversed(t *testing.T) {
 	}
 	gotRow := make([]driver.Value, 3)
 	err := ri.Next(gotRow)
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 	if !reflect.DeepEqual(gotRow, wantRow) {
 		t.Errorf("row1: %v, want %v", gotRow, wantRow)
 	}
@@ -216,9 +212,7 @@ func TestStreamingRowsError(t *testing.T) {
 	ri = newStreamingRows(&adapter{c: c, err: errors.New("error after rows")}, &converter{})
 	gotRow = make([]driver.Value, 3)
 	err = ri.Next(gotRow)
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 	err = ri.Next(gotRow)
 	wantErr = "error after rows"
 	if err == nil || !strings.Contains(err.Error(), wantErr) {

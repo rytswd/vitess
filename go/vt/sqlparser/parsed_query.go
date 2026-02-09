@@ -22,19 +22,19 @@ import (
 	"strings"
 
 	"vitess.io/vitess/go/sqltypes"
-
 	querypb "vitess.io/vitess/go/vt/proto/query"
 )
 
 // ParsedQuery represents a parsed query where
-// bind locations are precompued for fast substitutions.
+// bind locations are precomputed for fast substitutions.
 type ParsedQuery struct {
 	Query         string
-	bindLocations []bindLocation
+	bindLocations []BindLocation
+	truncateUILen int
 }
 
-type bindLocation struct {
-	offset, length int
+type BindLocation struct {
+	Offset, Length int
 }
 
 // NewParsedQuery returns a ParsedQuery of the ast.
@@ -63,8 +63,8 @@ func (pq *ParsedQuery) GenerateQuery(bindVariables map[string]*querypb.BindVaria
 func (pq *ParsedQuery) Append(buf *strings.Builder, bindVariables map[string]*querypb.BindVariable, extras map[string]Encodable) error {
 	current := 0
 	for _, loc := range pq.bindLocations {
-		buf.WriteString(pq.Query[current:loc.offset])
-		name := pq.Query[loc.offset : loc.offset+loc.length]
+		buf.WriteString(pq.Query[current:loc.Offset])
+		name := pq.Query[loc.Offset : loc.Offset+loc.Length]
 		if encodable, ok := extras[name[1:]]; ok {
 			encodable.EncodeSQL(buf)
 		} else {
@@ -74,36 +74,48 @@ func (pq *ParsedQuery) Append(buf *strings.Builder, bindVariables map[string]*qu
 			}
 			EncodeValue(buf, supplied)
 		}
-		current = loc.offset + loc.length
+		current = loc.Offset + loc.Length
 	}
 	buf.WriteString(pq.Query[current:])
 	return nil
 }
 
+func (pq *ParsedQuery) BindLocations() []BindLocation {
+	return pq.bindLocations
+}
+
 // MarshalJSON is a custom JSON marshaler for ParsedQuery.
-// Note that any queries longer that 512 bytes will be truncated.
 func (pq *ParsedQuery) MarshalJSON() ([]byte, error) {
-	return json.Marshal(TruncateForUI(pq.Query))
+	return json.Marshal(pq.Query)
 }
 
 // EncodeValue encodes one bind variable value into the query.
 func EncodeValue(buf *strings.Builder, value *querypb.BindVariable) {
-	if value.Type != querypb.Type_TUPLE {
-		// Since we already check for TUPLE, we don't expect an error.
-		v, _ := sqltypes.BindVariableToValue(value)
-		v.EncodeSQL(buf)
-		return
-	}
-
-	// It's a TUPLE.
-	buf.WriteByte('(')
-	for i, bv := range value.Values {
-		if i != 0 {
-			buf.WriteString(", ")
+	switch value.Type {
+	case querypb.Type_TUPLE:
+		buf.WriteByte('(')
+		for i, bv := range value.Values {
+			if i != 0 {
+				buf.WriteString(", ")
+			}
+			sqltypes.ProtoToValue(bv).EncodeSQLStringBuilder(buf)
 		}
-		sqltypes.ProtoToValue(bv).EncodeSQL(buf)
+		buf.WriteByte(')')
+	case querypb.Type_ROW_TUPLE:
+		for i, bv := range value.Values {
+			if i != 0 {
+				buf.WriteString(", ")
+			}
+			buf.WriteString("row")
+			sqltypes.ProtoToValue(bv).EncodeSQLStringBuilder(buf)
+		}
+	case querypb.Type_RAW:
+		v, _ := sqltypes.BindVariableToValue(value)
+		buf.Write(v.Raw())
+	default:
+		v, _ := sqltypes.BindVariableToValue(value)
+		v.EncodeSQLStringBuilder(buf)
 	}
-	buf.WriteByte(')')
 }
 
 // FetchBindVar resolves the bind variable by fetching it from bindVariables.
@@ -119,7 +131,9 @@ func FetchBindVar(name string, bindVariables map[string]*querypb.BindVariable) (
 	}
 
 	if isList {
-		if supplied.Type != querypb.Type_TUPLE {
+		switch supplied.Type {
+		case querypb.Type_TUPLE, querypb.Type_ROW_TUPLE:
+		default:
 			return nil, false, fmt.Errorf("unexpected list arg type (%v) for key %s", supplied.Type, name)
 		}
 		if len(supplied.Values) == 0 {
@@ -133,4 +147,33 @@ func FetchBindVar(name string, bindVariables map[string]*querypb.BindVariable) (
 	}
 
 	return supplied, false, nil
+}
+
+// ParseAndBind is a one step sweep that binds variables to an input query, in order of placeholders.
+// It is useful when one doesn't have any parser-variables, just bind variables.
+// Example:
+//
+//	query, err := ParseAndBind("select * from tbl where name=%a", sqltypes.StringBindVariable("it's me"))
+func ParseAndBind(in string, binds ...*querypb.BindVariable) (query string, err error) {
+	vars := make([]any, len(binds))
+	for i, bv := range binds {
+		switch bv.Type {
+		case querypb.Type_TUPLE:
+			vars[i] = fmt.Sprintf("::vars%d", i)
+		default:
+			vars[i] = fmt.Sprintf(":var%d", i)
+		}
+	}
+	parsed := BuildParsedQuery(in, vars...)
+
+	bindVars := map[string]*querypb.BindVariable{}
+	for i, bv := range binds {
+		switch bv.Type {
+		case querypb.Type_TUPLE:
+			bindVars[fmt.Sprintf("vars%d", i)] = binds[i]
+		default:
+			bindVars[fmt.Sprintf("var%d", i)] = binds[i]
+		}
+	}
+	return parsed.GenerateQuery(bindVars, nil)
 }

@@ -17,7 +17,7 @@ limitations under the License.
 package srvtopotest
 
 import (
-	"golang.org/x/net/context"
+	"context"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
@@ -50,7 +50,7 @@ func (srv *PassthroughSrvTopoServer) GetTopoServer() (*topo.Server, error) {
 }
 
 // GetSrvKeyspaceNames implements srvtopo.Server
-func (srv *PassthroughSrvTopoServer) GetSrvKeyspaceNames(ctx context.Context, cell string) ([]string, error) {
+func (srv *PassthroughSrvTopoServer) GetSrvKeyspaceNames(ctx context.Context, cell string, staleOK bool) ([]string, error) {
 	return srv.SrvKeyspaceNames, srv.SrvKeyspaceNamesError
 }
 
@@ -59,7 +59,11 @@ func (srv *PassthroughSrvTopoServer) GetSrvKeyspace(ctx context.Context, cell, k
 	return srv.SrvKeyspace, srv.SrvKeyspaceError
 }
 
+func (srv *PassthroughSrvTopoServer) WatchSrvKeyspace(ctx context.Context, cell, keyspace string, callback func(*topodatapb.SrvKeyspace, error) bool) {
+	callback(srv.SrvKeyspace, srv.SrvKeyspaceError)
+}
+
 // WatchSrvVSchema implements srvtopo.Server
-func (srv *PassthroughSrvTopoServer) WatchSrvVSchema(ctx context.Context, cell string, callback func(*vschemapb.SrvVSchema, error)) {
+func (srv *PassthroughSrvTopoServer) WatchSrvVSchema(ctx context.Context, cell string, callback func(*vschemapb.SrvVSchema, error) bool) {
 	callback(srv.WatchedSrvVSchema, srv.WatchedSrvVSchemaError)
 }

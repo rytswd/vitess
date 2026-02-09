@@ -18,7 +18,7 @@ package filelogger
 
 import (
 	"context"
-	"io/ioutil"
+	"os"
 	"path"
 	"testing"
 	"time"
@@ -29,10 +29,7 @@ import (
 
 // TestFileLog sends a stream of five query records to the plugin, and verifies that they are logged.
 func TestFileLog(t *testing.T) {
-	dir, err := ioutil.TempDir("", "filelogger_test")
-	if err != nil {
-		t.Fatalf("error getting tempdir: %v", err)
-	}
+	dir := t.TempDir()
 
 	logPath := path.Join(dir, "test.log")
 	logger, err := Init(logPath)
@@ -60,27 +57,25 @@ func TestFileLog(t *testing.T) {
 	tabletenv.StatsLogger.Send(log2)
 
 	// Allow time for propagation
-	time.Sleep(10 * time.Millisecond)
+	for i := range 10 {
+		time.Sleep(10 * time.Millisecond)
 
-	want := "\t\t\t''\t''\t0001-01-01 00:00:00.000000\t0001-01-01 00:00:00.000000\t0.000000\t\t\"test 1\"\tmap[]\t1\t\"test 1 PII\"\tmysql\t0.000000\t0.000000\t0\t0\t\"\"\t\n\t\t\t''\t''\t0001-01-01 00:00:00.000000\t0001-01-01 00:00:00.000000\t0.000000\t\t\"test 2\"\tmap[]\t1\t\"test 2 PII\"\tmysql\t0.000000\t0.000000\t0\t0\t\"\"\t\n"
-	contents, _ := ioutil.ReadFile(logPath)
-	got := string(contents)
-	if want != string(got) {
-		t.Errorf("streamlog file: want %q got %q", want, got)
+		want := "\t\t\t''\t''\t0001-01-01 00:00:00.000000\t0001-01-01 00:00:00.000000\t0.000000\t\t\"test 1\"\t{}\t1\t\"test 1 PII\"\tmysql\t0.000000\t0.000000\t0\t0\t0\t\"\"\t\"\"\t\n\t\t\t''\t''\t0001-01-01 00:00:00.000000\t0001-01-01 00:00:00.000000\t0.000000\t\t\"test 2\"\t{}\t1\t\"test 2 PII\"\tmysql\t0.000000\t0.000000\t0\t0\t0\t\"\"\t\"\"\t\n"
+		contents, _ := os.ReadFile(logPath)
+		got := string(contents)
+		if want == got {
+			return
+		}
+		// Last iteration.
+		if i == 9 {
+			t.Errorf("streamlog file: want %q got %q", want, got)
+		}
 	}
 }
 
 // TestFileLog sends a stream of five query records to the plugin, and verifies that they are logged.
 func TestFileLogRedacted(t *testing.T) {
-	*streamlog.RedactDebugUIQueries = true
-	defer func() {
-		*streamlog.RedactDebugUIQueries = false
-	}()
-
-	dir, err := ioutil.TempDir("", "filelogger_test")
-	if err != nil {
-		t.Fatalf("error getting tempdir: %v", err)
-	}
+	dir := t.TempDir()
 
 	logPath := path.Join(dir, "test.log")
 	logger, err := Init(logPath)
@@ -94,7 +89,9 @@ func TestFileLogRedacted(t *testing.T) {
 	log1 := &tabletenv.LogStats{
 		Ctx:         ctx,
 		OriginalSQL: "test 1",
+		Config:      streamlog.NewQueryLogConfigForTest(),
 	}
+	log1.Config.RedactDebugUIQueries = true
 	log1.AddRewrittenSQL("test 1 PII", time.Time{})
 	log1.MysqlResponseTime = 0
 	tabletenv.StatsLogger.Send(log1)
@@ -102,7 +99,9 @@ func TestFileLogRedacted(t *testing.T) {
 	log2 := &tabletenv.LogStats{
 		Ctx:         ctx,
 		OriginalSQL: "test 2",
+		Config:      streamlog.NewQueryLogConfigForTest(),
 	}
+	log2.Config.RedactDebugUIQueries = true
 	log2.AddRewrittenSQL("test 2 PII", time.Time{})
 	log2.MysqlResponseTime = 0
 	tabletenv.StatsLogger.Send(log2)
@@ -110,8 +109,8 @@ func TestFileLogRedacted(t *testing.T) {
 	// Allow time for propagation
 	time.Sleep(10 * time.Millisecond)
 
-	want := "\t\t\t''\t''\t0001-01-01 00:00:00.000000\t0001-01-01 00:00:00.000000\t0.000000\t\t\"test 1\"\t\"[REDACTED]\"\t1\t\"[REDACTED]\"\tmysql\t0.000000\t0.000000\t0\t0\t\"\"\t\n\t\t\t''\t''\t0001-01-01 00:00:00.000000\t0001-01-01 00:00:00.000000\t0.000000\t\t\"test 2\"\t\"[REDACTED]\"\t1\t\"[REDACTED]\"\tmysql\t0.000000\t0.000000\t0\t0\t\"\"\t\n"
-	contents, _ := ioutil.ReadFile(logPath)
+	want := "\t\t\t''\t''\t0001-01-01 00:00:00.000000\t0001-01-01 00:00:00.000000\t0.000000\t\t\"test 1\"\t\"[REDACTED]\"\t1\t\"[REDACTED]\"\tmysql\t0.000000\t0.000000\t0\t0\t0\t\"\"\t\"\"\t\n\t\t\t''\t''\t0001-01-01 00:00:00.000000\t0001-01-01 00:00:00.000000\t0.000000\t\t\"test 2\"\t\"[REDACTED]\"\t1\t\"[REDACTED]\"\tmysql\t0.000000\t0.000000\t0\t0\t0\t\"\"\t\"\"\t\n"
+	contents, _ := os.ReadFile(logPath)
 	got := string(contents)
 	if want != string(got) {
 		t.Errorf("streamlog file: want %q got %q", want, got)

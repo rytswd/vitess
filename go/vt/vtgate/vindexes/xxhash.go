@@ -18,6 +18,7 @@ package vindexes
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 
 	"github.com/cespare/xxhash/v2"
@@ -27,18 +28,24 @@ import (
 )
 
 var (
-	_ Vindex = (*XXHash)(nil)
+	_ SingleColumn    = (*XXHash)(nil)
+	_ Hashing         = (*XXHash)(nil)
+	_ ParamValidating = (*XXHash)(nil)
 )
 
 // XXHash defines vindex that hashes any sql types to a KeyspaceId
 // by using xxhash64. It's Unique and works on any platform giving identical result.
 type XXHash struct {
-	name string
+	name          string
+	unknownParams []string
 }
 
-// NewXXHash creates a new XXHash.
-func NewXXHash(name string, m map[string]string) (Vindex, error) {
-	return &XXHash{name: name}, nil
+// newXXHash creates a new XXHash.
+func newXXHash(name string, m map[string]string) (Vindex, error) {
+	return &XXHash{
+		name:          name,
+		unknownParams: FindUnknownParams(m, nil),
+	}, nil
 }
 
 // String returns the name of the vindex.
@@ -56,28 +63,52 @@ func (vind *XXHash) IsUnique() bool {
 	return true
 }
 
-// Map can map ids to key.Destination objects.
-func (vind *XXHash) Map(cursor VCursor, ids []sqltypes.Value) ([]key.Destination, error) {
-	out := make([]key.Destination, len(ids))
-	for i := range ids {
-		id := ids[i].ToBytes()
-		out[i] = key.DestinationKeyspaceID(vXXHash(id))
+// NeedsVCursor satisfies the Vindex interface.
+func (vind *XXHash) NeedsVCursor() bool {
+	return false
+}
+
+// Map can map ids to key.ShardDestination objects.
+func (vind *XXHash) Map(ctx context.Context, vcursor VCursor, ids []sqltypes.Value) ([]key.ShardDestination, error) {
+	out := make([]key.ShardDestination, 0, len(ids))
+	for _, id := range ids {
+		ksid, err := vind.Hash(id)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, key.DestinationKeyspaceID(ksid))
 	}
 	return out, nil
 }
 
 // Verify returns true if ids maps to ksids.
-func (vind *XXHash) Verify(_ VCursor, ids []sqltypes.Value, ksids [][]byte) ([]bool, error) {
-	out := make([]bool, len(ids))
-	for i := range ids {
-		id := ids[i].ToBytes()
-		out[i] = bytes.Equal(vXXHash(id), ksids[i])
+func (vind *XXHash) Verify(ctx context.Context, vcursor VCursor, ids []sqltypes.Value, ksids [][]byte) ([]bool, error) {
+	out := make([]bool, 0, len(ids))
+	for i, id := range ids {
+		ksid, err := vind.Hash(id)
+		if err != nil {
+			return out, err
+		}
+		out = append(out, bytes.Equal(ksid, ksids[i]))
 	}
 	return out, nil
 }
 
+func (vind *XXHash) Hash(id sqltypes.Value) ([]byte, error) {
+	idBytes, err := id.ToBytes()
+	if err != nil {
+		return nil, err
+	}
+	return vXXHash(idBytes), nil
+}
+
+// UnknownParams implements the ParamValidating interface.
+func (vind *XXHash) UnknownParams() []string {
+	return vind.unknownParams
+}
+
 func init() {
-	Register("xxhash", NewXXHash)
+	Register("xxhash", newXXHash)
 }
 
 func vXXHash(shardKey []byte) []byte {

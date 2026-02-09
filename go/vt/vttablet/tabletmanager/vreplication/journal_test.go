@@ -20,8 +20,8 @@ import (
 	"fmt"
 	"testing"
 
-	"golang.org/x/net/context"
 	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
+	qh "vitess.io/vitess/go/vt/vttablet/tabletmanager/vreplication/queryhistory"
 )
 
 func TestJournalOneToOne(t *testing.T) {
@@ -36,14 +36,20 @@ func TestJournalOneToOne(t *testing.T) {
 		"drop table t",
 		fmt.Sprintf("drop table %s.t", vrepldb),
 	})
-	env.SchemaEngine.Reload(context.Background())
 
 	filter := &binlogdatapb.Filter{
 		Rules: []*binlogdatapb.Rule{{
 			Match: "t",
 		}},
 	}
-	_, firstID := startVReplication(t, filter, binlogdatapb.OnDDLAction_IGNORE, "")
+	bls := &binlogdatapb.BinlogSource{
+		Keyspace: env.KeyspaceName,
+		Shard:    env.ShardName,
+		Filter:   filter,
+		OnDdl:    binlogdatapb.OnDDLAction_IGNORE,
+	}
+
+	_, firstID := startVReplication(t, bls, "")
 
 	journal := &binlogdatapb.Journal{
 		Id:            1,
@@ -59,22 +65,20 @@ func TestJournalOneToOne(t *testing.T) {
 		}},
 	}
 	query := fmt.Sprintf("insert into _vt.resharding_journal(id, db_name, val) values (1, 'vttest', %v)", encodeString(journal.String()))
-	execStatements(t, []string{createReshardingJournalTable, query})
+	execStatements(t, []string{query})
 	defer execStatements(t, []string{"delete from _vt.resharding_journal"})
 
-	expectDBClientQueries(t, []string{
-		"/update _vt.vreplication set pos=",
+	expectDBClientQueries(t, qh.Expect(
 		"begin",
-		`/insert into _vt.vreplication.*workflow, source, pos.*values.*'test', 'keyspace:\\"other_keyspace\\" shard:\\"0\\.*'MySQL56/7b04699f-f5e9-11e9-bf88-9cb6d089e1c3:1-10'`,
+		`/insert into _vt.vreplication.*workflow, source, pos.*values.*'test', 'keyspace:"other_keyspace" shard:"0.*'MySQL56/7b04699f-f5e9-11e9-bf88-9cb6d089e1c3:1-10'`,
 		fmt.Sprintf("delete from _vt.vreplication where id=%d", firstID),
 		"commit",
+		"/update _vt.vreplication set message='Picked source tablet.*",
 		"/update _vt.vreplication set state='Running', message='' where id.*",
-	})
+	))
 
 	// Delete all vreplication streams. There should be only one, but we don't know its id.
-	if _, err := playerEngine.Exec("delete from _vt.vreplication"); err != nil {
-		t.Fatal(err)
-	}
+	deleteAllVReplicationStreams(t)
 	expectDeleteQueries(t)
 }
 
@@ -91,14 +95,20 @@ func TestJournalOneToMany(t *testing.T) {
 		"drop table t",
 		fmt.Sprintf("drop table %s.t", vrepldb),
 	})
-	env.SchemaEngine.Reload(context.Background())
 
 	filter := &binlogdatapb.Filter{
 		Rules: []*binlogdatapb.Rule{{
 			Match: "t",
 		}},
 	}
-	_, firstID := startVReplication(t, filter, binlogdatapb.OnDDLAction_IGNORE, "")
+	bls := &binlogdatapb.BinlogSource{
+		Keyspace: env.KeyspaceName,
+		Shard:    env.ShardName,
+		Filter:   filter,
+		OnDdl:    binlogdatapb.OnDDLAction_IGNORE,
+	}
+
+	_, firstID := startVReplication(t, bls, "")
 
 	journal := &binlogdatapb.Journal{
 		Id:            1,
@@ -118,24 +128,23 @@ func TestJournalOneToMany(t *testing.T) {
 		}},
 	}
 	query := fmt.Sprintf("insert into _vt.resharding_journal(id, db_name, val) values (1, 'vttest', %v)", encodeString(journal.String()))
-	execStatements(t, []string{createReshardingJournalTable, query})
+	execStatements(t, []string{query})
 	defer execStatements(t, []string{"delete from _vt.resharding_journal"})
 
-	expectDBClientQueries(t, []string{
-		"/update _vt.vreplication set pos=",
+	expectDBClientQueries(t, qh.Expect(
 		"begin",
-		`/insert into _vt.vreplication.*workflow, source, pos.*values.*'test', 'keyspace:\\"other_keyspace\\" shard:\\"-80\\.*'MySQL56/7b04699f-f5e9-11e9-bf88-9cb6d089e1c3:1-5'`,
-		`/insert into _vt.vreplication.*workflow, source, pos.*values.*'test', 'keyspace:\\"other_keyspace\\" shard:\\"80-\\.*'MySQL56/7b04699f-f5e9-11e9-bf88-9cb6d089e1c3:5-10'`,
+		`/insert into _vt.vreplication.*workflow, source, pos.*values.*'test', 'keyspace:"other_keyspace" shard:"-80.*'MySQL56/7b04699f-f5e9-11e9-bf88-9cb6d089e1c3:1-5'`,
+		`/insert into _vt.vreplication.*workflow, source, pos.*values.*'test', 'keyspace:"other_keyspace" shard:"80-.*'MySQL56/7b04699f-f5e9-11e9-bf88-9cb6d089e1c3:5-10'`,
 		fmt.Sprintf("delete from _vt.vreplication where id=%d", firstID),
 		"commit",
+		"/update _vt.vreplication set message='Picked source tablet.*",
+		"/update _vt.vreplication set message='Picked source tablet.*",
 		"/update _vt.vreplication set state='Running', message='' where id.*",
 		"/update _vt.vreplication set state='Running', message='' where id.*",
-	})
+	))
 
 	// Delete all vreplication streams. There should be only one, but we don't know its id.
-	if _, err := playerEngine.Exec("delete from _vt.vreplication"); err != nil {
-		t.Fatal(err)
-	}
+	deleteAllVReplicationStreams(t)
 	expectDeleteQueries(t)
 }
 
@@ -151,14 +160,19 @@ func TestJournalTablePresent(t *testing.T) {
 		"drop table t",
 		fmt.Sprintf("drop table %s.t", vrepldb),
 	})
-	env.SchemaEngine.Reload(context.Background())
 
 	filter := &binlogdatapb.Filter{
 		Rules: []*binlogdatapb.Rule{{
 			Match: "t",
 		}},
 	}
-	_, firstID := startVReplication(t, filter, binlogdatapb.OnDDLAction_IGNORE, "")
+	bls := &binlogdatapb.BinlogSource{
+		Keyspace: env.KeyspaceName,
+		Shard:    env.ShardName,
+		Filter:   filter,
+		OnDdl:    binlogdatapb.OnDDLAction_IGNORE,
+	}
+	_, firstID := startVReplication(t, bls, "")
 
 	journal := &binlogdatapb.Journal{
 		Id:            1,
@@ -175,22 +189,20 @@ func TestJournalTablePresent(t *testing.T) {
 		}},
 	}
 	query := fmt.Sprintf("insert into _vt.resharding_journal(id, db_name, val) values (1, 'vttest', %v)", encodeString(journal.String()))
-	execStatements(t, []string{createReshardingJournalTable, query})
+	execStatements(t, []string{query})
 	defer execStatements(t, []string{"delete from _vt.resharding_journal"})
 
-	expectDBClientQueries(t, []string{
-		"/update _vt.vreplication set pos=",
+	expectDBClientQueries(t, qh.Expect(
 		"begin",
-		`/insert into _vt.vreplication.*workflow, source, pos.*values.*'test', 'keyspace:\\"other_keyspace\\" shard:\\"0\\.*'MySQL56/7b04699f-f5e9-11e9-bf88-9cb6d089e1c3:1-10'`,
+		`/insert into _vt.vreplication.*workflow, source, pos.*values.*'test', 'keyspace:"other_keyspace" shard:"0.*'MySQL56/7b04699f-f5e9-11e9-bf88-9cb6d089e1c3:1-10'`,
 		fmt.Sprintf("delete from _vt.vreplication where id=%d", firstID),
 		"commit",
+		"/update _vt.vreplication set message='Picked source tablet.*",
 		"/update _vt.vreplication set state='Running', message='' where id.*",
-	})
+	))
 
 	// Delete all vreplication streams. There should be only one, but we don't know its id.
-	if _, err := playerEngine.Exec("delete from _vt.vreplication"); err != nil {
-		t.Fatal(err)
-	}
+	deleteAllVReplicationStreams(t)
 	expectDeleteQueries(t)
 }
 
@@ -206,14 +218,20 @@ func TestJournalTableNotPresent(t *testing.T) {
 		"drop table t",
 		fmt.Sprintf("drop table %s.t", vrepldb),
 	})
-	env.SchemaEngine.Reload(context.Background())
 
 	filter := &binlogdatapb.Filter{
 		Rules: []*binlogdatapb.Rule{{
 			Match: "t",
 		}},
 	}
-	_, _ = startVReplication(t, filter, binlogdatapb.OnDDLAction_IGNORE, "")
+	bls := &binlogdatapb.BinlogSource{
+		Keyspace: env.KeyspaceName,
+		Shard:    env.ShardName,
+		Filter:   filter,
+		OnDdl:    binlogdatapb.OnDDLAction_IGNORE,
+	}
+
+	_, _ = startVReplication(t, bls, "")
 
 	journal := &binlogdatapb.Journal{
 		Id:            1,
@@ -230,18 +248,11 @@ func TestJournalTableNotPresent(t *testing.T) {
 		}},
 	}
 	query := fmt.Sprintf("insert into _vt.resharding_journal(id, db_name, val) values (1, 'vttest', %v)", encodeString(journal.String()))
-	execStatements(t, []string{createReshardingJournalTable, query})
+	execStatements(t, []string{query})
 	defer execStatements(t, []string{"delete from _vt.resharding_journal"})
 
-	// Wait for a heartbeat based update to confirm that the existing vreplication was not transitioned.
-	expectDBClientQueries(t, []string{
-		"/update _vt.vreplication set pos=",
-	})
-
 	// Delete all vreplication streams. There should be only one, but we don't know its id.
-	if _, err := playerEngine.Exec("delete from _vt.vreplication"); err != nil {
-		t.Fatal(err)
-	}
+	deleteAllVReplicationStreams(t)
 	expectDeleteQueries(t)
 }
 
@@ -261,7 +272,6 @@ func TestJournalTableMixed(t *testing.T) {
 		fmt.Sprintf("drop table %s.t", vrepldb),
 		fmt.Sprintf("drop table %s.t1", vrepldb),
 	})
-	env.SchemaEngine.Reload(context.Background())
 
 	filter := &binlogdatapb.Filter{
 		Rules: []*binlogdatapb.Rule{{
@@ -270,7 +280,13 @@ func TestJournalTableMixed(t *testing.T) {
 			Match: "t1",
 		}},
 	}
-	_, _ = startVReplication(t, filter, binlogdatapb.OnDDLAction_IGNORE, "")
+	bls := &binlogdatapb.BinlogSource{
+		Keyspace: env.KeyspaceName,
+		Shard:    env.ShardName,
+		Filter:   filter,
+		OnDdl:    binlogdatapb.OnDDLAction_IGNORE,
+	}
+	_, _ = startVReplication(t, bls, "")
 
 	journal := &binlogdatapb.Journal{
 		Id:            1,
@@ -287,17 +303,14 @@ func TestJournalTableMixed(t *testing.T) {
 		}},
 	}
 	query := fmt.Sprintf("insert into _vt.resharding_journal(id, db_name, val) values (1, 'vttest', %v)", encodeString(journal.String()))
-	execStatements(t, []string{createReshardingJournalTable, query})
+	execStatements(t, []string{query})
 	defer execStatements(t, []string{"delete from _vt.resharding_journal"})
 
-	expectDBClientQueries(t, []string{
-		"/update _vt.vreplication set pos=",
+	expectDBClientQueries(t, qh.Expect(
 		"/update _vt.vreplication set state='Stopped', message='unable to handle journal event: tables were partially matched' where id",
-	})
+	))
 
 	// Delete all vreplication streams. There should be only one, but we don't know its id.
-	if _, err := playerEngine.Exec("delete from _vt.vreplication"); err != nil {
-		t.Fatal(err)
-	}
+	deleteAllVReplicationStreams(t)
 	expectDeleteQueries(t)
 }

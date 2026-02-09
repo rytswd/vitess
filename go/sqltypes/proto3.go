@@ -17,12 +17,11 @@ limitations under the License.
 package sqltypes
 
 import (
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 
 	"vitess.io/vitess/go/vt/vterrors"
 
 	querypb "vitess.io/vitess/go/vt/proto/query"
-	vtgatepb "vitess.io/vitess/go/vt/proto/vtgate"
 )
 
 // This file contains the proto3 conversion functions for the structures
@@ -31,7 +30,17 @@ import (
 // RowToProto3 converts []Value to proto3.
 func RowToProto3(row []Value) *querypb.Row {
 	result := &querypb.Row{}
-	result.Lengths = make([]int64, 0, len(row))
+	_ = RowToProto3Inplace(row, result)
+	return result
+}
+
+// RowToProto3Inplace converts []Value to proto3 and stores the conversion in the provided Row
+func RowToProto3Inplace(row []Value, result *querypb.Row) int {
+	if result.Lengths == nil {
+		result.Lengths = make([]int64, 0, len(row))
+	} else {
+		result.Lengths = result.Lengths[:0]
+	}
 	total := 0
 	for _, c := range row {
 		if c.IsNull() {
@@ -42,14 +51,18 @@ func RowToProto3(row []Value) *querypb.Row {
 		result.Lengths = append(result.Lengths, int64(length))
 		total += length
 	}
-	result.Values = make([]byte, 0, total)
+	if result.Values == nil {
+		result.Values = make([]byte, 0, total)
+	} else {
+		result.Values = result.Values[:0]
+	}
 	for _, c := range row {
 		if c.IsNull() {
 			continue
 		}
 		result.Values = append(result.Values, c.Raw()...)
 	}
-	return result
+	return total
 }
 
 // RowsToProto3 converts [][]Value to proto3.
@@ -87,11 +100,13 @@ func ResultToProto3(qr *Result) *querypb.QueryResult {
 		return nil
 	}
 	return &querypb.QueryResult{
-		Fields:       qr.Fields,
-		RowsAffected: qr.RowsAffected,
-		InsertId:     qr.InsertID,
-		Rows:         RowsToProto3(qr.Rows),
-		Extras:       qr.Extras,
+		Fields:              qr.Fields,
+		RowsAffected:        qr.RowsAffected,
+		InsertId:            qr.InsertID,
+		InsertIdChanged:     qr.InsertIDChanged,
+		Rows:                RowsToProto3(qr.Rows),
+		Info:                qr.Info,
+		SessionStateChanges: qr.SessionStateChanges,
 	}
 }
 
@@ -102,11 +117,13 @@ func Proto3ToResult(qr *querypb.QueryResult) *Result {
 		return nil
 	}
 	return &Result{
-		Fields:       qr.Fields,
-		RowsAffected: qr.RowsAffected,
-		InsertID:     qr.InsertId,
-		Rows:         proto3ToRows(qr.Fields, qr.Rows),
-		Extras:       qr.Extras,
+		Fields:              qr.Fields,
+		RowsAffected:        qr.RowsAffected,
+		InsertID:            qr.InsertId,
+		InsertIDChanged:     qr.InsertIdChanged,
+		Rows:                proto3ToRows(qr.Fields, qr.Rows),
+		Info:                qr.Info,
+		SessionStateChanges: qr.SessionStateChanges,
 	}
 }
 
@@ -118,36 +135,46 @@ func CustomProto3ToResult(fields []*querypb.Field, qr *querypb.QueryResult) *Res
 		return nil
 	}
 	return &Result{
-		Fields:       qr.Fields,
-		RowsAffected: qr.RowsAffected,
-		InsertID:     qr.InsertId,
-		Rows:         proto3ToRows(fields, qr.Rows),
-		Extras:       qr.Extras,
+		Fields:              qr.Fields,
+		RowsAffected:        qr.RowsAffected,
+		InsertID:            qr.InsertId,
+		InsertIDChanged:     qr.InsertIdChanged,
+		Rows:                proto3ToRows(fields, qr.Rows),
+		Info:                qr.Info,
+		SessionStateChanges: qr.SessionStateChanges,
 	}
 }
 
 // ResultsToProto3 converts []Result to proto3.
-func ResultsToProto3(qr []Result) []*querypb.QueryResult {
+func ResultsToProto3(qr []*Result) []*querypb.QueryResult {
 	if len(qr) == 0 {
 		return nil
 	}
 	result := make([]*querypb.QueryResult, len(qr))
 	for i, q := range qr {
-		result[i] = ResultToProto3(&q)
+		result[i] = ResultToProto3(q)
 	}
 	return result
 }
 
 // Proto3ToResults converts proto3 results to []Result.
-func Proto3ToResults(qr []*querypb.QueryResult) []Result {
+func Proto3ToResults(qr []*querypb.QueryResult) []*Result {
 	if len(qr) == 0 {
 		return nil
 	}
-	result := make([]Result, len(qr))
+	result := make([]*Result, len(qr))
 	for i, q := range qr {
-		result[i] = *Proto3ToResult(q)
+		result[i] = Proto3ToResult(q)
 	}
 	return result
+}
+
+// QueryResponseToProto3 converts QueryResponse to proto3.
+func QueryResponseToProto3(qr QueryResponse) *querypb.ResultWithError {
+	return &querypb.ResultWithError{
+		Result: ResultToProto3(qr.QueryResult),
+		Error:  vterrors.ToVTRPC(qr.QueryError),
+	}
 }
 
 // QueryResponsesToProto3 converts []QueryResponse to proto3.
@@ -157,10 +184,7 @@ func QueryResponsesToProto3(qr []QueryResponse) []*querypb.ResultWithError {
 	}
 	result := make([]*querypb.ResultWithError, len(qr))
 	for i, q := range qr {
-		result[i] = &querypb.ResultWithError{
-			Result: ResultToProto3(q.QueryResult),
-			Error:  vterrors.ToVTRPC(q.QueryError),
-		}
+		result[i] = QueryResponseToProto3(q)
 	}
 	return result
 }
@@ -215,19 +239,6 @@ func Proto3ValuesEqual(v1, v2 []*querypb.Value) bool {
 	}
 	for i, v := range v1 {
 		if !proto.Equal(v, v2[i]) {
-			return false
-		}
-	}
-	return true
-}
-
-// SplitQueryResponsePartsEqual compares two arrays of SplitQueryResponse_Part.
-func SplitQueryResponsePartsEqual(s1, s2 []*vtgatepb.SplitQueryResponse_Part) bool {
-	if len(s1) != len(s2) {
-		return false
-	}
-	for i, s := range s1 {
-		if !proto.Equal(s, s2[i]) {
 			return false
 		}
 	}

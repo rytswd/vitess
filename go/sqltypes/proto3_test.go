@@ -19,7 +19,9 @@ package sqltypes
 import (
 	"testing"
 
-	"github.com/golang/protobuf/proto"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
+
 	querypb "vitess.io/vitess/go/vt/proto/query"
 	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/vterrors"
@@ -37,9 +39,10 @@ func TestResult(t *testing.T) {
 		Type: Float64,
 	}}
 	sqlResult := &Result{
-		Fields:       fields,
-		InsertID:     1,
-		RowsAffected: 2,
+		Fields:          fields,
+		InsertID:        1,
+		InsertIDChanged: true,
+		RowsAffected:    2,
 		Rows: [][]Value{{
 			TestValue(VarChar, "aa"),
 			TestValue(Int64, "1"),
@@ -49,18 +52,12 @@ func TestResult(t *testing.T) {
 			NULL,
 			NULL,
 		}},
-		Extras: &querypb.ResultExtras{
-			EventToken: &querypb.EventToken{
-				Timestamp: 123,
-				Shard:     "shard0",
-				Position:  "position0",
-			},
-		},
 	}
 	p3Result := &querypb.QueryResult{
-		Fields:       fields,
-		InsertId:     1,
-		RowsAffected: 2,
+		Fields:          fields,
+		InsertId:        1,
+		InsertIdChanged: true,
+		RowsAffected:    2,
 		Rows: []*querypb.Row{{
 			Lengths: []int64{2, 1, 1},
 			Values:  []byte("aa12"),
@@ -68,13 +65,6 @@ func TestResult(t *testing.T) {
 			Lengths: []int64{2, -1, -1},
 			Values:  []byte("bb"),
 		}},
-		Extras: &querypb.ResultExtras{
-			EventToken: &querypb.EventToken{
-				Timestamp: 123,
-				Shard:     "shard0",
-				Position:  "position0",
-			},
-		},
 	}
 	p3converted := ResultToProto3(sqlResult)
 	if !proto.Equal(p3converted, p3Result) {
@@ -116,69 +106,45 @@ func TestResults(t *testing.T) {
 		Name: "col13",
 		Type: Float64,
 	}}
-	sqlResults := []Result{{
-		Fields:       fields1,
-		InsertID:     1,
-		RowsAffected: 2,
+	sqlResults := []*Result{{
+		Fields:          fields1,
+		InsertID:        1,
+		InsertIDChanged: true,
+		RowsAffected:    2,
 		Rows: [][]Value{{
 			TestValue(VarChar, "aa"),
 			TestValue(Int64, "1"),
 			TestValue(Float64, "2"),
 		}},
-		Extras: &querypb.ResultExtras{
-			EventToken: &querypb.EventToken{
-				Timestamp: 123,
-				Shard:     "shard0",
-				Position:  "position0",
-			},
-		},
 	}, {
-		Fields:       fields2,
-		InsertID:     3,
-		RowsAffected: 4,
+		Fields:          fields2,
+		InsertID:        3,
+		InsertIDChanged: true,
+		RowsAffected:    4,
 		Rows: [][]Value{{
 			TestValue(VarChar, "bb"),
 			TestValue(Int64, "3"),
 			TestValue(Float64, "4"),
 		}},
-		Extras: &querypb.ResultExtras{
-			EventToken: &querypb.EventToken{
-				Timestamp: 123,
-				Shard:     "shard1",
-				Position:  "position1",
-			},
-		},
 	}}
 	p3Results := []*querypb.QueryResult{{
-		Fields:       fields1,
-		InsertId:     1,
-		RowsAffected: 2,
+		Fields:          fields1,
+		InsertId:        1,
+		InsertIdChanged: true,
+		RowsAffected:    2,
 		Rows: []*querypb.Row{{
 			Lengths: []int64{2, 1, 1},
 			Values:  []byte("aa12"),
 		}},
-		Extras: &querypb.ResultExtras{
-			EventToken: &querypb.EventToken{
-				Timestamp: 123,
-				Shard:     "shard0",
-				Position:  "position0",
-			},
-		},
 	}, {
-		Fields:       fields2,
-		InsertId:     3,
-		RowsAffected: 4,
+		Fields:          fields2,
+		InsertId:        3,
+		InsertIdChanged: true,
+		RowsAffected:    4,
 		Rows: []*querypb.Row{{
 			Lengths: []int64{2, 1, 1},
 			Values:  []byte("bb34"),
 		}},
-		Extras: &querypb.ResultExtras{
-			EventToken: &querypb.EventToken{
-				Timestamp: 123,
-				Shard:     "shard1",
-				Position:  "position1",
-			},
-		},
 	}}
 	p3converted := ResultsToProto3(sqlResults)
 	if !Proto3ResultsEqual(p3converted, p3Results) {
@@ -216,40 +182,28 @@ func TestQueryReponses(t *testing.T) {
 	queryResponses := []QueryResponse{
 		{
 			QueryResult: &Result{
-				Fields:       fields1,
-				InsertID:     1,
-				RowsAffected: 2,
+				Fields:          fields1,
+				InsertID:        1,
+				InsertIDChanged: true,
+				RowsAffected:    2,
 				Rows: [][]Value{{
 					TestValue(VarChar, "aa"),
 					TestValue(Int64, "1"),
 					TestValue(Float64, "2"),
 				}},
-				Extras: &querypb.ResultExtras{
-					EventToken: &querypb.EventToken{
-						Timestamp: 123,
-						Shard:     "shard0",
-						Position:  "position0",
-					},
-				},
 			},
 			QueryError: nil,
 		}, {
 			QueryResult: &Result{
-				Fields:       fields2,
-				InsertID:     3,
-				RowsAffected: 4,
+				Fields:          fields2,
+				InsertID:        3,
+				InsertIDChanged: true,
+				RowsAffected:    4,
 				Rows: [][]Value{{
 					TestValue(VarChar, "bb"),
 					TestValue(Int64, "3"),
 					TestValue(Float64, "4"),
 				}},
-				Extras: &querypb.ResultExtras{
-					EventToken: &querypb.EventToken{
-						Timestamp: 123,
-						Shard:     "shard1",
-						Position:  "position1",
-					},
-				},
 			},
 			QueryError: nil,
 		}, {
@@ -262,44 +216,31 @@ func TestQueryReponses(t *testing.T) {
 		{
 			Error: nil,
 			Result: &querypb.QueryResult{
-				Fields:       fields1,
-				InsertId:     1,
-				RowsAffected: 2,
+				Fields:          fields1,
+				InsertId:        1,
+				InsertIdChanged: true,
+				RowsAffected:    2,
 				Rows: []*querypb.Row{{
 					Lengths: []int64{2, 1, 1},
 					Values:  []byte("aa12"),
 				}},
-				Extras: &querypb.ResultExtras{
-					EventToken: &querypb.EventToken{
-						Timestamp: 123,
-						Shard:     "shard0",
-						Position:  "position0",
-					},
-				},
 			},
 		}, {
 			Error: nil,
 			Result: &querypb.QueryResult{
-				Fields:       fields2,
-				InsertId:     3,
-				RowsAffected: 4,
+				Fields:          fields2,
+				InsertId:        3,
+				InsertIdChanged: true,
+				RowsAffected:    4,
 				Rows: []*querypb.Row{{
 					Lengths: []int64{2, 1, 1},
 					Values:  []byte("bb34"),
 				}},
-				Extras: &querypb.ResultExtras{
-					EventToken: &querypb.EventToken{
-						Timestamp: 123,
-						Shard:     "shard1",
-						Position:  "position1",
-					},
-				},
 			},
 		}, {
 			Error: &vtrpcpb.RPCError{
-				LegacyCode: vtrpcpb.LegacyErrorCode_DEADLINE_EXCEEDED_LEGACY,
-				Message:    "deadline exceeded",
-				Code:       vtrpcpb.Code_DEADLINE_EXCEEDED,
+				Message: "deadline exceeded",
+				Code:    vtrpcpb.Code_DEADLINE_EXCEEDED,
 			},
 			Result: nil,
 		},
@@ -312,5 +253,80 @@ func TestQueryReponses(t *testing.T) {
 	reverse := Proto3ToQueryReponses(p3ResultWithError)
 	if !QueryResponsesEqual(reverse, queryResponses) {
 		t.Errorf("reverse:\n%#v, want\n%#v", reverse, queryResponses)
+	}
+}
+
+func TestProto3ValuesEqual(t *testing.T) {
+	for _, tc := range []struct {
+		v1, v2   []*querypb.Value
+		expected bool
+	}{
+		{
+			v1: []*querypb.Value{
+				{
+					Type:  0,
+					Value: []byte{0, 1},
+				},
+			},
+			v2: []*querypb.Value{
+				{
+					Type:  0,
+					Value: []byte{0, 1},
+				},
+				{
+					Type:  1,
+					Value: []byte{0, 1, 2},
+				},
+			},
+			expected: false,
+		},
+		{
+			v1: []*querypb.Value{
+				{
+					Type:  0,
+					Value: []byte{0, 1},
+				},
+				{
+					Type:  1,
+					Value: []byte{0, 1, 2},
+				},
+			},
+			v2: []*querypb.Value{
+				{
+					Type:  0,
+					Value: []byte{0, 1},
+				},
+				{
+					Type:  1,
+					Value: []byte{0, 1, 2},
+				},
+			},
+			expected: true,
+		},
+		{
+			v1: []*querypb.Value{
+				{
+					Type:  0,
+					Value: []byte{0, 1},
+				},
+				{
+					Type:  1,
+					Value: []byte{0, 1},
+				},
+			},
+			v2: []*querypb.Value{
+				{
+					Type:  0,
+					Value: []byte{0, 1},
+				},
+				{
+					Type:  1,
+					Value: []byte{0, 1, 2},
+				},
+			},
+			expected: false,
+		},
+	} {
+		require.Equal(t, tc.expected, Proto3ValuesEqual(tc.v1, tc.v2))
 	}
 }

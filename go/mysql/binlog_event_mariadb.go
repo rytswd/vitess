@@ -19,6 +19,7 @@ package mysql
 import (
 	"encoding/binary"
 
+	"vitess.io/vitess/go/mysql/replication"
 	"vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/vterrors"
 )
@@ -28,11 +29,22 @@ import (
 // binlogEvent.
 type mariadbBinlogEvent struct {
 	binlogEvent
+	semiSyncAckRequested bool
+}
+
+// NewMariadbBinlogEventWithSemiSyncInfo creates a BinlogEvent instance from given byte array
+func NewMariadbBinlogEventWithSemiSyncInfo(buf []byte, semiSyncAckRequested bool) BinlogEvent {
+	return mariadbBinlogEvent{binlogEvent: binlogEvent(buf), semiSyncAckRequested: semiSyncAckRequested}
 }
 
 // NewMariadbBinlogEvent creates a BinlogEvent instance from given byte array
 func NewMariadbBinlogEvent(buf []byte) BinlogEvent {
 	return mariadbBinlogEvent{binlogEvent: binlogEvent(buf)}
+}
+
+// IsSemiSyncAckRequested implements BinlogEvent.IsSemiSyncAckRequested().
+func (ev mariadbBinlogEvent) IsSemiSyncAckRequested() bool {
+	return ev.semiSyncAckRequested
 }
 
 // IsGTID implements BinlogEvent.IsGTID().
@@ -43,26 +55,28 @@ func (ev mariadbBinlogEvent) IsGTID() bool {
 // GTID implements BinlogEvent.GTID().
 //
 // Expected format:
-//   # bytes   field
-//   8         sequence number
-//   4         domain ID
-//   1         flags2
-func (ev mariadbBinlogEvent) GTID(f BinlogFormat) (GTID, bool, error) {
+//
+//	# bytes   field
+//	8         sequence number
+//	4         domain ID
+//	1         flags2
+func (ev mariadbBinlogEvent) GTID(f BinlogFormat) (replication.GTID, bool, int64, int64, error) {
 	const FLStandalone = 1
 
 	data := ev.Bytes()[f.HeaderLength:]
 	flags2 := data[8+4]
 
-	return MariadbGTID{
+	gtid := replication.MariadbGTID{
 		Sequence: binary.LittleEndian.Uint64(data[:8]),
 		Domain:   binary.LittleEndian.Uint32(data[8 : 8+4]),
 		Server:   ev.ServerID(),
-	}, flags2&FLStandalone == 0, nil
+	}
+	return gtid, flags2&FLStandalone == 0, 0, 0, nil
 }
 
 // PreviousGTIDs implements BinlogEvent.PreviousGTIDs().
-func (ev mariadbBinlogEvent) PreviousGTIDs(f BinlogFormat) (Position, error) {
-	return Position{}, vterrors.Errorf(vtrpc.Code_INTERNAL, "MariaDB should not provide PREVIOUS_GTIDS_EVENT events")
+func (ev mariadbBinlogEvent) PreviousGTIDs(f BinlogFormat) (replication.Position, error) {
+	return replication.Position{}, vterrors.Errorf(vtrpc.Code_INTERNAL, "MariaDB should not provide PREVIOUS_GTIDS_EVENT events")
 }
 
 // StripChecksum implements BinlogEvent.StripChecksum().
@@ -75,8 +89,8 @@ func (ev mariadbBinlogEvent) StripChecksum(f BinlogFormat) (BinlogEvent, []byte,
 		// Checksum is the last 4 bytes of the event buffer.
 		data := ev.Bytes()
 		length := len(data)
-		checksum := data[length-4:]
-		data = data[:length-4]
+		checksum := data[length-BinlogCRC32ChecksumLen:]
+		data = data[:length-BinlogCRC32ChecksumLen]
 		return mariadbBinlogEvent{binlogEvent: binlogEvent(data)}, checksum, nil
 	}
 }

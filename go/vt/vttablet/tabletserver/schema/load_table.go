@@ -17,28 +17,31 @@ limitations under the License.
 package schema
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
+	"vitess.io/vitess/go/mysql/collations"
 	"vitess.io/vitess/go/sqltypes"
-	"vitess.io/vitess/go/vt/log"
-	"vitess.io/vitess/go/vt/sqlparser"
-	"vitess.io/vitess/go/vt/vttablet/tabletserver/connpool"
-	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
-
+	"vitess.io/vitess/go/vt/mysqlctl"
+	"vitess.io/vitess/go/vt/mysqlctl/tmutils"
 	querypb "vitess.io/vitess/go/vt/proto/query"
+	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/vtgate/evalengine"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/connpool"
 )
 
 // LoadTable creates a Table from the schema info in the database.
-func LoadTable(conn *connpool.DBConn, tableName string, tableType string, comment string) (*Table, error) {
-	ta := NewTable(tableName)
-	sqlTableName := sqlparser.String(ta.Name)
-	if err := fetchColumns(ta, conn, sqlTableName); err != nil {
-		return nil, err
+func LoadTable(conn *connpool.PooledConn, databaseName, tableName, tableType string, comment string, collationEnv *collations.Environment) (*Table, error) {
+	ta := NewTable(tableName, NoType)
+	if strings.Contains(tableType, tmutils.TableView) {
+		ta.Type = View
+		return ta, nil
 	}
-	if err := fetchIndexes(ta, conn, sqlTableName); err != nil {
+	sqlTableName := sqlparser.String(ta.Name)
+	if err := fetchColumns(ta, conn, databaseName, sqlTableName); err != nil {
 		return nil, err
 	}
 	switch {
@@ -46,7 +49,7 @@ func LoadTable(conn *connpool.DBConn, tableName string, tableType string, commen
 		ta.Type = Sequence
 		ta.SequenceInfo = &SequenceInfo{}
 	case strings.Contains(comment, "vitess_message"):
-		if err := loadMessageInfo(ta, comment); err != nil {
+		if err := loadMessageInfo(ta, comment, collationEnv); err != nil {
 			return nil, err
 		}
 		ta.Type = Message
@@ -54,120 +57,33 @@ func LoadTable(conn *connpool.DBConn, tableName string, tableType string, commen
 	return ta, nil
 }
 
-// LoadTableBaisc creates a Table with just the column info loaded.
-func LoadTableBasic(conn *connpool.DBConn, tableName string) (*Table, error) {
-	ta := NewTable(tableName)
-	if err := fetchColumns(ta, conn, tableName); err != nil {
-		return nil, err
+func fetchColumns(ta *Table, conn *connpool.PooledConn, databaseName, sqlTableName string) error {
+	ctx := context.Background()
+	exec := func(query string, maxRows int, wantFields bool) (*sqltypes.Result, error) {
+		return conn.Conn.Exec(ctx, query, maxRows, wantFields)
 	}
-	return ta, nil
-}
-
-func fetchColumns(ta *Table, conn *connpool.DBConn, sqlTableName string) error {
-	qr, err := conn.Exec(tabletenv.LocalContext(), fmt.Sprintf("select * from %s where 1 != 1", sqlTableName), 0, true)
+	fields, _, err := mysqlctl.GetColumns(databaseName, sqlTableName, exec)
 	if err != nil {
 		return err
 	}
-	fieldTypes := make(map[string]querypb.Type, len(qr.Fields))
-	// TODO(sougou): Store the full field info in the schema.
-	for _, field := range qr.Fields {
-		fieldTypes[field.Name] = field.Type
-	}
-	columns, err := conn.Exec(tabletenv.LocalContext(), fmt.Sprintf("describe %s", sqlTableName), 10000, false)
-	if err != nil {
-		return err
-	}
-	for _, row := range columns.Rows {
-		name := row[0].ToString()
-		columnType, ok := fieldTypes[name]
-		if !ok {
-			// This code is unreachable.
-			log.Warningf("Table: %s, column %s not found in select list, skipping.", ta.Name, name)
-			continue
-		}
-		// BIT data type default value representation differs from how
-		// it's returned. It's represented as b'101', but returned in
-		// its binary form. Extract the binary form.
-		if columnType == querypb.Type_BIT && row[4].ToString() != "" {
-			query := fmt.Sprintf("select %s", row[4].ToString())
-			r, err := conn.Exec(tabletenv.LocalContext(), query, 10000, false)
-			if err != nil {
-				return err
-			}
-			if len(r.Rows) != 1 || len(r.Rows[0]) != 1 {
-				// This code is unreachable.
-				return fmt.Errorf("invalid rows returned from %s: %v", query, r.Rows)
-			}
-			// overwrite the original value with the new one.
-			row[4] = r.Rows[0][0]
-		}
-		ta.AddColumn(name, columnType, row[4], row[5].ToString())
-	}
+	ta.Fields = fields
 	return nil
 }
 
-func fetchIndexes(ta *Table, conn *connpool.DBConn, sqlTableName string) error {
-	indexes, err := conn.Exec(tabletenv.LocalContext(), fmt.Sprintf("show index from %s", sqlTableName), 10000, false)
-	if err != nil {
-		return err
-	}
-	var currentIndex *Index
-	currentName := ""
-	for _, row := range indexes.Rows {
-		indexName := row[2].ToString()
-		if currentName != indexName {
-			currentIndex = ta.AddIndex(indexName, row[1].ToString() == "0")
-			currentName = indexName
-		}
-		var cardinality uint64
-		if !row[6].IsNull() {
-			cardinality, err = sqltypes.ToUint64(row[6])
-			if err != nil {
-				log.Warningf("%s", err)
-			}
-		}
-		currentIndex.AddColumn(row[4].ToString(), cardinality)
-	}
-	ta.Done()
-	return nil
-}
-
-func loadMessageInfo(ta *Table, comment string) error {
-	findCols := map[string]struct{}{
-		"id":             {},
-		"time_scheduled": {},
-		"time_next":      {},
-		"epoch":          {},
-		"time_created":   {},
-		"time_acked":     {},
-	}
-
-	// orderedColumns are necessary to ensure that they
-	// get added in the correct order to fields if they
-	// need to be returned with the stream.
-	orderedColumns := []string{
-		"id",
-		"time_scheduled",
-		"time_next",
-		"epoch",
-		"time_created",
-		"time_acked",
-	}
-
+func loadMessageInfo(ta *Table, comment string, collationEnv *collations.Environment) error {
 	ta.MessageInfo = &MessageInfo{}
 	// Extract keyvalues.
 	keyvals := make(map[string]string)
-	inputs := strings.Split(comment, ",")
-	for _, input := range inputs {
+	inputs := strings.SplitSeq(comment, ",")
+	for input := range inputs {
 		kv := strings.Split(input, "=")
 		if len(kv) != 2 {
 			continue
 		}
 		keyvals[kv[0]] = kv[1]
 	}
-	var err error
-	ta.MessageInfo.Topic = getTopic(keyvals)
 
+	var err error
 	if ta.MessageInfo.AckWaitDuration, err = getDuration(keyvals, "vt_ack_wait"); err != nil {
 		return err
 	}
@@ -183,47 +99,74 @@ func loadMessageInfo(ta *Table, comment string) error {
 	if ta.MessageInfo.PollInterval, err = getDuration(keyvals, "vt_poller_interval"); err != nil {
 		return err
 	}
-	for _, col := range orderedColumns {
-		num := ta.FindColumn(sqlparser.NewColIdent(col))
+
+	// errors are ignored because these fields are optional and 0 is the default value
+	ta.MessageInfo.MinBackoff, _ = getDuration(keyvals, "vt_min_backoff")
+	// the original default minimum backoff was based on ack wait timeout, so this preserves that
+	if ta.MessageInfo.MinBackoff == 0 {
+		ta.MessageInfo.MinBackoff = ta.MessageInfo.AckWaitDuration
+	}
+
+	ta.MessageInfo.MaxBackoff, _ = getDuration(keyvals, "vt_max_backoff")
+
+	// these columns are required for message manager to function properly, but only
+	// id is required to be streamed to subscribers
+	requiredCols := []string{
+		"id",
+		"priority",
+		"time_next",
+		"epoch",
+		"time_acked",
+	}
+
+	// by default, these columns are loaded for the message manager, but not sent to subscribers
+	// via stream * from msg_tbl
+	hiddenCols := map[string]struct{}{
+		"priority":   {},
+		"time_next":  {},
+		"epoch":      {},
+		"time_acked": {},
+	}
+
+	// make sure required columns exist in the table schema
+	for _, col := range requiredCols {
+		num := ta.FindColumn(sqlparser.NewIdentifierCI(col))
 		if num == -1 {
 			return fmt.Errorf("%s missing from message table: %s", col, ta.Name.String())
 		}
-
-		// id and time_scheduled must be the first two columns.
-		if col == "id" || col == "time_scheduled" {
-			ta.MessageInfo.Fields = append(ta.MessageInfo.Fields, &querypb.Field{
-				Name: ta.Columns[num].Name.String(),
-				Type: ta.Columns[num].Type,
-			})
-		}
 	}
 
-	// Store the position of the id column in the PK
-	// list. This is required to handle arbitrary updates.
-	// In such cases, we have to be able to identify the
-	// affected id and invalidate the message cache.
-	ta.MessageInfo.IDPKIndex = -1
-	for i, j := range ta.PKColumns {
-		if ta.Columns[j].Name.EqualString("id") {
-			ta.MessageInfo.IDPKIndex = i
+	// check to see if the user has specified columns to stream to subscribers
+	specifiedCols := parseMessageCols(keyvals, "vt_message_cols")
+
+	if len(specifiedCols) > 0 {
+		// make sure that all the specified columns exist in the table schema
+		for _, col := range specifiedCols {
+			num := ta.FindColumn(sqlparser.NewIdentifierCI(col))
+			if num == -1 {
+				return fmt.Errorf("%s missing from message table: %s", col, ta.Name.String())
+			}
+		}
+
+		// the original implementation in message_manager assumes id is the first column, as originally users
+		// could not restrict columns. As the PK, id is required, and by requiring it as the first column,
+		// we avoid the need to change the implementation.
+		if specifiedCols[0] != "id" {
+			return fmt.Errorf("vt_message_cols must begin with id: %s", ta.Name.String())
+		}
+		ta.MessageInfo.Fields = getSpecifiedMessageFields(ta.Fields, specifiedCols, collationEnv)
+	} else {
+		ta.MessageInfo.Fields = getDefaultMessageFields(ta.Fields, hiddenCols)
+	}
+
+	ta.MessageInfo.IDType = sqltypes.VarBinary
+	for _, field := range ta.MessageInfo.Fields {
+		if field.Name == "id" {
+			ta.MessageInfo.IDType = field.Type
 			break
 		}
 	}
-	if ta.MessageInfo.IDPKIndex == -1 {
-		return fmt.Errorf("id column is not part of the primary key for message table: %s", ta.Name.String())
-	}
 
-	// Load user-defined columns. Any "unrecognized" column is user-defined.
-	for _, c := range ta.Columns {
-		if _, ok := findCols[c.Name.Lowered()]; ok {
-			continue
-		}
-
-		ta.MessageInfo.Fields = append(ta.MessageInfo.Fields, &querypb.Field{
-			Name: c.Name.String(),
-			Type: c.Type,
-		})
-	}
 	return nil
 }
 
@@ -251,6 +194,42 @@ func getNum(in map[string]string, key string) (int, error) {
 	return v, nil
 }
 
-func getTopic(in map[string]string) string {
-	return in["vt_topic"]
+// parseMessageCols parses the vt_message_cols attribute. It doesn't error out if the attribute is not specified
+// because the default behavior is to stream all columns to subscribers, and if done incorrectly, later checks
+// to see if the columns exist in the table schema will fail.
+func parseMessageCols(in map[string]string, key string) []string {
+	sv := in[key]
+	cols := strings.Split(sv, "|")
+	if len(cols) == 1 && strings.TrimSpace(cols[0]) == "" {
+		return nil
+	}
+	return cols
+}
+
+func getDefaultMessageFields(tableFields []*querypb.Field, hiddenCols map[string]struct{}) []*querypb.Field {
+	fields := make([]*querypb.Field, 0, len(tableFields))
+	// Load user-defined columns. Any "unrecognized" column is user-defined.
+	for _, field := range tableFields {
+		if _, ok := hiddenCols[strings.ToLower(field.Name)]; ok {
+			continue
+		}
+
+		fields = append(fields, field)
+	}
+	return fields
+}
+
+// we have already validated that all the specified columns exist in the table schema, so we don't need to
+// check again and possibly return an error here.
+func getSpecifiedMessageFields(tableFields []*querypb.Field, specifiedCols []string, collationEnv *collations.Environment) []*querypb.Field {
+	fields := make([]*querypb.Field, 0, len(specifiedCols))
+	for _, col := range specifiedCols {
+		for _, field := range tableFields {
+			if res, _ := evalengine.NullsafeCompare(sqltypes.NewVarChar(field.Name), sqltypes.NewVarChar(strings.TrimSpace(col)), collationEnv, collationEnv.DefaultConnectionCharset(), nil); res == 0 {
+				fields = append(fields, field)
+				break
+			}
+		}
+	}
+	return fields
 }

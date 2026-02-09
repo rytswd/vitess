@@ -17,6 +17,7 @@ limitations under the License.
 package throttler
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -27,15 +28,19 @@ import (
 // MaxReplicationLagModule. Internally, the parameters are represented by a
 // protobuf message. This message is also used to update the parameters.
 type MaxReplicationLagModuleConfig struct {
-	throttlerdatapb.Configuration
+	*throttlerdatapb.Configuration
+}
+
+func (cfg MaxReplicationLagModuleConfig) Clone() MaxReplicationLagModuleConfig {
+	return MaxReplicationLagModuleConfig{cfg.CloneVT()}
 }
 
 // Most of the values are based on the assumption that vttablet is started
-// with the flag --health_check_interval=20s.
+// with the flag --health-check-interval=20s.
 const healthCheckInterval = 20
 
 var defaultMaxReplicationLagModuleConfig = MaxReplicationLagModuleConfig{
-	throttlerdatapb.Configuration{
+	&throttlerdatapb.Configuration{
 		TargetReplicationLagSec: 2,
 		MaxReplicationLagSec:    ReplicationLagModuleDisabled,
 
@@ -45,7 +50,7 @@ var defaultMaxReplicationLagModuleConfig = MaxReplicationLagModuleConfig{
 		EmergencyDecrease: 0.5,
 
 		// Wait for two health broadcast rounds. Otherwise, the "decrease" mode
-		// has less than 2 lag records available to calculate the actual slave rate.
+		// has less than 2 lag records available to calculate the actual replication rate.
 		MinDurationBetweenIncreasesSec: 2 * healthCheckInterval,
 		// MaxDurationBetweenIncreasesSec defaults to 60+2 seconds because this
 		// corresponds to 3 broadcasts.
@@ -62,13 +67,13 @@ var defaultMaxReplicationLagModuleConfig = MaxReplicationLagModuleConfig{
 
 // DefaultMaxReplicationLagModuleConfig returns a copy of the default config object.
 func DefaultMaxReplicationLagModuleConfig() MaxReplicationLagModuleConfig {
-	return defaultMaxReplicationLagModuleConfig
+	return defaultMaxReplicationLagModuleConfig.Clone()
 }
 
 // NewMaxReplicationLagModuleConfig returns a default configuration where
 // only "maxReplicationLag" is set.
 func NewMaxReplicationLagModuleConfig(maxReplicationLag int64) MaxReplicationLagModuleConfig {
-	config := defaultMaxReplicationLagModuleConfig
+	config := defaultMaxReplicationLagModuleConfig.Clone()
 	config.MaxReplicationLagSec = maxReplicationLag
 	return config
 }
@@ -77,82 +82,82 @@ func NewMaxReplicationLagModuleConfig(maxReplicationLag int64) MaxReplicationLag
 // in protobuf.
 
 // Verify returns an error if the config is invalid.
-func (c MaxReplicationLagModuleConfig) Verify() error {
-	if c.TargetReplicationLagSec < 1 {
-		return fmt.Errorf("target_replication_lag_sec must be >= 1")
+func (cfg MaxReplicationLagModuleConfig) Verify() error {
+	if cfg.TargetReplicationLagSec < 1 {
+		return errors.New("target_replication_lag_sec must be >= 1")
 	}
-	if c.MaxReplicationLagSec < 2 {
-		return fmt.Errorf("max_replication_lag_sec must be >= 2")
+	if cfg.MaxReplicationLagSec < 2 {
+		return errors.New("max_replication_lag_sec must be >= 2")
 	}
-	if c.TargetReplicationLagSec > c.MaxReplicationLagSec {
+	if cfg.TargetReplicationLagSec > cfg.MaxReplicationLagSec {
 		return fmt.Errorf("target_replication_lag_sec must not be higher than max_replication_lag_sec: invalid: %v > %v",
-			c.TargetReplicationLagSec, c.MaxReplicationLagSec)
+			cfg.TargetReplicationLagSec, cfg.MaxReplicationLagSec)
 	}
-	if c.InitialRate < 1 {
-		return fmt.Errorf("initial_rate must be >= 1")
+	if cfg.InitialRate < 1 {
+		return errors.New("initial_rate must be >= 1")
 	}
-	if c.MaxIncrease <= 0 {
-		return fmt.Errorf("max_increase must be > 0")
+	if cfg.MaxIncrease <= 0 {
+		return errors.New("max_increase must be > 0")
 	}
-	if c.EmergencyDecrease <= 0 {
-		return fmt.Errorf("emergency_decrease must be > 0")
+	if cfg.EmergencyDecrease <= 0 {
+		return errors.New("emergency_decrease must be > 0")
 	}
-	if c.MinDurationBetweenIncreasesSec < 1 {
-		return fmt.Errorf("min_duration_between_increases_sec must be >= 1")
+	if cfg.MinDurationBetweenIncreasesSec < 1 {
+		return errors.New("min_duration_between_increases_sec must be >= 1")
 	}
-	if c.MaxDurationBetweenIncreasesSec < 1 {
-		return fmt.Errorf("max_duration_between_increases_sec must be >= 1")
+	if cfg.MaxDurationBetweenIncreasesSec < 1 {
+		return errors.New("max_duration_between_increases_sec must be >= 1")
 	}
-	if c.MinDurationBetweenDecreasesSec < 1 {
-		return fmt.Errorf("min_duration_between_decreases_sec must be >= 1")
+	if cfg.MinDurationBetweenDecreasesSec < 1 {
+		return errors.New("min_duration_between_decreases_sec must be >= 1")
 	}
-	if c.SpreadBacklogAcrossSec < 1 {
-		return fmt.Errorf("spread_backlog_across_sec must be >= 1")
+	if cfg.SpreadBacklogAcrossSec < 1 {
+		return errors.New("spread_backlog_across_sec must be >= 1")
 	}
-	if c.IgnoreNSlowestReplicas < 0 {
-		return fmt.Errorf("ignore_n_slowest_replicas must be >= 0")
+	if cfg.IgnoreNSlowestReplicas < 0 {
+		return errors.New("ignore_n_slowest_replicas must be >= 0")
 	}
-	if c.IgnoreNSlowestRdonlys < 0 {
-		return fmt.Errorf("ignore_n_slowest_rdonlys must be >= 0")
+	if cfg.IgnoreNSlowestRdonlys < 0 {
+		return errors.New("ignore_n_slowest_rdonlys must be >= 0")
 	}
-	if c.AgeBadRateAfterSec < 1 {
-		return fmt.Errorf("age_bad_rate_after_sec must be >= 1")
+	if cfg.AgeBadRateAfterSec < 1 {
+		return errors.New("age_bad_rate_after_sec must be >= 1")
 	}
-	if c.MaxRateApproachThreshold < 0 {
-		return fmt.Errorf("max_rate_approach_threshold must be >=0")
+	if cfg.MaxRateApproachThreshold < 0 {
+		return errors.New("max_rate_approach_threshold must be >=0")
 	}
-	if c.MaxRateApproachThreshold > 1 {
-		return fmt.Errorf("max_rate_approach_threshold must be <=1")
+	if cfg.MaxRateApproachThreshold > 1 {
+		return errors.New("max_rate_approach_threshold must be <=1")
 	}
 	return nil
 }
 
 // MinDurationBetweenIncreases is a helper function which returns the respective
 // protobuf field as native Go type.
-func (c MaxReplicationLagModuleConfig) MinDurationBetweenIncreases() time.Duration {
-	return time.Duration(c.MinDurationBetweenIncreasesSec) * time.Second
+func (cfg MaxReplicationLagModuleConfig) MinDurationBetweenIncreases() time.Duration {
+	return time.Duration(cfg.MinDurationBetweenIncreasesSec) * time.Second
 }
 
 // MaxDurationBetweenIncreases is a helper function which returns the respective
 // protobuf field as native Go type.
-func (c MaxReplicationLagModuleConfig) MaxDurationBetweenIncreases() time.Duration {
-	return time.Duration(c.MaxDurationBetweenIncreasesSec) * time.Second
+func (cfg MaxReplicationLagModuleConfig) MaxDurationBetweenIncreases() time.Duration {
+	return time.Duration(cfg.MaxDurationBetweenIncreasesSec) * time.Second
 }
 
 // MinDurationBetweenDecreases is a helper function which returns the respective
 // protobuf field as native Go type.
-func (c MaxReplicationLagModuleConfig) MinDurationBetweenDecreases() time.Duration {
-	return time.Duration(c.MinDurationBetweenDecreasesSec) * time.Second
+func (cfg MaxReplicationLagModuleConfig) MinDurationBetweenDecreases() time.Duration {
+	return time.Duration(cfg.MinDurationBetweenDecreasesSec) * time.Second
 }
 
 // SpreadBacklogAcross is a helper function which returns the respective
 // protobuf field as native Go type.
-func (c MaxReplicationLagModuleConfig) SpreadBacklogAcross() time.Duration {
-	return time.Duration(c.SpreadBacklogAcrossSec) * time.Second
+func (cfg MaxReplicationLagModuleConfig) SpreadBacklogAcross() time.Duration {
+	return time.Duration(cfg.SpreadBacklogAcrossSec) * time.Second
 }
 
 // AgeBadRateAfter is a helper function which returns the respective
 // protobuf field as native Go type.
-func (c MaxReplicationLagModuleConfig) AgeBadRateAfter() time.Duration {
-	return time.Duration(c.AgeBadRateAfterSec) * time.Second
+func (cfg MaxReplicationLagModuleConfig) AgeBadRateAfter() time.Duration {
+	return time.Duration(cfg.AgeBadRateAfterSec) * time.Second
 }

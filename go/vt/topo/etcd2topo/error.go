@@ -17,10 +17,10 @@ limitations under the License.
 package etcd2topo
 
 import (
+	"context"
 	"errors"
 
-	"github.com/coreos/etcd/etcdserver/api/v3rpc/rpctypes"
-	"golang.org/x/net/context"
+	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -44,7 +44,8 @@ func convertError(err error, nodePath string) error {
 		return nil
 	}
 
-	if typeErr, ok := err.(rpctypes.EtcdError); ok {
+	var typeErr rpctypes.EtcdError
+	if errors.As(err, &typeErr) {
 		switch typeErr.Code() {
 		case codes.NotFound:
 			return topo.NewError(topo.NoNode, nodePath)
@@ -57,9 +58,11 @@ func convertError(err error, nodePath string) error {
 			// seem to be using the codes.Unavailable
 			// category. So changing all of them to ErrTimeout.
 			// The other reasons for codes.Unavailable are when
-			// etcd master election is failing, so timeout
+			// etcd primary election is failing, so timeout
 			// also sounds reasonable there.
 			return topo.NewError(topo.Timeout, nodePath)
+		case codes.ResourceExhausted:
+			return topo.NewError(topo.ResourceExhausted, nodePath)
 		}
 		return err
 	}
@@ -73,15 +76,17 @@ func convertError(err error, nodePath string) error {
 			return topo.NewError(topo.Interrupted, nodePath)
 		case codes.DeadlineExceeded:
 			return topo.NewError(topo.Timeout, nodePath)
+		case codes.ResourceExhausted:
+			return topo.NewError(topo.ResourceExhausted, nodePath)
 		default:
 			return err
 		}
 	}
 
-	switch err {
-	case context.Canceled:
+	switch {
+	case errors.Is(err, context.Canceled):
 		return topo.NewError(topo.Interrupted, nodePath)
-	case context.DeadlineExceeded:
+	case errors.Is(err, context.DeadlineExceeded):
 		return topo.NewError(topo.Timeout, nodePath)
 	default:
 		return err

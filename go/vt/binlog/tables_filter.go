@@ -17,6 +17,7 @@ limitations under the License.
 package binlog
 
 import (
+	"slices"
 	"strings"
 
 	"vitess.io/vitess/go/vt/log"
@@ -30,11 +31,11 @@ const (
 	space         = " "
 )
 
-// TablesFilterFunc returns a function that calls callback only if statements
+// tablesFilterFunc returns a function that calls callback only if statements
 // in the transaction match the specified tables. The resulting function can be
 // passed into the Streamer: bls.Stream(file, pos, sendTransaction) ->
-// bls.Stream(file, pos, TablesFilterFunc(sendTransaction))
-func TablesFilterFunc(tables []string, callback func(*binlogdatapb.BinlogTransaction) error) sendTransactionFunc {
+// bls.Stream(file, pos, tablesFilterFunc(sendTransaction))
+func tablesFilterFunc(tables []string, callback func(*binlogdatapb.BinlogTransaction) error) sendTransactionFunc {
 	return func(eventToken *querypb.EventToken, statements []FullBinlogStatement) error {
 		matched := false
 		filtered := make([]*binlogdatapb.BinlogTransaction_Statement, 0, len(statements))
@@ -69,12 +70,9 @@ func TablesFilterFunc(tables []string, callback func(*binlogdatapb.BinlogTransac
 					}
 					tableName = sql[tableStart : tableStart+tableEnd]
 				}
-				for _, t := range tables {
-					if t == tableName {
-						filtered = append(filtered, statement.Statement)
-						matched = true
-						break
-					}
+				if slices.Contains(tables, tableName) {
+					filtered = append(filtered, statement.Statement)
+					matched = true
 				}
 			case binlogdatapb.BinlogTransaction_Statement_BL_UNRECOGNIZED:
 				updateStreamErrors.Add("TablesStream", 1)

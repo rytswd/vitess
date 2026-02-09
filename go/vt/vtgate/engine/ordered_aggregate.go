@@ -17,14 +17,15 @@ limitations under the License.
 package engine
 
 import (
+	"context"
 	"fmt"
+	"strconv"
 
-	"vitess.io/vitess/go/vt/proto/vtrpc"
-	"vitess.io/vitess/go/vt/vterrors"
-
+	"vitess.io/vitess/go/mysql/collations"
 	"vitess.io/vitess/go/sqltypes"
-
 	querypb "vitess.io/vitess/go/vt/proto/query"
+	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/vtgate/evalengine"
 )
 
 var _ Primitive = (*OrderedAggregate)(nil)
@@ -35,357 +36,351 @@ var _ Primitive = (*OrderedAggregate)(nil)
 // is that the underlying primitive is a scatter select with pre-sorted
 // rows.
 type OrderedAggregate struct {
-	// HasDistinct is true if one of the aggregates is distinct.
-	HasDistinct bool `json:",omitempty"`
 	// Aggregates specifies the aggregation parameters for each
 	// aggregation function: function opcode and input column number.
-	Aggregates []AggregateParams
+	Aggregates []*AggregateParams
 
-	// Keys specifies the input values that must be used for
+	// GroupByKeys specifies the input values that must be used for
 	// the aggregation key.
-	Keys []int
+	GroupByKeys []*GroupByParams
 
 	// TruncateColumnCount specifies the number of columns to return
 	// in the final result. Rest of the columns are truncated
 	// from the result received. If 0, no truncation happens.
-	TruncateColumnCount int `json:",omitempty"`
+	TruncateColumnCount int
 
 	// Input is the primitive that will feed into this Primitive.
 	Input Primitive
 }
 
-// AggregateParams specify the parameters for each aggregation.
-// It contains the opcode and input column number.
-type AggregateParams struct {
-	Opcode AggregateOpcode
-	Col    int
-	// Alias is set only for distinct opcodes.
-	Alias string `json:",omitempty"`
+// GroupByParams specify the grouping key to be used.
+type GroupByParams struct {
+	KeyCol          int
+	WeightStringCol int
+	Expr            sqlparser.Expr
+	FromGroupBy     bool
+	Type            evalengine.Type
+	CollationEnv    *collations.Environment
 }
 
-func (ap AggregateParams) isDistinct() bool {
-	return ap.Opcode == AggregateCountDistinct || ap.Opcode == AggregateSumDistinct
-}
-
-// AggregateOpcode is the aggregation Opcode.
-type AggregateOpcode int
-
-// These constants list the possible aggregate opcodes.
-const (
-	AggregateCount = AggregateOpcode(iota)
-	AggregateSum
-	AggregateMin
-	AggregateMax
-	AggregateCountDistinct
-	AggregateSumDistinct
-)
-
-var (
-	opcodeType = map[AggregateOpcode]querypb.Type{
-		AggregateCountDistinct: sqltypes.Int64,
-		AggregateSumDistinct:   sqltypes.Decimal,
+// String returns a string. Used for plan descriptions
+func (gbp GroupByParams) String() string {
+	var out string
+	if gbp.WeightStringCol == -1 || gbp.KeyCol == gbp.WeightStringCol {
+		out = strconv.Itoa(gbp.KeyCol)
+	} else {
+		out = fmt.Sprintf("(%d|%d)", gbp.KeyCol, gbp.WeightStringCol)
 	}
-	// Some predefined values
-	countZero = sqltypes.MakeTrusted(sqltypes.Int64, []byte("0"))
-	countOne  = sqltypes.MakeTrusted(sqltypes.Int64, []byte("1"))
-	sumZero   = sqltypes.MakeTrusted(sqltypes.Decimal, []byte("0"))
-)
 
-// SupportedAggregates maps the list of supported aggregate
-// functions to their opcodes.
-var SupportedAggregates = map[string]AggregateOpcode{
-	"count": AggregateCount,
-	"sum":   AggregateSum,
-	"min":   AggregateMin,
-	"max":   AggregateMax,
-	// These functions don't exist in mysql, but are used
-	// to display the plan.
-	"count_distinct": AggregateCountDistinct,
-	"sum_distinct":   AggregateSumDistinct,
-}
-
-func (code AggregateOpcode) String() string {
-	for k, v := range SupportedAggregates {
-		if v == code {
-			return k
-		}
+	if sqltypes.IsText(gbp.Type.Type()) && gbp.Type.Collation() != collations.Unknown {
+		out += " COLLATE " + gbp.CollationEnv.LookupName(gbp.Type.Collation())
 	}
-	panic("unreachable")
+
+	return out
 }
 
-// MarshalJSON serializes the AggregateOpcode as a JSON string.
-// It's used for testing and diagnostics.
-func (code AggregateOpcode) MarshalJSON() ([]byte, error) {
-	return ([]byte)(fmt.Sprintf("\"%s\"", code.String())), nil
-}
-
-// RouteType returns a description of the query routing type used by the primitive
-func (oa *OrderedAggregate) RouteType() string {
-	return oa.Input.RouteType()
-}
-
-// GetKeyspaceName specifies the Keyspace that this primitive routes to.
-func (oa *OrderedAggregate) GetKeyspaceName() string {
-	return oa.Input.GetKeyspaceName()
-}
-
-// GetTableName specifies the table that this primitive routes to.
-func (oa *OrderedAggregate) GetTableName() string {
-	return oa.Input.GetTableName()
-}
-
-// SetTruncateColumnCount sets the truncate column count.
-func (oa *OrderedAggregate) SetTruncateColumnCount(count int) {
-	oa.TruncateColumnCount = count
-}
-
-// Execute is a Primitive function.
-func (oa *OrderedAggregate) Execute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error) {
-	qr, err := oa.execute(vcursor, bindVars, wantfields)
+// TryExecute is a Primitive function.
+func (oa *OrderedAggregate) TryExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, _ bool) (*sqltypes.Result, error) {
+	qr, err := oa.execute(ctx, vcursor, bindVars)
 	if err != nil {
 		return nil, err
 	}
 	return qr.Truncate(oa.TruncateColumnCount), nil
 }
 
-func (oa *OrderedAggregate) execute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error) {
-	result, err := oa.Input.Execute(vcursor, bindVars, wantfields)
-	if err != nil {
-		return nil, err
+// executeGroupBy is used when the plan contains grouping but not aggregations
+func (oa *OrderedAggregate) executeGroupBy(result *sqltypes.Result) (*sqltypes.Result, error) {
+	if len(result.Rows) < 1 {
+		return result, nil
 	}
+
 	out := &sqltypes.Result{
-		Fields: oa.convertFields(result.Fields),
-		Rows:   make([][]sqltypes.Value, 0, len(result.Rows)),
-		Extras: result.Extras,
+		Fields: result.Fields,
+		Rows:   result.Rows[:0],
 	}
-	// This code is similar to the one in StreamExecute.
-	var current []sqltypes.Value
-	var curDistinct sqltypes.Value
+
+	var currentKey []sqltypes.Value
+	var lastRow sqltypes.Row
+	var err error
 	for _, row := range result.Rows {
-		if current == nil {
-			current, curDistinct = oa.convertRow(row)
-			continue
-		}
+		var nextGroup bool
 
-		equal, err := oa.keysEqual(current, row)
+		currentKey, nextGroup, err = oa.nextGroupBy(currentKey, row)
 		if err != nil {
 			return nil, err
 		}
-
-		if equal {
-			current, curDistinct, err = oa.merge(result.Fields, current, row, curDistinct)
-			if err != nil {
-				return nil, err
-			}
-			continue
+		if nextGroup {
+			out.Rows = append(out.Rows, lastRow)
 		}
-		out.Rows = append(out.Rows, current)
-		current, curDistinct = oa.convertRow(row)
+		lastRow = row
 	}
-
-	if len(result.Rows) == 0 && len(oa.Keys) == 0 {
-		// When doing aggregation without grouping keys, we need to produce a single row containing zero-value for the
-		// different aggregation functions
-		row, err := oa.createEmptyRow()
-		if err != nil {
-			return nil, err
-		}
-		out.Rows = append(out.Rows, row)
-	}
-
-	if current != nil {
-		out.Rows = append(out.Rows, current)
-	}
-	out.RowsAffected = uint64(len(out.Rows))
+	out.Rows = append(out.Rows, lastRow)
 	return out, nil
 }
 
-// StreamExecute is a Primitive function.
-func (oa *OrderedAggregate) StreamExecute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
-	var current []sqltypes.Value
-	var curDistinct sqltypes.Value
-	var fields []*querypb.Field
+func (oa *OrderedAggregate) execute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
+	result, err := vcursor.ExecutePrimitive(
+		ctx,
+		oa.Input,
+		bindVars,
+		true, /*wantFields - we need the input fields types to correctly calculate the output types*/
+	)
+	env := evalengine.NewExpressionEnv(ctx, bindVars, vcursor)
+	if err != nil {
+		return nil, err
+	}
+	if len(oa.Aggregates) == 0 {
+		return oa.executeGroupBy(result)
+	}
 
+	agg, fields, err := newAggregation(result.Fields, oa.Aggregates, env, vcursor.ConnCollation())
+	if err != nil {
+		return nil, err
+	}
+
+	out := &sqltypes.Result{
+		Fields: fields,
+		Rows:   make([][]sqltypes.Value, 0, len(result.Rows)),
+	}
+
+	var currentKey []sqltypes.Value
+	for _, row := range result.Rows {
+		var nextGroup bool
+
+		currentKey, nextGroup, err = oa.nextGroupBy(currentKey, row)
+		if err != nil {
+			return nil, err
+		}
+
+		if nextGroup {
+			values, err := agg.finish()
+			if err != nil {
+				return nil, err
+			}
+			out.Rows = append(out.Rows, values)
+			agg.reset()
+		}
+
+		if err := agg.add(row); err != nil {
+			return nil, err
+		}
+	}
+
+	if currentKey != nil {
+		values, err := agg.finish()
+		if err != nil {
+			return nil, err
+		}
+		out.Rows = append(out.Rows, values)
+	}
+
+	return out, nil
+}
+
+func (oa *OrderedAggregate) executeStreamGroupBy(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, callback func(*sqltypes.Result) error) error {
 	cb := func(qr *sqltypes.Result) error {
 		return callback(qr.Truncate(oa.TruncateColumnCount))
 	}
 
-	err := oa.Input.StreamExecute(vcursor, bindVars, wantfields, func(qr *sqltypes.Result) error {
-		if len(qr.Fields) != 0 {
-			fields = oa.convertFields(qr.Fields)
-			if err := cb(&sqltypes.Result{Fields: fields}); err != nil {
+	var fields []*querypb.Field
+	var currentKey []sqltypes.Value
+	var lastRow sqltypes.Row
+
+	visitor := func(qr *sqltypes.Result) error {
+		var err error
+		if fields == nil && len(qr.Fields) > 0 {
+			fields = qr.Fields
+			if err = cb(&sqltypes.Result{Fields: fields}); err != nil {
 				return err
 			}
 		}
-		// This code is similar to the one in Execute.
 		for _, row := range qr.Rows {
-			if current == nil {
-				current, curDistinct = oa.convertRow(row)
-				continue
-			}
+			var nextGroup bool
 
-			equal, err := oa.keysEqual(current, row)
+			currentKey, nextGroup, err = oa.nextGroupBy(currentKey, row)
 			if err != nil {
 				return err
 			}
 
-			if equal {
-				current, curDistinct, err = oa.merge(fields, current, row, curDistinct)
-				if err != nil {
+			if nextGroup {
+				// this is a new grouping. let's yield the old one, and start a new
+				if err := cb(&sqltypes.Result{Rows: []sqltypes.Row{lastRow}}); err != nil {
 					return err
 				}
-				continue
 			}
-			if err := cb(&sqltypes.Result{Rows: [][]sqltypes.Value{current}}); err != nil {
-				return err
-			}
-			current, curDistinct = oa.convertRow(row)
+
+			lastRow = row
 		}
 		return nil
-	})
+	}
+
+	/* we need the input fields types to correctly calculate the output types */
+	err := vcursor.StreamExecutePrimitive(ctx, oa.Input, bindVars, true, visitor)
 	if err != nil {
 		return err
 	}
 
-	if current != nil {
-		if err := cb(&sqltypes.Result{Rows: [][]sqltypes.Value{current}}); err != nil {
+	if lastRow != nil {
+		if err := cb(&sqltypes.Result{Rows: [][]sqltypes.Value{lastRow}}); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (oa *OrderedAggregate) convertFields(fields []*querypb.Field) []*querypb.Field {
-	if !oa.HasDistinct {
-		return fields
+// TryStreamExecute is a Primitive function.
+func (oa *OrderedAggregate) TryStreamExecute(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable, _ bool, callback func(*sqltypes.Result) error) error {
+	if len(oa.Aggregates) == 0 {
+		return oa.executeStreamGroupBy(ctx, vcursor, bindVars, callback)
+	}
+	env := evalengine.NewExpressionEnv(ctx, bindVars, vcursor)
+
+	cb := func(qr *sqltypes.Result) error {
+		return callback(qr.Truncate(oa.TruncateColumnCount))
 	}
 
-	for _, aggr := range oa.Aggregates {
-		if !aggr.isDistinct() {
-			continue
-		}
-		fields[aggr.Col] = &querypb.Field{
-			Name: aggr.Alias,
-			Type: opcodeType[aggr.Opcode],
-		}
-	}
-	return fields
-}
+	var agg *aggregationState
+	var fields []*querypb.Field
+	var currentKey []sqltypes.Value
 
-func (oa *OrderedAggregate) convertRow(row []sqltypes.Value) (newRow []sqltypes.Value, curDistinct sqltypes.Value) {
-	if !oa.HasDistinct {
-		return row, sqltypes.NULL
-	}
-	newRow = append(newRow, row...)
-	for _, aggr := range oa.Aggregates {
-		switch aggr.Opcode {
-		case AggregateCountDistinct:
-			curDistinct = row[aggr.Col]
-			// Type is int64. Ok to call MakeTrusted.
-			if row[aggr.Col].IsNull() {
-				newRow[aggr.Col] = countZero
-			} else {
-				newRow[aggr.Col] = countOne
-			}
-		case AggregateSumDistinct:
-			curDistinct = row[aggr.Col]
-			var err error
-			newRow[aggr.Col], err = sqltypes.Cast(row[aggr.Col], opcodeType[aggr.Opcode])
+	visitor := func(qr *sqltypes.Result) error {
+		var err error
+
+		if agg == nil && len(qr.Fields) != 0 {
+			agg, fields, err = newAggregation(qr.Fields, oa.Aggregates, env, vcursor.ConnCollation())
 			if err != nil {
-				newRow[aggr.Col] = sumZero
+				return err
+			}
+			if err = cb(&sqltypes.Result{Fields: fields}); err != nil {
+				return err
 			}
 		}
+
+		// This code is similar to the one in Execute.
+		for _, row := range qr.Rows {
+			var nextGroup bool
+
+			currentKey, nextGroup, err = oa.nextGroupBy(currentKey, row)
+			if err != nil {
+				return err
+			}
+
+			if nextGroup {
+				// this is a new grouping. let's yield the old one, and start a new
+				values, err := agg.finish()
+				if err != nil {
+					return err
+				}
+				if err := cb(&sqltypes.Result{Rows: [][]sqltypes.Value{values}}); err != nil {
+					return err
+				}
+
+				agg.reset()
+			}
+
+			if err := agg.add(row); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
-	return newRow, curDistinct
+
+	/* we need the input fields types to correctly calculate the output types */
+	err := vcursor.StreamExecutePrimitive(ctx, oa.Input, bindVars, true, visitor)
+	if err != nil {
+		return err
+	}
+
+	if currentKey != nil {
+		values, err := agg.finish()
+		if err != nil {
+			return err
+		}
+		if err := cb(&sqltypes.Result{Rows: [][]sqltypes.Value{values}}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // GetFields is a Primitive function.
-func (oa *OrderedAggregate) GetFields(vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
-	qr, err := oa.Input.GetFields(vcursor, bindVars)
+func (oa *OrderedAggregate) GetFields(ctx context.Context, vcursor VCursor, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
+	qr, err := oa.Input.GetFields(ctx, vcursor, bindVars)
 	if err != nil {
 		return nil, err
 	}
-	qr = &sqltypes.Result{Fields: oa.convertFields(qr.Fields)}
+	env := evalengine.NewExpressionEnv(ctx, bindVars, vcursor)
+	_, fields, err := newAggregation(qr.Fields, oa.Aggregates, env, vcursor.ConnCollation())
+	if err != nil {
+		return nil, err
+	}
+
+	qr = &sqltypes.Result{Fields: fields}
 	return qr.Truncate(oa.TruncateColumnCount), nil
 }
 
-func (oa *OrderedAggregate) keysEqual(row1, row2 []sqltypes.Value) (bool, error) {
-	for _, key := range oa.Keys {
-		cmp, err := sqltypes.NullsafeCompare(row1[key], row2[key])
+// Inputs returns the Primitive input for this aggregation
+func (oa *OrderedAggregate) Inputs() ([]Primitive, []map[string]any) {
+	return []Primitive{oa.Input}, nil
+}
+
+// NeedsTransaction implements the Primitive interface
+func (oa *OrderedAggregate) NeedsTransaction() bool {
+	return oa.Input.NeedsTransaction()
+}
+
+func (oa *OrderedAggregate) nextGroupBy(currentKey, nextRow []sqltypes.Value) (nextKey []sqltypes.Value, nextGroup bool, err error) {
+	if currentKey == nil {
+		return nextRow, false, nil
+	}
+
+	for _, gb := range oa.GroupByKeys {
+		v1 := currentKey[gb.KeyCol]
+		v2 := nextRow[gb.KeyCol]
+		if v1.TinyWeightCmp(v2) != 0 {
+			return nextRow, true, nil
+		}
+
+		cmp, err := evalengine.NullsafeCompare(v1, v2, gb.CollationEnv, gb.Type.Collation(), gb.Type.Values())
 		if err != nil {
-			return false, err
+			_, isCollationErr := err.(evalengine.UnsupportedCollationError)
+			if !isCollationErr || gb.WeightStringCol == -1 {
+				return nil, false, err
+			}
+			gb.KeyCol = gb.WeightStringCol
+			cmp, err = evalengine.NullsafeCompare(currentKey[gb.WeightStringCol], nextRow[gb.WeightStringCol], gb.CollationEnv, gb.Type.Collation(), gb.Type.Values())
+			if err != nil {
+				return nil, false, err
+			}
 		}
 		if cmp != 0 {
-			return false, nil
+			return nextRow, true, nil
 		}
 	}
-	return true, nil
+	return currentKey, false, nil
 }
 
-func (oa *OrderedAggregate) merge(fields []*querypb.Field, row1, row2 []sqltypes.Value, curDistinct sqltypes.Value) ([]sqltypes.Value, sqltypes.Value, error) {
-	result := sqltypes.CopyRow(row1)
-	for _, aggr := range oa.Aggregates {
-		if aggr.isDistinct() {
-			if row2[aggr.Col].IsNull() {
-				continue
-			}
-			cmp, err := sqltypes.NullsafeCompare(curDistinct, row2[aggr.Col])
-			if err != nil {
-				return nil, sqltypes.NULL, err
-			}
-			if cmp == 0 {
-				continue
-			}
-			curDistinct = row2[aggr.Col]
-		}
-		var err error
-		switch aggr.Opcode {
-		case AggregateCount, AggregateSum:
-			result[aggr.Col] = sqltypes.NullsafeAdd(row1[aggr.Col], row2[aggr.Col], fields[aggr.Col].Type)
-		case AggregateMin:
-			result[aggr.Col], err = sqltypes.Min(row1[aggr.Col], row2[aggr.Col])
-		case AggregateMax:
-			result[aggr.Col], err = sqltypes.Max(row1[aggr.Col], row2[aggr.Col])
-		case AggregateCountDistinct:
-			result[aggr.Col] = sqltypes.NullsafeAdd(row1[aggr.Col], countOne, opcodeType[aggr.Opcode])
-		case AggregateSumDistinct:
-			result[aggr.Col] = sqltypes.NullsafeAdd(row1[aggr.Col], row2[aggr.Col], opcodeType[aggr.Opcode])
-		default:
-			return nil, sqltypes.NULL, fmt.Errorf("BUG: Unexpected opcode: %v", aggr.Opcode)
-		}
-		if err != nil {
-			return nil, sqltypes.NULL, err
-		}
-	}
-	return result, curDistinct, nil
+func aggregateParamsToString(in any) string {
+	return in.(*AggregateParams).String()
 }
 
-// creates the empty row for the case when we are missing grouping keys and have empty input table
-func (oa *OrderedAggregate) createEmptyRow() ([]sqltypes.Value, error) {
-	out := make([]sqltypes.Value, len(oa.Aggregates))
-	for i, aggr := range oa.Aggregates {
-		value, err := createEmptyValueFor(aggr.Opcode)
-		if err != nil {
-			return nil, err
-		}
-		out[i] = value
-	}
-	return out, nil
+func groupByParamsToString(i any) string {
+	return i.(*GroupByParams).String()
 }
 
-func createEmptyValueFor(opcode AggregateOpcode) (sqltypes.Value, error) {
-	switch opcode {
-	case
-		AggregateCountDistinct,
-		AggregateCount:
-		return countZero, nil
-	case
-		AggregateSumDistinct,
-		AggregateSum,
-		AggregateMin,
-		AggregateMax:
-		return sqltypes.NULL, nil
-
+func (oa *OrderedAggregate) description() PrimitiveDescription {
+	aggregates := GenericJoin(oa.Aggregates, aggregateParamsToString)
+	groupBy := GenericJoin(oa.GroupByKeys, groupByParamsToString)
+	other := map[string]any{
+		"Aggregates": aggregates,
+		"GroupBy":    groupBy,
 	}
-	return sqltypes.NULL, vterrors.Errorf(vtrpc.Code_INVALID_ARGUMENT, "unknown aggregation %v", opcode)
+	if oa.TruncateColumnCount > 0 {
+		other["ResultColumns"] = oa.TruncateColumnCount
+	}
+	return PrimitiveDescription{
+		OperatorType: "Aggregate",
+		Variant:      "Ordered",
+		Other:        other,
+	}
 }

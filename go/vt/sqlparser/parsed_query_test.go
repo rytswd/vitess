@@ -20,13 +20,16 @@ import (
 	"reflect"
 	"testing"
 
-	"vitess.io/vitess/go/sqltypes"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
+	"vitess.io/vitess/go/sqltypes"
 	querypb "vitess.io/vitess/go/vt/proto/query"
 )
 
 func TestNewParsedQuery(t *testing.T) {
-	stmt, err := Parse("select * from a where id =:id")
+	parser := NewTestParser()
+	stmt, err := parser.Parse("select * from a where id =:id")
 	if err != nil {
 		t.Error(err)
 		return
@@ -34,7 +37,7 @@ func TestNewParsedQuery(t *testing.T) {
 	pq := NewParsedQuery(stmt)
 	want := &ParsedQuery{
 		Query:         "select * from a where id = :id",
-		bindLocations: []bindLocation{{offset: 27, length: 3}},
+		bindLocations: []BindLocation{{Offset: 27, Length: 3}},
 	}
 	if !reflect.DeepEqual(pq, want) {
 		t.Errorf("GenerateParsedQuery: %+v, want %+v", pq, want)
@@ -75,14 +78,22 @@ func TestGenerateQuery(t *testing.T) {
 			desc:  "tuple *querypb.BindVariable",
 			query: "select * from a where id in ::vals",
 			bindVars: map[string]*querypb.BindVariable{
-				"vals": sqltypes.TestBindVariable([]interface{}{1, "aa"}),
+				"vals": sqltypes.TestBindVariable([]any{1, "aa"}),
 			},
 			output: "select * from a where id in (1, 'aa')",
+		}, {
+			desc:  "json bindvar and raw bindvar",
+			query: "insert into t values (:v1, :v2)",
+			bindVars: map[string]*querypb.BindVariable{
+				"v1": sqltypes.ValueBindVariable(sqltypes.MakeTrusted(querypb.Type_JSON, []byte(`{"key": "value"}`))),
+				"v2": sqltypes.ValueBindVariable(sqltypes.MakeTrusted(querypb.Type_RAW, []byte(`json_object("k", "v")`))),
+			},
+			output: `insert into t values ('{"key": "value"}', json_object("k", "v"))`,
 		}, {
 			desc:  "list bind vars 0 arguments",
 			query: "select * from a where id in ::vals",
 			bindVars: map[string]*querypb.BindVariable{
-				"vals": sqltypes.TestBindVariable([]interface{}{}),
+				"vals": sqltypes.TestBindVariable([]any{}),
 			},
 			output: "empty list supplied for vals",
 		}, {
@@ -93,10 +104,17 @@ func TestGenerateQuery(t *testing.T) {
 			},
 			output: "unexpected list arg type (INT64) for key vals",
 		}, {
+			desc:  "row tuple",
+			query: "select 1 from (values ::a) dt",
+			bindVars: map[string]*querypb.BindVariable{
+				"a": createRowTupleBV(),
+			},
+			output: "select 1 from (values row('a', 1), row('b', 2)) as dt",
+		}, {
 			desc:  "list bind var for non-list",
 			query: "select * from a where id = :vals",
 			bindVars: map[string]*querypb.BindVariable{
-				"vals": sqltypes.TestBindVariable([]interface{}{1}),
+				"vals": sqltypes.TestBindVariable([]any{1}),
 			},
 			output: "unexpected arg type (TUPLE) for non-list key vals",
 		}, {
@@ -104,10 +122,10 @@ func TestGenerateQuery(t *testing.T) {
 			query: "select * from a where b = :equality",
 			extras: map[string]Encodable{
 				"equality": &TupleEqualityList{
-					Columns: []ColIdent{NewColIdent("pk")},
+					Columns: []IdentifierCI{NewIdentifierCI("pk")},
 					Rows: [][]sqltypes.Value{
 						{sqltypes.NewInt64(1)},
-						{sqltypes.NewVarBinary("aa")},
+						{sqltypes.NewVarChar("aa")},
 					},
 				},
 			},
@@ -117,15 +135,15 @@ func TestGenerateQuery(t *testing.T) {
 			query: "select * from a where b = :equality",
 			extras: map[string]Encodable{
 				"equality": &TupleEqualityList{
-					Columns: []ColIdent{NewColIdent("pk1"), NewColIdent("pk2")},
+					Columns: []IdentifierCI{NewIdentifierCI("pk1"), NewIdentifierCI("pk2")},
 					Rows: [][]sqltypes.Value{
 						{
 							sqltypes.NewInt64(1),
-							sqltypes.NewVarBinary("aa"),
+							sqltypes.NewVarChar("aa"),
 						},
 						{
 							sqltypes.NewInt64(2),
-							sqltypes.NewVarBinary("bb"),
+							sqltypes.NewVarChar("bb"),
 						},
 					},
 				},
@@ -134,24 +152,169 @@ func TestGenerateQuery(t *testing.T) {
 		},
 	}
 
+	parser := NewTestParser()
 	for _, tcase := range tcases {
-		tree, err := Parse(tcase.query)
-		if err != nil {
-			t.Errorf("parse failed for %s: %v", tcase.desc, err)
-			continue
-		}
-		buf := NewTrackedBuffer(nil)
-		buf.Myprintf("%v", tree)
-		pq := buf.ParsedQuery()
-		bytes, err := pq.GenerateQuery(tcase.bindVars, tcase.extras)
-		var got string
-		if err != nil {
-			got = err.Error()
-		} else {
-			got = string(bytes)
-		}
-		if got != tcase.output {
-			t.Errorf("for test case: %s, got: '%s', want '%s'", tcase.desc, got, tcase.output)
-		}
+		t.Run(tcase.query, func(t *testing.T) {
+			tree, err := parser.Parse(tcase.query)
+			require.NoError(t, err)
+			buf := NewTrackedBuffer(nil)
+			buf.Myprintf("%v", tree)
+			pq := buf.ParsedQuery()
+			bytes, err := pq.GenerateQuery(tcase.bindVars, tcase.extras)
+			if err != nil {
+				assert.Equal(t, tcase.output, err.Error())
+			} else {
+				assert.Equal(t, tcase.output, bytes)
+			}
+		})
+	}
+}
+
+func TestParseAndBind(t *testing.T) {
+	testcases := []struct {
+		in    string
+		binds []*querypb.BindVariable
+		out   string
+	}{
+		{
+			in:  "select * from tbl",
+			out: "select * from tbl",
+		}, {
+			in:  "select * from tbl where b=4 or a=3",
+			out: "select * from tbl where b=4 or a=3",
+		}, {
+			in:  "select * from tbl where b = 4 or a = 3",
+			out: "select * from tbl where b = 4 or a = 3",
+		}, {
+			in:    "select * from tbl where name=%a",
+			binds: []*querypb.BindVariable{sqltypes.StringBindVariable("xyz")},
+			out:   "select * from tbl where name='xyz'",
+		}, {
+			in:    "select * from tbl where c=%a",
+			binds: []*querypb.BindVariable{sqltypes.Int64BindVariable(17)},
+			out:   "select * from tbl where c=17",
+		}, {
+			in:    "select * from tbl where name=%a and c=%a",
+			binds: []*querypb.BindVariable{sqltypes.StringBindVariable("xyz"), sqltypes.Int64BindVariable(17)},
+			out:   "select * from tbl where name='xyz' and c=17",
+		}, {
+			in:    "select * from tbl where name=%a",
+			binds: []*querypb.BindVariable{sqltypes.StringBindVariable("it's")},
+			out:   "select * from tbl where name='it\\'s'",
+		}, {
+			in:    "where name=%a",
+			binds: []*querypb.BindVariable{sqltypes.StringBindVariable("xyz")},
+			out:   "where name='xyz'",
+		}, {
+			in:    "name=%a",
+			binds: []*querypb.BindVariable{sqltypes.StringBindVariable("xyz")},
+			out:   "name='xyz'",
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.in, func(t *testing.T) {
+			query, err := ParseAndBind(tc.in, tc.binds...)
+			assert.NoError(t, err)
+			assert.Equal(t, tc.out, query)
+		})
+	}
+}
+
+func TestCastBindVars(t *testing.T) {
+	testcases := []struct {
+		typ   sqltypes.Type
+		size  int
+		binds map[string]*querypb.BindVariable
+		out   string
+	}{
+		{
+			typ:   sqltypes.Decimal,
+			binds: map[string]*querypb.BindVariable{"arg": sqltypes.DecimalBindVariable("50")},
+			out:   "select CAST(50 AS DECIMAL(0, 0)) from ",
+		},
+		{
+			typ:   sqltypes.Uint32,
+			binds: map[string]*querypb.BindVariable{"arg": {Type: sqltypes.Uint32, Value: sqltypes.NewUint32(42).Raw()}},
+			out:   "select CAST(42 AS UNSIGNED) from ",
+		},
+		{
+			typ:   sqltypes.Float64,
+			binds: map[string]*querypb.BindVariable{"arg": {Type: sqltypes.Float64, Value: sqltypes.NewFloat64(42.42).Raw()}},
+			out:   "select CAST(42.42 AS DOUBLE) from ",
+		},
+		{
+			typ:   sqltypes.Float32,
+			binds: map[string]*querypb.BindVariable{"arg": {Type: sqltypes.Float32, Value: sqltypes.NewFloat32(42).Raw()}},
+			out:   "select CAST(42 AS FLOAT) from ",
+		},
+		{
+			typ:   sqltypes.Date,
+			binds: map[string]*querypb.BindVariable{"arg": {Type: sqltypes.Date, Value: sqltypes.NewDate("2021-10-30").Raw()}},
+			out:   "select CAST('2021-10-30' AS DATE) from ",
+		},
+		{
+			typ:   sqltypes.Time,
+			binds: map[string]*querypb.BindVariable{"arg": {Type: sqltypes.Time, Value: sqltypes.NewTime("12:00:00").Raw()}},
+			out:   "select CAST('12:00:00' AS TIME) from ",
+		},
+		{
+			typ:   sqltypes.Time,
+			size:  6,
+			binds: map[string]*querypb.BindVariable{"arg": {Type: sqltypes.Time, Value: sqltypes.NewTime("12:00:00").Raw()}},
+			out:   "select CAST('12:00:00' AS TIME(6)) from ",
+		},
+		{
+			typ:   sqltypes.Timestamp,
+			binds: map[string]*querypb.BindVariable{"arg": {Type: sqltypes.Timestamp, Value: sqltypes.NewTimestamp("2021-10-22 12:00:00").Raw()}},
+			out:   "select CAST('2021-10-22 12:00:00' AS DATETIME) from ",
+		},
+		{
+			typ:   sqltypes.Timestamp,
+			size:  6,
+			binds: map[string]*querypb.BindVariable{"arg": {Type: sqltypes.Timestamp, Value: sqltypes.NewTimestamp("2021-10-22 12:00:00").Raw()}},
+			out:   "select CAST('2021-10-22 12:00:00' AS DATETIME(6)) from ",
+		},
+		{
+			typ:   sqltypes.Datetime,
+			binds: map[string]*querypb.BindVariable{"arg": {Type: sqltypes.Datetime, Value: sqltypes.NewDatetime("2021-10-22 12:00:00").Raw()}},
+			out:   "select CAST('2021-10-22 12:00:00' AS DATETIME) from ",
+		},
+		{
+			typ:   sqltypes.Datetime,
+			size:  6,
+			binds: map[string]*querypb.BindVariable{"arg": {Type: sqltypes.Datetime, Value: sqltypes.NewDatetime("2021-10-22 12:00:00").Raw()}},
+			out:   "select CAST('2021-10-22 12:00:00' AS DATETIME(6)) from ",
+		},
+	}
+
+	for _, testcase := range testcases {
+		t.Run(testcase.out, func(t *testing.T) {
+			argument := NewTypedArgument("arg", testcase.typ)
+			if testcase.size > 0 {
+				argument.Size = int32(testcase.size)
+			}
+
+			s := &Select{
+				SelectExprs: &SelectExprs{
+					Exprs: []SelectExpr{NewAliasedExpr(argument, "")},
+				},
+			}
+
+			pq := NewParsedQuery(s)
+			out, err := pq.GenerateQuery(testcase.binds, nil)
+
+			require.NoError(t, err)
+			require.Equal(t, testcase.out, out)
+		})
+	}
+}
+
+func createRowTupleBV() *querypb.BindVariable {
+	v1 := sqltypes.TestTuple(sqltypes.NewVarChar("a"), sqltypes.NewInt64(1))
+	v2 := sqltypes.TestTuple(sqltypes.NewVarChar("b"), sqltypes.NewInt64(2))
+	return &querypb.BindVariable{
+		Type:   querypb.Type_ROW_TUPLE,
+		Values: append([]*querypb.Value{sqltypes.ValueToProto(v1)}, sqltypes.ValueToProto(v2)),
 	}
 }

@@ -17,11 +17,11 @@ limitations under the License.
 package etcd2topo
 
 import (
+	"context"
 	"path"
 	"strings"
 
-	"github.com/coreos/etcd/clientv3"
-	"golang.org/x/net/context"
+	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"vitess.io/vitess/go/vt/topo"
 )

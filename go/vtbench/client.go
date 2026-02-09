@@ -18,10 +18,12 @@ package vtbench
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
 	"google.golang.org/grpc"
+
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/grpcclient"
@@ -53,7 +55,6 @@ func (c *mysqlClientConn) connect(ctx context.Context, cp ConnParams) error {
 		Pass:       cp.Password,
 		UnixSocket: cp.UnixSocket,
 	})
-
 	if err != nil {
 		return err
 	}
@@ -83,7 +84,7 @@ var vtgateConns = map[string]*vtgateconn.VTGateConn{}
 func (c *grpcVtgateConn) connect(ctx context.Context, cp ConnParams) error {
 	withBlockOnce.Do(func() {
 		grpcclient.RegisterGRPCDialOptions(func(opts []grpc.DialOption) ([]grpc.DialOption, error) {
-			return append(opts, grpc.WithBlock()), nil
+			return append(opts, grpc.WithBlock()), nil //nolint:staticcheck
 		})
 	})
 
@@ -105,7 +106,7 @@ func (c *grpcVtgateConn) connect(ctx context.Context, cp ConnParams) error {
 }
 
 func (c *grpcVtgateConn) execute(ctx context.Context, query string, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
-	return c.session.Execute(ctx, query, bindVars)
+	return c.session.Execute(ctx, query, bindVars, false)
 }
 
 type grpcVttabletConn struct {
@@ -118,12 +119,12 @@ var vttabletConns = map[string]queryservice.QueryService{}
 func (c *grpcVttabletConn) connect(ctx context.Context, cp ConnParams) error {
 	withBlockOnce.Do(func() {
 		grpcclient.RegisterGRPCDialOptions(func(opts []grpc.DialOption) ([]grpc.DialOption, error) {
-			return append(opts, grpc.WithBlock()), nil
+			return append(opts, grpc.WithBlock()), nil //nolint:staticcheck
 		})
 	})
 
 	// parse the "db" into the keyspace/shard target
-	keyspace, tabletType, dest, err := topoproto.ParseDestination(cp.DB, topodatapb.TabletType_MASTER)
+	keyspace, tabletType, dest, _, err := topoproto.ParseDestination(cp.DB, topodatapb.TabletType_PRIMARY)
 	if err != nil {
 		return err
 	}
@@ -136,7 +137,7 @@ func (c *grpcVttabletConn) connect(ctx context.Context, cp ConnParams) error {
 			Keyspace: keyspace,
 		}
 		var err error
-		qs, err = tabletconn.GetDialer()(&tablet, true)
+		qs, err = tabletconn.GetDialer()(ctx, &tablet, true)
 		if err != nil {
 			return err
 		}
@@ -147,7 +148,7 @@ func (c *grpcVttabletConn) connect(ctx context.Context, cp ConnParams) error {
 
 	shard, ok := dest.(key.DestinationShard)
 	if !ok {
-		return fmt.Errorf("invalid destination shard")
+		return errors.New("invalid destination shard")
 	}
 
 	c.target = querypb.Target{
@@ -160,5 +161,5 @@ func (c *grpcVttabletConn) connect(ctx context.Context, cp ConnParams) error {
 }
 
 func (c *grpcVttabletConn) execute(ctx context.Context, query string, bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error) {
-	return c.qs.Execute(ctx, &c.target, query, bindVars, 0, nil)
+	return c.qs.Execute(ctx, nil, &c.target, query, bindVars, 0, 0, nil)
 }

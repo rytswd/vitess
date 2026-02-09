@@ -20,11 +20,11 @@ import (
 	"fmt"
 	"strings"
 
+	"vitess.io/vitess/go/mysql/capabilities"
 	"vitess.io/vitess/go/sqltypes"
 )
 
-type fakeDBClient struct {
-}
+type fakeDBClient struct{}
 
 // NewFakeDBClient returns a fake DBClient. Its functions return
 // preset responses to requests.
@@ -55,6 +55,10 @@ func (dc *fakeDBClient) Rollback() error {
 func (dc *fakeDBClient) Close() {
 }
 
+func (dc *fakeDBClient) IsClosed() bool {
+	return false
+}
+
 func (dc *fakeDBClient) ExecuteFetch(query string, maxrows int) (qr *sqltypes.Result, err error) {
 	query = strings.ToLower(query)
 	switch {
@@ -68,10 +72,10 @@ func (dc *fakeDBClient) ExecuteFetch(query string, maxrows int) (qr *sqltypes.Re
 		if strings.Contains(query, "where") {
 			return sqltypes.MakeTestResult(
 				sqltypes.MakeTestFields(
-					"id|state|source",
-					"int64|varchar|varchar",
+					"id|state|source|message",
+					"int64|varchar|varchar|varchar",
 				),
-				`1|Running|keyspace:"ks" shard:"0" key_range:<end:"\200" > `,
+				`1|Running|keyspace:"ks" shard:"0" key_range:<end:"\200" > |`,
 			), nil
 		}
 		return &sqltypes.Result{}, nil
@@ -79,4 +83,12 @@ func (dc *fakeDBClient) ExecuteFetch(query string, maxrows int) (qr *sqltypes.Re
 		return &sqltypes.Result{}, nil
 	}
 	return nil, fmt.Errorf("unexpected: %v", query)
+}
+
+func (dc *fakeDBClient) ExecuteFetchMulti(query string, maxrows int) ([]*sqltypes.Result, error) {
+	return make([]*sqltypes.Result, 0), nil
+}
+
+func (dc *fakeDBClient) SupportsCapability(capability capabilities.FlavorCapability) (bool, error) {
+	return false, nil
 }

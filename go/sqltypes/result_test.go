@@ -17,11 +17,20 @@ limitations under the License.
 package sqltypes
 
 import (
-	"reflect"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 
 	querypb "vitess.io/vitess/go/vt/proto/query"
 )
+
+func assertEqualResults(t *testing.T, a, b *Result) {
+	t.Helper()
+	assert.Truef(t, a.Equal(b), "Results are not equal: \n%v\n%v", a, b)
+	if !a.Equal(b) {
+		t.Errorf("Results are not equal: %v %v", a, b)
+	}
+}
 
 func TestRepair(t *testing.T) {
 	fields := []*querypb.Field{{
@@ -29,22 +38,20 @@ func TestRepair(t *testing.T) {
 	}, {
 		Type: VarChar,
 	}}
-	in := Result{
+	in := &Result{
 		Rows: [][]Value{
 			{TestValue(VarBinary, "1"), TestValue(VarBinary, "aa")},
 			{TestValue(VarBinary, "2"), TestValue(VarBinary, "bb")},
 		},
 	}
-	want := Result{
+	want := &Result{
 		Rows: [][]Value{
 			{TestValue(Int64, "1"), TestValue(VarChar, "aa")},
 			{TestValue(Int64, "2"), TestValue(VarChar, "bb")},
 		},
 	}
 	in.Repair(fields)
-	if !reflect.DeepEqual(in, want) {
-		t.Errorf("Repair:\n%#v, want\n%#v", in, want)
-	}
+	assertEqualResults(t, in, want)
 }
 
 func TestCopy(t *testing.T) {
@@ -54,26 +61,17 @@ func TestCopy(t *testing.T) {
 		}, {
 			Type: VarChar,
 		}},
-		InsertID:     1,
-		RowsAffected: 2,
+		InsertID:        1,
+		InsertIDChanged: true,
+		RowsAffected:    2,
 		Rows: [][]Value{
 			{TestValue(Int64, "1"), MakeTrusted(Null, nil)},
 			{TestValue(Int64, "2"), MakeTrusted(VarChar, nil)},
 			{TestValue(Int64, "3"), TestValue(VarChar, "")},
 		},
-		Extras: &querypb.ResultExtras{
-			EventToken: &querypb.EventToken{
-				Timestamp: 123,
-				Shard:     "sh",
-				Position:  "po",
-			},
-			Fresher: true,
-		},
 	}
 	out := in.Copy()
-	if !reflect.DeepEqual(out, in) {
-		t.Errorf("Copy:\n%v, want\n%v", out, in)
-	}
+	assertEqualResults(t, in, out)
 }
 
 func TestTruncate(t *testing.T) {
@@ -83,52 +81,34 @@ func TestTruncate(t *testing.T) {
 		}, {
 			Type: VarChar,
 		}},
-		InsertID:     1,
-		RowsAffected: 2,
+		InsertID:        1,
+		InsertIDChanged: true,
+		RowsAffected:    2,
 		Rows: [][]Value{
 			{TestValue(Int64, "1"), MakeTrusted(Null, nil)},
 			{TestValue(Int64, "2"), MakeTrusted(VarChar, nil)},
 			{TestValue(Int64, "3"), TestValue(VarChar, "")},
 		},
-		Extras: &querypb.ResultExtras{
-			EventToken: &querypb.EventToken{
-				Timestamp: 123,
-				Shard:     "sh",
-				Position:  "po",
-			},
-			Fresher: true,
-		},
 	}
 
 	out := in.Truncate(0)
-	if !reflect.DeepEqual(out, in) {
-		t.Errorf("Truncate(0):\n%v, want\n%v", out, in)
-	}
+	assertEqualResults(t, in, out)
 
 	out = in.Truncate(1)
 	want := &Result{
 		Fields: []*querypb.Field{{
 			Type: Int64,
 		}},
-		InsertID:     1,
-		RowsAffected: 2,
+		InsertID:        1,
+		InsertIDChanged: true,
+		RowsAffected:    2,
 		Rows: [][]Value{
 			{TestValue(Int64, "1")},
 			{TestValue(Int64, "2")},
 			{TestValue(Int64, "3")},
 		},
-		Extras: &querypb.ResultExtras{
-			EventToken: &querypb.EventToken{
-				Timestamp: 123,
-				Shard:     "sh",
-				Position:  "po",
-			},
-			Fresher: true,
-		},
 	}
-	if !reflect.DeepEqual(out, want) {
-		t.Errorf("Truncate(1):\n%v, want\n%v", out, want)
-	}
+	assertEqualResults(t, out, want)
 }
 
 func TestStripMetaData(t *testing.T) {
@@ -303,20 +283,230 @@ func TestStripMetaData(t *testing.T) {
 		},
 	}}
 	for _, tcase := range testcases {
-		inCopy := tcase.in.Copy()
-		out := inCopy.StripMetadata(tcase.includedFields)
-		if !reflect.DeepEqual(out, tcase.expected) {
-			t.Errorf("StripMetaData unexpected result for %v: %v", tcase.name, out)
-		}
-		if len(tcase.in.Fields) > 0 {
-			// check the out array is different than the in array.
-			if out.Fields[0] == inCopy.Fields[0] && tcase.includedFields != querypb.ExecuteOptions_ALL {
-				t.Errorf("StripMetaData modified original Field for %v", tcase.name)
+		t.Run(tcase.name, func(t *testing.T) {
+			inCopy := tcase.in.Copy()
+			out := inCopy.StripMetadata(tcase.includedFields)
+			assertEqualResults(t, out, tcase.expected)
+			if len(tcase.in.Fields) > 0 {
+				// check the out array is different than the in array.
+				if out.Fields[0] == inCopy.Fields[0] && tcase.includedFields != querypb.ExecuteOptions_ALL {
+					t.Errorf("StripMetaData modified original Field for %v", tcase.name)
+				}
 			}
-		}
-		// check we didn't change the original result.
-		if !reflect.DeepEqual(tcase.in, inCopy) {
-			t.Error("StripMetaData modified original result")
-		}
+			// check we didn't change the original result.
+			assertEqualResults(t, tcase.in, inCopy)
+		})
 	}
+}
+
+func TestAppendResult(t *testing.T) {
+	src := &Result{
+		Fields: []*querypb.Field{{
+			Type: Int64,
+		}, {
+			Type: VarChar,
+		}},
+		InsertIDChanged: true,
+		InsertID:        1,
+		RowsAffected:    2,
+		Rows: [][]Value{
+			{TestValue(Int64, "2"), MakeTrusted(VarChar, nil)},
+			{TestValue(Int64, "3"), TestValue(VarChar, "")},
+		},
+	}
+
+	result := &Result{
+		Fields: []*querypb.Field{{
+			Type: Int64,
+		}, {
+			Type: VarChar,
+		}},
+		InsertID:        3,
+		InsertIDChanged: true,
+		RowsAffected:    4,
+		Rows: [][]Value{
+			{TestValue(Int64, "1"), MakeTrusted(Null, nil)},
+		},
+	}
+
+	want := &Result{
+		Fields: []*querypb.Field{{
+			Type: Int64,
+		}, {
+			Type: VarChar,
+		}},
+		InsertID:        1,
+		InsertIDChanged: true,
+		RowsAffected:    6,
+		Rows: [][]Value{
+			{TestValue(Int64, "1"), MakeTrusted(Null, nil)},
+			{TestValue(Int64, "2"), MakeTrusted(VarChar, nil)},
+			{TestValue(Int64, "3"), TestValue(VarChar, "")},
+		},
+	}
+
+	result.AppendResult(src)
+	assertEqualResults(t, result, want)
+}
+
+func TestReplaceKeyspace(t *testing.T) {
+	result := &Result{
+		Fields: []*querypb.Field{{
+			Type:     Int64,
+			Database: "vttest",
+		}, {
+			Type:     VarChar,
+			Database: "vttest",
+		}, {
+			Type: VarBinary,
+		}},
+	}
+
+	result.ReplaceKeyspace("keyspace-name")
+	assert.Equal(t, "keyspace-name", result.Fields[0].Database)
+	assert.Equal(t, "keyspace-name", result.Fields[1].Database)
+	// Expect empty database identifiers to remain empty
+	assert.Equal(t, "", result.Fields[2].Database)
+}
+
+func TestShallowCopy(t *testing.T) {
+	result := &Result{
+		Fields: []*querypb.Field{{
+			Type:     Int64,
+			Database: "vttest",
+		}, {
+			Type:     VarChar,
+			Database: "vttest",
+		}},
+		Rows: [][]Value{
+			{
+				MakeTrusted(querypb.Type_INT32, []byte("10")),
+				MakeTrusted(querypb.Type_VARCHAR, []byte("name")),
+			},
+		},
+	}
+
+	res := result.ShallowCopy()
+	assert.Equal(t, result, res)
+}
+
+func TestMetadata(t *testing.T) {
+	result := &Result{
+		Fields: []*querypb.Field{{
+			Type:     Int64,
+			Database: "vttest",
+		}, {
+			Type:     VarChar,
+			Database: "vttest",
+		}},
+		Rows: [][]Value{
+			{
+				MakeTrusted(querypb.Type_INT32, []byte("10")),
+				MakeTrusted(querypb.Type_VARCHAR, []byte("name")),
+			},
+		},
+	}
+
+	res := result.Metadata()
+	assert.Nil(t, res.Rows)
+	assert.Equal(t, result.Fields, res.Fields)
+}
+
+func TestResultsEqualUnordered(t *testing.T) {
+	result1 := &Result{
+		Fields: []*querypb.Field{{
+			Type:     Int64,
+			Database: "vttest",
+		}, {
+			Type:     VarChar,
+			Database: "vttest",
+		}},
+		Rows: [][]Value{
+			{
+				MakeTrusted(querypb.Type_INT32, []byte("24")),
+				MakeTrusted(querypb.Type_VARCHAR, []byte("test-name1")),
+			},
+		},
+		RowsAffected: 2,
+	}
+
+	result2 := &Result{
+		Fields: []*querypb.Field{{
+			Type:     Int64,
+			Database: "vttest",
+		}, {
+			Type:     VarChar,
+			Database: "vttest",
+		}},
+		Rows: [][]Value{
+			{
+				MakeTrusted(querypb.Type_INT32, []byte("10")),
+				MakeTrusted(querypb.Type_VARCHAR, []byte("test-name2")),
+			},
+		},
+		RowsAffected: 2,
+	}
+
+	result3 := &Result{
+		Fields: []*querypb.Field{{
+			Type:     Int64,
+			Database: "vttest",
+		}, {
+			Type:     VarChar,
+			Database: "vttest",
+		}},
+		Rows: [][]Value{
+			{
+				MakeTrusted(querypb.Type_INT32, []byte("10")),
+				MakeTrusted(querypb.Type_VARCHAR, []byte("test-name2")),
+			},
+			{
+				MakeTrusted(querypb.Type_INT32, []byte("24")),
+				MakeTrusted(querypb.Type_VARCHAR, []byte("test-name1")),
+			},
+		},
+		RowsAffected: 3,
+	}
+
+	eq := ResultsEqualUnordered([]Result{*result1, *result2}, []Result{*result2, *result1})
+	assert.True(t, eq)
+
+	eq = ResultsEqualUnordered([]Result{*result1}, []Result{*result2, *result1})
+	assert.False(t, eq)
+
+	eq = ResultsEqualUnordered([]Result{*result1}, []Result{*result2})
+	assert.False(t, eq)
+
+	eq = ResultsEqualUnordered([]Result{*result1, *result3}, []Result{*result2, *result1})
+	assert.False(t, eq)
+}
+
+func TestStatusFlags(t *testing.T) {
+	result := &Result{
+		Fields: []*querypb.Field{{
+			Type:     Int64,
+			Database: "vttest",
+		}, {
+			Type:     VarChar,
+			Database: "vttest",
+		}},
+		StatusFlags: ServerMoreResultsExists,
+	}
+
+	assert.True(t, result.IsMoreResultsExists())
+	assert.False(t, result.IsInTransaction())
+
+	result.StatusFlags = ServerStatusInTrans
+
+	assert.False(t, result.IsMoreResultsExists())
+	assert.True(t, result.IsInTransaction())
+}
+
+func TestIncludeFieldsOrDefault(t *testing.T) {
+	// Should return default if nil is passed
+	r := IncludeFieldsOrDefault(nil)
+	assert.Equal(t, querypb.ExecuteOptions_TYPE_AND_NAME, r)
+
+	r = IncludeFieldsOrDefault(&querypb.ExecuteOptions{IncludedFields: querypb.ExecuteOptions_TYPE_ONLY})
+	assert.Equal(t, querypb.ExecuteOptions_TYPE_ONLY, r)
 }

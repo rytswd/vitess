@@ -17,14 +17,15 @@ limitations under the License.
 package servenv
 
 import (
-	"io/ioutil"
+	"io"
 	"net/http"
-	"net/http/httptest"
 	"testing"
+
+	"vitess.io/vitess/go/vt/servenv/testutils"
 )
 
 func TestLivenessHandler(t *testing.T) {
-	server := httptest.NewServer(nil)
+	server := testutils.HTTPTestServer()
 	defer server.Close()
 
 	resp, err := http.Get(server.URL + "/debug/liveness")
@@ -34,9 +35,9 @@ func TestLivenessHandler(t *testing.T) {
 	defer resp.Body.Close()
 
 	// Make sure we can read the body, even though it's empty.
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		t.Fatalf("ioutil.ReadAll: %v", err)
+		t.Fatalf("io.ReadAll: %v", err)
 	}
 	t.Logf("body: %q", body)
 }

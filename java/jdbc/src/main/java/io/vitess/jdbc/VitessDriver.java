@@ -17,7 +17,6 @@
 package io.vitess.jdbc;
 
 import io.vitess.util.Constants;
-
 import java.sql.Connection;
 import java.sql.Driver;
 import java.sql.DriverManager;
@@ -60,12 +59,10 @@ public class VitessDriver implements Driver {
 
   /**
    * Checks whether a given url is in a valid format.
-   * <p/>
    * The current uri format is: jdbc:vitess://[host]:[port]
    *
    * @param url the URL of the database
    * @return true, if this driver understands the given URL; false, otherwise
-   *     <p/>
    *     TODO: Write a better regex
    */
   @Override
@@ -78,7 +75,7 @@ public class VitessDriver implements Driver {
    * the driver. Parameters can be set in either the URL or Properties.
    *
    * @param url - Connection Url A vitess-compatible URL, per {@link VitessJDBCUrl} i.e.
-   *     jdbc:vitess://locahost:9000/vt_keyspace?TABLET_TYPE=master
+   *     jdbc:vitess://locahost:9000/vt_keyspace?TABLET_TYPE=primary
    * @param info - Property for the connection May contain additional properties to configure
    *     this driver with
    * @return DriverPropertyInfo Array Object

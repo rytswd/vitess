@@ -21,21 +21,40 @@ package consultopo
 
 import (
 	"encoding/json"
-	"flag"
-	"fmt"
-	"io/ioutil"
+	"os"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/hashicorp/consul/api"
-	"vitess.io/vitess/go/vt/vterrors"
+	"github.com/spf13/pflag"
 
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/servenv"
 	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/utils"
+	"vitess.io/vitess/go/vt/vterrors"
 )
 
 var (
-	consulAuthClientStaticFile = flag.String("consul_auth_static_file", "", "JSON File to read the topos/tokens from.")
+	consulAuthClientStaticFile string
+	// serfHealth is the default check from consul
+	consulLockSessionChecks = "serfHealth"
+	consulLockSessionTTL    string
+	consulLockDelay         = 15 * time.Second
 )
+
+func init() {
+	servenv.RegisterFlagsForTopoBinaries(registerServerFlags)
+}
+
+func registerServerFlags(fs *pflag.FlagSet) {
+	utils.SetFlagStringVar(fs, &consulAuthClientStaticFile, "consul-auth-static-file", consulAuthClientStaticFile, "JSON File to read the topos/tokens from.")
+	utils.SetFlagStringVar(fs, &consulLockSessionChecks, "topo-consul-lock-session-checks", consulLockSessionChecks, "List of checks for consul session.")
+	utils.SetFlagStringVar(fs, &consulLockSessionTTL, "topo-consul-lock-session-ttl", consulLockSessionTTL, "TTL for consul session.")
+	utils.SetFlagDurationVar(fs, &consulLockDelay, "topo-consul-lock-delay", consulLockDelay, "LockDelay for consul session.")
+}
 
 // ClientAuthCred credential to use for consul clusters
 type ClientAuthCred struct {
@@ -59,20 +78,24 @@ func (f Factory) Create(cell, serverAddr, root string) (topo.Conn, error) {
 func getClientCreds() (creds map[string]*ClientAuthCred, err error) {
 	creds = make(map[string]*ClientAuthCred)
 
-	if *consulAuthClientStaticFile == "" {
+	if consulAuthClientStaticFile == "" {
 		// Not configured, nothing to do.
-		log.Infof("Consul client auth is not set up. consul_auth_static_file was not provided")
+		log.Infof("Consul client auth is not set up. consul-auth-static-file was not provided")
 		return nil, nil
 	}
 
-	data, err := ioutil.ReadFile(*consulAuthClientStaticFile)
+	data, err := os.ReadFile(consulAuthClientStaticFile)
 	if err != nil {
-		err = vterrors.Wrapf(err, "Failed to read consul_auth_static_file file")
+		err = vterrors.Wrapf(err, "Failed to read consul-auth-static-file file")
 		return creds, err
 	}
 
 	if err := json.Unmarshal(data, &creds); err != nil {
-		err = vterrors.Wrapf(err, fmt.Sprintf("Error parsing consul_auth_static_file"))
+		err = vterrors.Wrapf(err, "Error parsing consul-auth-static-file")
+		return creds, err
+	}
+	if len(creds) == 0 {
+		err = vterrors.New(vtrpc.Code_FAILED_PRECONDITION, "Found no credentials in consul_auth_static_file")
 		return creds, err
 	}
 	return creds, nil
@@ -92,6 +115,10 @@ type Server struct {
 	// locks is a map of *lockInstance structures.
 	// The key is the filepath of the Lock file.
 	locks map[string]*lockInstance
+
+	lockChecks []string
+	lockTTL    string // This is the default used for all non-named locks
+	lockDelay  time.Duration
 }
 
 // lockInstance keeps track of one lock held by this client.
@@ -125,11 +152,22 @@ func NewServer(cell, serverAddr, root string) (*Server, error) {
 	}
 
 	return &Server{
-		client: client,
-		kv:     client.KV(),
-		root:   root,
-		locks:  make(map[string]*lockInstance),
+		client:     client,
+		kv:         client.KV(),
+		root:       root,
+		locks:      make(map[string]*lockInstance),
+		lockChecks: parseConsulLockSessionChecks(consulLockSessionChecks),
+		lockTTL:    consulLockSessionTTL,
+		lockDelay:  consulLockDelay,
 	}, nil
+}
+
+func parseConsulLockSessionChecks(s string) []string {
+	var res []string
+	if len(s) == 0 {
+		return res
+	}
+	return strings.Split(consulLockSessionChecks, ",")
 }
 
 // Close implements topo.Server.Close.

@@ -1,0 +1,1488 @@
+/*
+Copyright 2023 The Vitess Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package smartconnpool
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"reflect"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+var (
+	sFoo = &Setting{queryApply: "set foo=1"}
+	sBar = &Setting{queryApply: "set bar=1"}
+)
+
+type TestState struct {
+	lastID, open, close, reset atomic.Int64
+	mu                         sync.Mutex
+	waits                      []time.Time
+	chaos                      struct {
+		delayConnect time.Duration
+		failConnect  atomic.Bool
+		failApply    bool
+	}
+}
+
+func (ts *TestState) LogWait(start time.Time) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	ts.waits = append(ts.waits, start)
+}
+
+type TestConn struct {
+	counts  *TestState
+	onClose chan struct{}
+
+	setting     *Setting
+	num         int64
+	timeCreated time.Time
+	closed      bool
+	failApply   bool
+}
+
+func (tr *TestConn) waitForClose() chan struct{} {
+	tr.onClose = make(chan struct{})
+	return tr.onClose
+}
+
+func (tr *TestConn) IsClosed() bool {
+	return tr.closed
+}
+
+func (tr *TestConn) Setting() *Setting {
+	return tr.setting
+}
+
+func (tr *TestConn) ResetSetting(ctx context.Context) error {
+	tr.counts.reset.Add(1)
+	tr.setting = nil
+	return nil
+}
+
+func (tr *TestConn) ApplySetting(ctx context.Context, setting *Setting) error {
+	if tr.failApply {
+		return errors.New("ApplySetting failed")
+	}
+	tr.setting = setting
+	return nil
+}
+
+func (tr *TestConn) Close() {
+	if !tr.closed {
+		if tr.onClose != nil {
+			close(tr.onClose)
+		}
+		tr.counts.open.Add(-1)
+		tr.counts.close.Add(1)
+		tr.closed = true
+	}
+}
+
+var _ Connection = (*TestConn)(nil)
+
+func newConnector(state *TestState) Connector[*TestConn] {
+	return func(ctx context.Context) (*TestConn, error) {
+		state.open.Add(1)
+		if state.chaos.delayConnect != 0 {
+			time.Sleep(state.chaos.delayConnect)
+		}
+		if state.chaos.failConnect.Load() {
+			return nil, errors.New("failed to connect: forced failure")
+		}
+		return &TestConn{
+			num:         state.lastID.Add(1),
+			timeCreated: time.Now(),
+			counts:      state,
+			failApply:   state.chaos.failApply,
+		}, nil
+	}
+}
+
+func TestOpen(t *testing.T) {
+	var state TestState
+
+	ctx := context.Background()
+	p := NewPool(&Config[*TestConn]{
+		Capacity:    5,
+		IdleTimeout: time.Second,
+		LogWait:     state.LogWait,
+	}).Open(newConnector(&state), nil)
+
+	var resources [10]*Pooled[*TestConn]
+	var r *Pooled[*TestConn]
+	var err error
+
+	// Test Get
+	for i := range 5 {
+		if i%2 == 0 {
+			r, err = p.Get(ctx, nil)
+		} else {
+			r, err = p.Get(ctx, sFoo)
+		}
+		require.NoError(t, err)
+		resources[i] = r
+		assert.EqualValues(t, 5-i-1, p.Available())
+		assert.Zero(t, p.Metrics.WaitCount())
+		assert.Zero(t, len(state.waits))
+		assert.Zero(t, p.Metrics.WaitTime())
+		assert.EqualValues(t, i+1, state.lastID.Load())
+		assert.EqualValues(t, i+1, state.open.Load())
+	}
+
+	// Test that Get waits
+	done := make(chan struct{})
+	go func() {
+		for i := range 5 {
+			if i%2 == 0 {
+				r, err = p.Get(ctx, nil)
+			} else {
+				r, err = p.Get(ctx, sFoo)
+			}
+			require.NoError(t, err)
+			resources[i] = r
+		}
+		for i := range 5 {
+			p.put(resources[i])
+		}
+		close(done)
+	}()
+	for i := range 5 {
+		// block until we have a client wait for a connection, then offer it
+		for p.wait.waiting() == 0 {
+			time.Sleep(time.Millisecond)
+		}
+		p.put(resources[i])
+	}
+	<-done
+	assert.EqualValues(t, 5, p.Metrics.WaitCount())
+	assert.Equal(t, 5, len(state.waits))
+	// verify start times are monotonic increasing
+	for i := 1; i < len(state.waits); i++ {
+		assert.False(t, state.waits[i].Before(state.waits[i-1]), "Expecting monotonic increasing start times")
+	}
+	assert.NotZero(t, p.Metrics.WaitTime())
+	assert.EqualValues(t, 5, state.lastID.Load())
+	// Test Close resource
+	r, err = p.Get(ctx, nil)
+	require.NoError(t, err)
+	r.Close()
+	// A nil Put should cause the resource to be reopened.
+	p.put(nil)
+	assert.EqualValues(t, 5, state.open.Load())
+	assert.EqualValues(t, 6, state.lastID.Load())
+
+	for i := range 5 {
+		if i%2 == 0 {
+			r, err = p.Get(ctx, nil)
+		} else {
+			r, err = p.Get(ctx, sFoo)
+		}
+		require.NoError(t, err)
+		resources[i] = r
+	}
+	for i := range 5 {
+		p.put(resources[i])
+	}
+	assert.EqualValues(t, 5, state.open.Load())
+	assert.EqualValues(t, 6, state.lastID.Load())
+
+	// SetCapacity
+	err = p.SetCapacity(ctx, 3)
+	require.NoError(t, err)
+	assert.EqualValues(t, 3, state.open.Load())
+	assert.EqualValues(t, 6, state.lastID.Load())
+	assert.EqualValues(t, 3, p.Capacity())
+	assert.EqualValues(t, 3, p.Available())
+
+	err = p.SetCapacity(ctx, 6)
+	require.NoError(t, err)
+	assert.EqualValues(t, 6, p.Capacity())
+	assert.EqualValues(t, 6, p.Available())
+
+	for i := range 6 {
+		if i%2 == 0 {
+			r, err = p.Get(ctx, nil)
+		} else {
+			r, err = p.Get(ctx, sFoo)
+		}
+		require.NoError(t, err)
+		resources[i] = r
+	}
+	for i := range 6 {
+		p.put(resources[i])
+	}
+	assert.EqualValues(t, 6, state.open.Load())
+	assert.EqualValues(t, 9, state.lastID.Load())
+
+	// Close
+	p.Close()
+	assert.EqualValues(t, 0, p.Capacity())
+	assert.EqualValues(t, 0, p.Available())
+	assert.EqualValues(t, 0, state.open.Load())
+}
+
+func TestShrinking(t *testing.T) {
+	var state TestState
+
+	ctx := context.Background()
+	p := NewPool(&Config[*TestConn]{
+		Capacity:    5,
+		IdleTimeout: time.Second,
+		LogWait:     state.LogWait,
+	}).Open(newConnector(&state), nil)
+
+	var resources [10]*Pooled[*TestConn]
+	// Leave one empty slot in the pool
+	for i := range 4 {
+		var r *Pooled[*TestConn]
+		var err error
+		if i%2 == 0 {
+			r, err = p.Get(ctx, nil)
+		} else {
+			r, err = p.Get(ctx, sFoo)
+		}
+		require.NoError(t, err)
+		resources[i] = r
+	}
+	done := make(chan bool)
+	go func() {
+		err := p.SetCapacity(ctx, 3)
+		require.NoError(t, err)
+
+		done <- true
+	}()
+	expected := map[string]any{
+		"Capacity":          3,
+		"Available":         -1, // negative because we've borrowed past our capacity
+		"Active":            4,
+		"InUse":             4,
+		"WaitCount":         0,
+		"WaitTime":          time.Duration(0),
+		"IdleTimeout":       1 * time.Second,
+		"IdleClosed":        0,
+		"MaxLifetimeClosed": 0,
+	}
+	for i := range 10 {
+		time.Sleep(10 * time.Millisecond)
+		stats := p.StatsJSON()
+		if reflect.DeepEqual(expected, stats) {
+			break
+		}
+		if i == 9 {
+			assert.Equal(t, expected, stats)
+		}
+	}
+	// There are already 2 resources available in the pool.
+	// So, returning one should be enough for SetCapacity to complete.
+	p.put(resources[3])
+	<-done
+	// Return the rest of the resources
+	for i := range 3 {
+		p.put(resources[i])
+	}
+	stats := p.StatsJSON()
+	expected = map[string]any{
+		"Capacity":          3,
+		"Available":         3,
+		"Active":            3,
+		"InUse":             0,
+		"WaitCount":         0,
+		"WaitTime":          time.Duration(0),
+		"IdleTimeout":       1 * time.Second,
+		"IdleClosed":        0,
+		"MaxLifetimeClosed": 0,
+	}
+	assert.Equal(t, expected, stats)
+	assert.EqualValues(t, 3, state.open.Load())
+
+	// Ensure no deadlock if SetCapacity is called after we start
+	// waiting for a resource
+	var err error
+	for i := range 3 {
+		var r *Pooled[*TestConn]
+		if i%2 == 0 {
+			r, err = p.Get(ctx, nil)
+		} else {
+			r, err = p.Get(ctx, sFoo)
+		}
+		require.NoError(t, err)
+		resources[i] = r
+	}
+	// This will wait because pool is empty
+	go func() {
+		r, err := p.Get(ctx, nil)
+		require.NoError(t, err)
+		p.put(r)
+		done <- true
+	}()
+
+	// This will also wait
+	go func() {
+		err := p.SetCapacity(ctx, 2)
+		require.NoError(t, err)
+		done <- true
+	}()
+	time.Sleep(10 * time.Millisecond)
+
+	// This should not hang
+	for i := range 3 {
+		p.put(resources[i])
+	}
+	<-done
+	<-done
+	assert.EqualValues(t, 2, p.Capacity())
+	assert.EqualValues(t, 2, p.Available())
+	assert.EqualValues(t, 1, p.Metrics.WaitCount())
+	assert.EqualValues(t, p.Metrics.WaitCount(), len(state.waits))
+	assert.EqualValues(t, 2, state.open.Load())
+
+	// Test race condition of SetCapacity with itself
+	err = p.SetCapacity(ctx, 3)
+	require.NoError(t, err)
+	for i := range 3 {
+		var r *Pooled[*TestConn]
+		var err error
+		if i%2 == 0 {
+			r, err = p.Get(ctx, nil)
+		} else {
+			r, err = p.Get(ctx, sFoo)
+		}
+		require.NoError(t, err)
+		resources[i] = r
+	}
+	// This will wait because pool is empty
+	go func() {
+		r, err := p.Get(ctx, nil)
+		require.NoError(t, err)
+		p.put(r)
+		done <- true
+	}()
+	time.Sleep(10 * time.Millisecond)
+
+	// This will wait till we Put
+	go func() {
+		err := p.SetCapacity(ctx, 2)
+		require.NoError(t, err)
+	}()
+	time.Sleep(10 * time.Millisecond)
+	go func() {
+		err := p.SetCapacity(ctx, 4)
+		require.NoError(t, err)
+	}()
+	time.Sleep(10 * time.Millisecond)
+
+	// This should not hang
+	for i := range 3 {
+		p.put(resources[i])
+	}
+	<-done
+
+	assert.Panics(t, func() {
+		_ = p.SetCapacity(ctx, -1)
+	})
+
+	assert.EqualValues(t, 4, p.Capacity())
+	assert.EqualValues(t, 4, p.Available())
+}
+
+func TestClosing(t *testing.T) {
+	var state TestState
+
+	ctx := context.Background()
+	p := NewPool(&Config[*TestConn]{
+		Capacity:    5,
+		IdleTimeout: time.Second,
+		LogWait:     state.LogWait,
+	}).Open(newConnector(&state), nil)
+
+	var resources [10]*Pooled[*TestConn]
+	for i := range 5 {
+		var r *Pooled[*TestConn]
+		var err error
+		if i%2 == 0 {
+			r, err = p.Get(ctx, nil)
+		} else {
+			r, err = p.Get(ctx, sFoo)
+		}
+		require.NoError(t, err)
+		resources[i] = r
+	}
+	ch := make(chan bool)
+	go func() {
+		p.Close()
+		ch <- true
+	}()
+
+	// Wait for goroutine to call Close
+	time.Sleep(10 * time.Millisecond)
+	stats := p.StatsJSON()
+	expected := map[string]any{
+		"Capacity":          0,
+		"Available":         -5,
+		"Active":            5,
+		"InUse":             5,
+		"WaitCount":         0,
+		"WaitTime":          time.Duration(0),
+		"IdleTimeout":       1 * time.Second,
+		"IdleClosed":        0,
+		"MaxLifetimeClosed": 0,
+	}
+	assert.Equal(t, expected, stats)
+
+	// Put is allowed when closing
+	for i := range 5 {
+		p.put(resources[i])
+	}
+
+	// Wait for Close to return
+	<-ch
+
+	stats = p.StatsJSON()
+	expected = map[string]any{
+		"Capacity":          0,
+		"Available":         0,
+		"Active":            0,
+		"InUse":             0,
+		"WaitCount":         0,
+		"WaitTime":          time.Duration(0),
+		"IdleTimeout":       1 * time.Second,
+		"IdleClosed":        0,
+		"MaxLifetimeClosed": 0,
+	}
+	assert.Equal(t, expected, stats)
+	assert.EqualValues(t, 5, state.lastID.Load())
+	assert.EqualValues(t, 0, state.open.Load())
+}
+
+func TestReopen(t *testing.T) {
+	var state TestState
+	var refreshed atomic.Bool
+
+	ctx := context.Background()
+	p := NewPool(&Config[*TestConn]{
+		Capacity:        5,
+		IdleTimeout:     time.Second,
+		LogWait:         state.LogWait,
+		RefreshInterval: 500 * time.Millisecond,
+	}).Open(newConnector(&state), func() (bool, error) {
+		refreshed.Store(true)
+		return true, nil
+	})
+
+	var resources [10]*Pooled[*TestConn]
+	for i := range 5 {
+		var r *Pooled[*TestConn]
+		var err error
+		if i%2 == 0 {
+			r, err = p.Get(ctx, nil)
+		} else {
+			r, err = p.Get(ctx, sFoo)
+		}
+		require.NoError(t, err)
+		resources[i] = r
+	}
+
+	time.Sleep(10 * time.Millisecond)
+	stats := p.StatsJSON()
+	expected := map[string]any{
+		"Capacity":          5,
+		"Available":         0,
+		"Active":            5,
+		"InUse":             5,
+		"WaitCount":         0,
+		"WaitTime":          time.Duration(0),
+		"IdleTimeout":       1 * time.Second,
+		"IdleClosed":        0,
+		"MaxLifetimeClosed": 0,
+	}
+	assert.Equal(t, expected, stats)
+
+	time.Sleep(1 * time.Second)
+	assert.Truef(t, refreshed.Load(), "did not refresh")
+
+	for i := range 5 {
+		p.put(resources[i])
+	}
+	time.Sleep(50 * time.Millisecond)
+	stats = p.StatsJSON()
+	expected = map[string]any{
+		"Capacity":          5,
+		"Available":         5,
+		"Active":            0,
+		"InUse":             0,
+		"WaitCount":         0,
+		"WaitTime":          time.Duration(0),
+		"IdleTimeout":       1 * time.Second,
+		"IdleClosed":        0,
+		"MaxLifetimeClosed": 0,
+	}
+	assert.Equal(t, expected, stats)
+	assert.EqualValues(t, 5, state.lastID.Load())
+	assert.EqualValues(t, 0, state.open.Load())
+}
+
+func TestUserClosing(t *testing.T) {
+	var state TestState
+
+	ctx := context.Background()
+	p := NewPool(&Config[*TestConn]{
+		Capacity:    5,
+		IdleTimeout: time.Second,
+		LogWait:     state.LogWait,
+	}).Open(newConnector(&state), nil)
+
+	var resources [5]*Pooled[*TestConn]
+	for i := range 5 {
+		var err error
+		resources[i], err = p.Get(ctx, nil)
+		require.NoError(t, err)
+	}
+
+	for _, r := range resources[:4] {
+		r.Recycle()
+	}
+
+	ch := make(chan error)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		defer cancel()
+
+		err := p.CloseWithContext(ctx)
+		ch <- err
+		close(ch)
+	}()
+
+	select {
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Pool did not shutdown after 5s")
+	case err := <-ch:
+		require.Error(t, err)
+		t.Logf("Shutdown error: %v", err)
+	}
+}
+
+func TestConnReopen(t *testing.T) {
+	var state TestState
+
+	p := NewPool(&Config[*TestConn]{
+		Capacity:    1,
+		IdleTimeout: 200 * time.Millisecond,
+		MaxLifetime: 10 * time.Millisecond,
+		LogWait:     state.LogWait,
+	}).Open(newConnector(&state), nil)
+
+	defer p.Close()
+
+	conn, err := p.Get(context.Background(), nil)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, state.lastID.Load())
+	assert.EqualValues(t, 1, p.Active())
+
+	// wait enough to reach maxlifetime.
+	time.Sleep(50 * time.Millisecond)
+
+	p.put(conn)
+	assert.EqualValues(t, 2, state.lastID.Load())
+	assert.EqualValues(t, 1, p.Active())
+
+	// wait enough to reach idle timeout.
+	time.Sleep(300 * time.Millisecond)
+	assert.GreaterOrEqual(t, state.lastID.Load(), int64(3))
+	assert.EqualValues(t, 1, p.Active())
+	assert.GreaterOrEqual(t, p.Metrics.IdleClosed(), int64(1))
+
+	// mark connect to fail
+	state.chaos.failConnect.Store(true)
+	// wait enough to reach idle timeout and connect to fail.
+	time.Sleep(300 * time.Millisecond)
+	// no active connection should be left.
+	assert.Zero(t, p.Active())
+}
+
+func TestIdleTimeout(t *testing.T) {
+	testTimeout := func(t *testing.T, setting *Setting) {
+		var state TestState
+
+		ctx := context.Background()
+		p := NewPool(&Config[*TestConn]{
+			Capacity:    5,
+			IdleTimeout: 10 * time.Millisecond,
+			LogWait:     state.LogWait,
+		}).Open(newConnector(&state), nil)
+
+		defer p.Close()
+
+		var conns []*Pooled[*TestConn]
+		for i := range 5 {
+			r, err := p.Get(ctx, setting)
+			require.NoError(t, err)
+			assert.EqualValues(t, i+1, state.open.Load())
+			assert.EqualValues(t, 0, p.Metrics.IdleClosed())
+
+			conns = append(conns, r)
+		}
+		assert.GreaterOrEqual(t, state.open.Load(), int64(5))
+
+		// wait a long while; ensure that none of the conns have been closed
+		time.Sleep(1 * time.Second)
+
+		var closers []chan struct{}
+		for _, conn := range conns {
+			assert.Falsef(t, conn.Conn.IsClosed(), "connection was idle-closed while outside the pool")
+			closers = append(closers, conn.Conn.waitForClose())
+			p.put(conn)
+		}
+
+		time.Sleep(1 * time.Second)
+
+		for _, closed := range closers {
+			select {
+			case <-closed:
+			default:
+				t.Fatalf("Connections remain open after 1 second")
+			}
+		}
+		// At least 5 connections should have been closed by now.
+		assert.GreaterOrEqual(t, p.Metrics.IdleClosed(), int64(5), "At least 5 connections should have been closed by now.")
+
+		// At any point, at least 4 connections should be open, with 1 either in the process of opening or already opened.
+		// The idle connection closer shuts down one connection at a time.
+		assert.GreaterOrEqual(t, state.open.Load(), int64(4))
+
+		// The number of available connections in the pool should remain at 5.
+		assert.EqualValues(t, 5, p.Available())
+	}
+
+	t.Run("WithoutSettings", func(t *testing.T) { testTimeout(t, nil) })
+	t.Run("WithSettings", func(t *testing.T) { testTimeout(t, sFoo) })
+}
+
+func TestIdleTimeoutCreateFail(t *testing.T) {
+	var state TestState
+	connector := newConnector(&state)
+
+	ctx := context.Background()
+	p := NewPool(&Config[*TestConn]{
+		Capacity:    1,
+		IdleTimeout: 10 * time.Millisecond,
+		LogWait:     state.LogWait,
+	}).Open(connector, nil)
+
+	defer p.Close()
+
+	for _, setting := range []*Setting{nil, sFoo} {
+		r, err := p.Get(ctx, setting)
+		require.NoError(t, err)
+		// Change the factory before putting back
+		// to prevent race with the idle closer, who will
+		// try to use it.
+		state.chaos.failConnect.Store(true)
+		p.put(r)
+		timeout := time.After(1 * time.Second)
+		for p.Active() != 0 {
+			select {
+			case <-timeout:
+				t.Errorf("Timed out waiting for resource to be closed by idle timeout")
+			default:
+			}
+		}
+		// reset factory for next run.
+		state.chaos.failConnect.Store(false)
+	}
+}
+
+func TestMaxLifetime(t *testing.T) {
+	var state TestState
+
+	ctx := context.Background()
+	p := NewPool(&Config[*TestConn]{
+		Capacity:    1,
+		IdleTimeout: 10 * time.Second,
+		LogWait:     state.LogWait,
+	}).Open(newConnector(&state), nil)
+
+	r, err := p.Get(ctx, nil)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, state.open.Load())
+	assert.EqualValues(t, 0, p.Metrics.MaxLifetimeClosed())
+
+	time.Sleep(10 * time.Millisecond)
+
+	p.put(r)
+	assert.EqualValues(t, 1, state.lastID.Load())
+	assert.EqualValues(t, 1, state.open.Load())
+	assert.EqualValues(t, 0, p.Metrics.MaxLifetimeClosed())
+
+	p.Close()
+
+	// maxLifetime > 0
+	state.lastID.Store(0)
+	state.open.Store(0)
+
+	p = NewPool(&Config[*TestConn]{
+		Capacity:    1,
+		IdleTimeout: 10 * time.Second,
+		MaxLifetime: 10 * time.Millisecond,
+		LogWait:     state.LogWait,
+	}).Open(newConnector(&state), nil)
+
+	r, err = p.Get(ctx, nil)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, state.open.Load())
+	assert.EqualValues(t, 0, p.Metrics.MaxLifetimeClosed())
+
+	time.Sleep(5 * time.Millisecond)
+
+	p.put(r)
+	assert.EqualValues(t, 1, state.lastID.Load())
+	assert.EqualValues(t, 1, state.open.Load())
+	assert.EqualValues(t, 0, p.Metrics.MaxLifetimeClosed())
+
+	r, err = p.Get(ctx, nil)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, state.open.Load())
+	assert.EqualValues(t, 0, p.Metrics.MaxLifetimeClosed())
+
+	time.Sleep(10 * time.Millisecond * 2)
+
+	p.put(r)
+	assert.EqualValues(t, 2, state.lastID.Load())
+	assert.EqualValues(t, 1, state.open.Load())
+	assert.EqualValues(t, 1, p.Metrics.MaxLifetimeClosed())
+}
+
+func TestExtendedLifetimeTimeout(t *testing.T) {
+	var state TestState
+	connector := newConnector(&state)
+	config := &Config[*TestConn]{
+		Capacity:    1,
+		IdleTimeout: time.Second,
+		MaxLifetime: 0,
+		LogWait:     state.LogWait,
+	}
+
+	// maxLifetime 0
+	p := NewPool(config).Open(connector, nil)
+	assert.Zero(t, p.extendedMaxLifetime())
+	p.Close()
+
+	// maxLifetime > 0
+	config.MaxLifetime = 10 * time.Millisecond
+	for range 10 {
+		p = NewPool(config).Open(connector, nil)
+		assert.LessOrEqual(t, config.MaxLifetime, p.extendedMaxLifetime())
+		assert.Greater(t, 2*config.MaxLifetime, p.extendedMaxLifetime())
+		p.Close()
+	}
+}
+
+// TestMaxIdleCount tests the MaxIdleCount setting, to check if the pool closes
+// the idle connections when the number of idle connections exceeds the limit.
+func TestMaxIdleCount(t *testing.T) {
+	testMaxIdleCount := func(t *testing.T, setting *Setting, maxIdleCount int64, expClosedConn int) {
+		var state TestState
+
+		ctx := context.Background()
+		p := NewPool(&Config[*TestConn]{
+			Capacity:     5,
+			MaxIdleCount: maxIdleCount,
+			LogWait:      state.LogWait,
+		}).Open(newConnector(&state), nil)
+
+		defer p.Close()
+
+		var conns []*Pooled[*TestConn]
+		for i := range 5 {
+			r, err := p.Get(ctx, setting)
+			require.NoError(t, err)
+			assert.EqualValues(t, i+1, state.open.Load())
+			assert.EqualValues(t, 0, p.Metrics.IdleClosed())
+
+			conns = append(conns, r)
+		}
+
+		for _, conn := range conns {
+			p.put(conn)
+		}
+
+		closedConn := 0
+		for _, conn := range conns {
+			if conn.Conn.IsClosed() {
+				closedConn++
+			}
+		}
+		assert.EqualValues(t, expClosedConn, closedConn)
+		assert.EqualValues(t, expClosedConn, p.Metrics.IdleClosed())
+	}
+
+	t.Run("WithoutSettings", func(t *testing.T) { testMaxIdleCount(t, nil, 2, 3) })
+	t.Run("WithSettings", func(t *testing.T) { testMaxIdleCount(t, sFoo, 2, 3) })
+	t.Run("WithoutSettings-MaxIdleCount-Zero", func(t *testing.T) { testMaxIdleCount(t, nil, 0, 0) })
+	t.Run("WithSettings-MaxIdleCount-Zero", func(t *testing.T) { testMaxIdleCount(t, sFoo, 0, 0) })
+}
+
+func TestCreateFail(t *testing.T) {
+	var state TestState
+	state.chaos.failConnect.Store(true)
+
+	ctx := context.Background()
+	p := NewPool(&Config[*TestConn]{
+		Capacity:    5,
+		IdleTimeout: time.Second,
+		LogWait:     state.LogWait,
+	}).Open(newConnector(&state), nil)
+
+	for _, setting := range []*Setting{nil, sFoo} {
+		if _, err := p.Get(ctx, setting); err.Error() != "failed to connect: forced failure" {
+			t.Errorf("Expecting Failed, received %v", err)
+		}
+		stats := p.StatsJSON()
+		expected := map[string]any{
+			"Capacity":          5,
+			"Available":         5,
+			"Active":            0,
+			"InUse":             0,
+			"WaitCount":         0,
+			"WaitTime":          time.Duration(0),
+			"IdleTimeout":       1 * time.Second,
+			"IdleClosed":        0,
+			"MaxLifetimeClosed": 0,
+		}
+		assert.Equal(t, expected, stats)
+	}
+}
+
+func TestCreateFailOnPut(t *testing.T) {
+	var state TestState
+	connector := newConnector(&state)
+
+	ctx := context.Background()
+	p := NewPool(&Config[*TestConn]{
+		Capacity:    5,
+		IdleTimeout: time.Second,
+		LogWait:     state.LogWait,
+	}).Open(connector, nil)
+
+	defer p.Close()
+
+	for _, setting := range []*Setting{nil, sFoo} {
+		_, err := p.Get(ctx, setting)
+		require.NoError(t, err)
+
+		// change factory to fail the put.
+		state.chaos.failConnect.Store(true)
+		p.put(nil)
+		assert.Zero(t, p.Active())
+
+		// change back for next iteration.
+		state.chaos.failConnect.Store(false)
+	}
+}
+
+func TestSlowCreateFail(t *testing.T) {
+	var state TestState
+	state.chaos.delayConnect = 10 * time.Millisecond
+
+	ctx := context.Background()
+	ch := make(chan *Pooled[*TestConn])
+
+	for _, setting := range []*Setting{nil, sFoo} {
+		p := NewPool(&Config[*TestConn]{
+			Capacity:    2,
+			IdleTimeout: time.Second,
+			LogWait:     state.LogWait,
+		}).Open(newConnector(&state), nil)
+
+		state.chaos.failConnect.Store(true)
+
+		for range 3 {
+			go func() {
+				conn, _ := p.Get(ctx, setting)
+				ch <- conn
+			}()
+		}
+		assert.Nil(t, <-ch)
+		assert.Nil(t, <-ch)
+		assert.Equalf(t, p.Capacity(), int64(2), "pool should not be out of capacity")
+		assert.Equalf(t, p.Available(), int64(2), "pool should not be out of availability")
+
+		select {
+		case <-ch:
+			assert.Fail(t, "there should be no capacity for a third connection")
+		default:
+		}
+
+		state.chaos.failConnect.Store(false)
+		conn, err := p.Get(ctx, setting)
+		require.NoError(t, err)
+
+		p.put(conn)
+		conn = <-ch
+		assert.NotNil(t, conn)
+		p.put(conn)
+		p.Close()
+	}
+}
+
+func TestTimeout(t *testing.T) {
+	var state TestState
+
+	ctx := context.Background()
+	p := NewPool(&Config[*TestConn]{
+		Capacity:    1,
+		IdleTimeout: time.Second,
+		LogWait:     state.LogWait,
+	}).Open(newConnector(&state), nil)
+
+	defer p.Close()
+
+	// take the only connection available
+	r, err := p.Get(ctx, nil)
+	require.NoError(t, err)
+
+	for _, setting := range []*Setting{nil, sFoo} {
+		// trying to get the connection without a timeout.
+		newctx, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
+		_, err = p.Get(newctx, setting)
+		cancel()
+		assert.EqualError(t, err, "connection pool timed out")
+	}
+
+	// put the connection take was taken initially.
+	p.put(r)
+}
+
+func TestExpired(t *testing.T) {
+	var state TestState
+
+	p := NewPool(&Config[*TestConn]{
+		Capacity:    1,
+		IdleTimeout: time.Second,
+		LogWait:     state.LogWait,
+	}).Open(newConnector(&state), nil)
+
+	defer p.Close()
+
+	for _, setting := range []*Setting{nil, sFoo} {
+		// expired context
+		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-1*time.Second))
+		_, err := p.Get(ctx, setting)
+		cancel()
+		require.EqualError(t, err, "connection pool context already expired")
+	}
+}
+
+func TestMultiSettings(t *testing.T) {
+	var state TestState
+
+	ctx := context.Background()
+	p := NewPool(&Config[*TestConn]{
+		Capacity:    5,
+		IdleTimeout: time.Second,
+		LogWait:     state.LogWait,
+	}).Open(newConnector(&state), nil)
+
+	var resources [10]*Pooled[*TestConn]
+	var r *Pooled[*TestConn]
+	var err error
+
+	settings := []*Setting{nil, sFoo, sBar, sBar, sFoo}
+
+	// Test Get
+	for i := range 5 {
+		r, err = p.Get(ctx, settings[i])
+		require.NoError(t, err)
+		resources[i] = r
+		assert.EqualValues(t, 5-i-1, p.Available())
+		assert.Zero(t, p.Metrics.WaitCount())
+		assert.Zero(t, len(state.waits))
+		assert.Zero(t, p.Metrics.WaitTime())
+		assert.EqualValues(t, i+1, state.lastID.Load())
+		assert.EqualValues(t, i+1, state.open.Load())
+	}
+
+	// Test that Get waits
+	ch := make(chan bool)
+	go func() {
+		for i := range 5 {
+			r, err = p.Get(ctx, settings[i])
+			require.NoError(t, err)
+			resources[i] = r
+		}
+		for i := range 5 {
+			p.put(resources[i])
+		}
+		ch <- true
+	}()
+	for i := range 5 {
+		// Sleep to ensure the goroutine waits
+		time.Sleep(10 * time.Millisecond)
+		p.put(resources[i])
+	}
+	<-ch
+	assert.EqualValues(t, 5, p.Metrics.WaitCount())
+	assert.Equal(t, 5, len(state.waits))
+	// verify start times are monotonic increasing
+	for i := 1; i < len(state.waits); i++ {
+		assert.False(t, state.waits[i].Before(state.waits[i-1]), "Expecting monotonic increasing start times")
+	}
+	assert.NotZero(t, p.Metrics.WaitTime())
+	assert.EqualValues(t, 5, state.lastID.Load())
+
+	// Close
+	p.Close()
+	assert.EqualValues(t, 0, p.Capacity())
+	assert.EqualValues(t, 0, p.Available())
+	assert.EqualValues(t, 0, state.open.Load())
+}
+
+func TestMultiSettingsWithReset(t *testing.T) {
+	var state TestState
+
+	ctx := context.Background()
+	p := NewPool(&Config[*TestConn]{
+		Capacity:    5,
+		IdleTimeout: time.Second,
+		LogWait:     state.LogWait,
+	}).Open(newConnector(&state), nil)
+
+	var resources [10]*Pooled[*TestConn]
+	var r *Pooled[*TestConn]
+	var err error
+
+	settings := []*Setting{nil, sFoo, sBar, sBar, sFoo}
+
+	// Test Get
+	for i := range 5 {
+		r, err = p.Get(ctx, settings[i])
+		require.NoError(t, err)
+		resources[i] = r
+		assert.EqualValues(t, 5-i-1, p.Available())
+		assert.EqualValues(t, i+1, state.lastID.Load())
+		assert.EqualValues(t, i+1, state.open.Load())
+	}
+
+	// Put all of them back
+	for i := range 5 {
+		p.put(resources[i])
+	}
+
+	// Getting all with same setting.
+	for i := range 5 {
+		r, err = p.Get(ctx, settings[1]) // {foo}
+		require.NoError(t, err)
+		assert.Truef(t, r.Conn.setting == settings[1], "setting was not properly applied")
+		resources[i] = r
+	}
+	assert.EqualValues(t, 2, state.reset.Load()) // when setting was {bar} and getting for {foo}
+	assert.EqualValues(t, 0, p.Available())
+	assert.EqualValues(t, 5, state.lastID.Load())
+	assert.EqualValues(t, 5, state.open.Load())
+
+	for i := range 5 {
+		p.put(resources[i])
+	}
+
+	// Close
+	p.Close()
+	assert.EqualValues(t, 0, p.Capacity())
+	assert.EqualValues(t, 0, p.Available())
+	assert.EqualValues(t, 0, state.open.Load())
+}
+
+func TestApplySettingsFailure(t *testing.T) {
+	var state TestState
+
+	ctx := context.Background()
+	p := NewPool(&Config[*TestConn]{
+		Capacity:    5,
+		IdleTimeout: time.Second,
+		LogWait:     state.LogWait,
+	}).Open(newConnector(&state), nil)
+
+	var resources []*Pooled[*TestConn]
+	var r *Pooled[*TestConn]
+	var err error
+
+	settings := []*Setting{nil, sFoo, sBar, sBar, sFoo}
+	// get the resource and mark for failure
+	for i := range 5 {
+		r, err = p.Get(ctx, settings[i])
+		require.NoError(t, err)
+		r.Conn.failApply = true
+		resources = append(resources, r)
+	}
+	// put them back
+	for _, r = range resources {
+		p.put(r)
+	}
+
+	// any new connection created will fail to apply setting
+	state.chaos.failApply = true
+
+	// Get the resource with "foo" setting
+	// For an applied connection if the setting are same it will be returned as-is.
+	// Otherwise, will fail to get the resource.
+	var failCount int
+	resources = nil
+	for range 5 {
+		r, err = p.Get(ctx, settings[1])
+		if err != nil {
+			failCount++
+			assert.EqualError(t, err, "ApplySetting failed")
+			continue
+		}
+		resources = append(resources, r)
+	}
+	// put them back
+	for _, r = range resources {
+		p.put(r)
+	}
+	require.Equal(t, 3, failCount)
+
+	// should be able to get all the resource with no setting
+	resources = nil
+	for range 5 {
+		r, err = p.Get(ctx, nil)
+		require.NoError(t, err)
+		resources = append(resources, r)
+	}
+	// put them back
+	for _, r = range resources {
+		p.put(r)
+	}
+}
+
+func TestGetSpike(t *testing.T) {
+	var state TestState
+
+	ctx := context.Background()
+	p := NewPool(&Config[*TestConn]{
+		Capacity:    5,
+		IdleTimeout: time.Second,
+		LogWait:     state.LogWait,
+	}).Open(newConnector(&state), nil)
+
+	var resources [10]*Pooled[*TestConn]
+
+	// Ensure we have a pool with 5 available resources
+	for i := range 5 {
+		r, err := p.Get(ctx, nil)
+
+		require.NoError(t, err)
+		resources[i] = r
+		assert.EqualValues(t, 5-i-1, p.Available())
+		assert.Zero(t, p.Metrics.WaitCount())
+		assert.Zero(t, len(state.waits))
+		assert.Zero(t, p.Metrics.WaitTime())
+		assert.EqualValues(t, i+1, state.lastID.Load())
+		assert.EqualValues(t, i+1, state.open.Load())
+	}
+
+	for i := range 5 {
+		p.put(resources[i])
+	}
+
+	assert.EqualValues(t, 5, p.Available())
+	assert.EqualValues(t, 5, p.Active())
+	assert.EqualValues(t, 0, p.InUse())
+
+	for range 2000 {
+		wg := sync.WaitGroup{}
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+
+		errs := make(chan error, 80)
+
+		for range 80 {
+			wg.Go(func() {
+				r, err := p.Get(ctx, nil)
+				defer p.put(r)
+
+				if err != nil {
+					errs <- err
+				}
+			})
+		}
+		wg.Wait()
+
+		if len(errs) > 0 {
+			t.Errorf("Error getting connection: %v", <-errs)
+		}
+
+		close(errs)
+	}
+}
+
+// TestCloseDuringWaitForConn confirms that we do not get hung when the pool gets
+// closed while we are waiting for a connection from it.
+func TestCloseDuringWaitForConn(t *testing.T) {
+	ctx := context.Background()
+	goRoutineCnt := 50
+	getTimeout := 2000 * time.Millisecond
+
+	for range 50 {
+		hung := make(chan (struct{}), goRoutineCnt)
+		var state TestState
+		p := NewPool(&Config[*TestConn]{
+			Capacity:     1,
+			MaxIdleCount: 1,
+			IdleTimeout:  time.Second,
+			LogWait:      state.LogWait,
+		}).Open(newConnector(&state), nil)
+
+		closed := atomic.Bool{}
+		wg := sync.WaitGroup{}
+		var count atomic.Int64
+
+		fmt.Println("Starting TestCloseDuringWaitForConn")
+
+		// Spawn multiple goroutines to perform Get and Put operations, but only
+		// allow connections to be checked out until `closed` has been set to true.
+		for range goRoutineCnt {
+			wg.Go(func() {
+				for !closed.Load() {
+					timeout := time.After(getTimeout)
+					getCtx, getCancel := context.WithTimeout(ctx, getTimeout/3)
+					defer getCancel()
+					done := make(chan struct{})
+					go func() {
+						defer close(done)
+						r, err := p.Get(getCtx, nil)
+						if err != nil {
+							return
+						}
+						count.Add(1)
+						r.Recycle()
+					}()
+					select {
+					case <-timeout:
+						hung <- struct{}{}
+						return
+					case <-done:
+					}
+				}
+			})
+		}
+
+		// Let the go-routines get up and running.
+		for count.Load() < 5000 {
+			time.Sleep(1 * time.Millisecond)
+		}
+
+		// Close the pool, which should allow all goroutines to finish.
+		closeCtx, closeCancel := context.WithTimeout(ctx, 1*time.Second)
+		defer closeCancel()
+		err := p.CloseWithContext(closeCtx)
+		closed.Store(true)
+		require.NoError(t, err, "Failed to close pool")
+
+		// Wait for all goroutines to finish.
+		wg.Wait()
+		select {
+		case <-hung:
+			require.FailNow(t, "Race encountered and deadlock detected")
+		default:
+		}
+
+		fmt.Println("Count of connections checked out:", count.Load())
+		// Check that the pool is closed and no connections are available.
+		require.EqualValues(t, 0, p.Capacity())
+		require.EqualValues(t, 0, p.Available())
+		require.EqualValues(t, 0, state.open.Load())
+	}
+}
+
+// TestIdleTimeoutConnectionLeak checks for leaked connections after idle timeout
+func TestIdleTimeoutConnectionLeak(t *testing.T) {
+	var state TestState
+
+	// Slow connection creation to ensure idle timeout happens during reopening
+	state.chaos.delayConnect = 300 * time.Millisecond
+
+	p := NewPool(&Config[*TestConn]{
+		Capacity:    2,
+		IdleTimeout: 50 * time.Millisecond,
+		LogWait:     state.LogWait,
+	}).Open(newConnector(&state), nil)
+
+	getCtx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer cancel()
+
+	// Get and return two connections
+	conn1, err := p.Get(getCtx, nil)
+	require.NoError(t, err)
+
+	conn2, err := p.Get(getCtx, nil)
+	require.NoError(t, err)
+
+	p.put(conn1)
+	p.put(conn2)
+
+	// At this point: Active=2, InUse=0, Available=2
+	require.EqualValues(t, 2, p.Active())
+	require.EqualValues(t, 0, p.InUse())
+	require.EqualValues(t, 2, p.Available())
+
+	// Wait for idle timeout to kick in and start expiring connections
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		// Check the actual number of currently open connections
+		assert.Equal(c, int64(2), state.open.Load())
+		// Check the total number of closed connections
+		assert.Equal(c, int64(1), state.close.Load())
+	}, 100*time.Millisecond, 10*time.Millisecond)
+
+	// At this point, the idle timeout worker has expired the connections
+	// and is trying to reopen them (which takes 300ms due to delayConnect)
+
+	// Try to get connections while they're being reopened
+	// This should trigger the bug where connections get discarded
+	wg := sync.WaitGroup{}
+
+	for range 2 {
+		wg.Go(func() {
+			getCtx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+			defer cancel()
+
+			conn, err := p.Get(getCtx, nil)
+			require.NoError(t, err)
+
+			p.put(conn)
+		})
+	}
+
+	wg.Wait()
+
+	// Wait a moment for all reopening to complete
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		// Check the actual number of currently open connections
+		require.Equal(c, int64(2), state.open.Load())
+		// Check the total number of closed connections
+		require.Equal(c, int64(2), state.close.Load())
+	}, 400*time.Millisecond, 10*time.Millisecond)
+
+	// Check the pool state
+	assert.Equal(t, int64(2), p.Active())
+	assert.Equal(t, int64(0), p.InUse())
+	assert.Equal(t, int64(2), p.Available())
+	assert.Equal(t, int64(2), p.Metrics.IdleClosed())
+
+	// Try to close the pool - if there are leaked connections, this will timeout
+	closeCtx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer cancel()
+
+	err = p.CloseWithContext(closeCtx)
+	require.NoError(t, err)
+
+	// Pool should be completely closed now
+	assert.Equal(t, int64(0), p.Active())
+	assert.Equal(t, int64(0), p.InUse())
+	assert.Equal(t, int64(0), p.Available())
+	assert.Equal(t, int64(2), p.Metrics.IdleClosed())
+
+	assert.Equal(t, int64(0), state.open.Load())
+	assert.Equal(t, int64(4), state.close.Load())
+}
+
+func TestIdleTimeoutDoesntLeaveLingeringConnection(t *testing.T) {
+	var state TestState
+
+	ctx := context.Background()
+	p := NewPool(&Config[*TestConn]{
+		Capacity:    10,
+		IdleTimeout: 50 * time.Millisecond,
+		LogWait:     state.LogWait,
+	}).Open(newConnector(&state), nil)
+
+	defer p.Close()
+
+	var conns []*Pooled[*TestConn]
+	for range 10 {
+		conn, err := p.Get(ctx, nil)
+		require.NoError(t, err)
+		conns = append(conns, conn)
+	}
+
+	for _, conn := range conns {
+		p.put(conn)
+	}
+
+	require.EqualValues(t, 10, p.Active())
+	require.EqualValues(t, 10, p.Available())
+
+	// Wait a bit for the idle timeout worker to refresh connections
+	assert.Eventually(t, func() bool {
+		return p.Metrics.IdleClosed() > 10
+	}, 500*time.Millisecond, 10*time.Millisecond, "Expected at least 10 connections to be closed by idle timeout")
+
+	// Verify that new connections were created to replace the closed ones
+	require.EqualValues(t, 10, p.Active())
+	require.EqualValues(t, 10, p.Available())
+
+	// Count how many connections in the stack are closed
+	totalInStack := 0
+	for conn := p.clean.Peek(); conn != nil; conn = conn.next.Load() {
+		totalInStack++
+	}
+
+	require.LessOrEqual(t, totalInStack, 10)
+}
+
+func BenchmarkPoolCleanupIdleConnectionsPerformanceNoIdleConnections(b *testing.B) {
+	var state TestState
+
+	capacity := 1000
+
+	p := NewPool(&Config[*TestConn]{
+		Capacity:    int64(capacity),
+		IdleTimeout: 30 * time.Second,
+		LogWait:     state.LogWait,
+	}).Open(newConnector(&state), nil)
+	defer p.Close()
+
+	// Fill the pool
+	connections := make([]*Pooled[*TestConn], 0, capacity)
+	for range capacity {
+		conn, err := p.Get(context.Background(), nil)
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		connections = append(connections, conn)
+	}
+
+	// Return all connections to the pool
+	for _, conn := range connections {
+		conn.Recycle()
+	}
+
+	b.ResetTimer()
+
+	for b.Loop() {
+		p.closeIdleResources(time.Now())
+	}
+}

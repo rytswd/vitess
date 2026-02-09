@@ -18,14 +18,12 @@ package io.vitess.jdbc;
 
 import io.vitess.proto.Query;
 import io.vitess.util.Constants;
-
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.ResultSet;
 import java.sql.RowIdLifetime;
 import java.sql.SQLException;
 import java.sql.SQLFeatureNotSupportedException;
-import java.util.logging.Logger;
 
 /**
  * Created by ashudeep.sharma on 15/02/16.
@@ -34,7 +32,6 @@ public class VitessMariaDBDatabaseMetadata extends VitessDatabaseMetaData implem
     DatabaseMetaData {
 
   private static final String DRIVER_NAME = "Vitess MariaDB JDBC Driver";
-  private static Logger logger = Logger.getLogger(VitessMariaDBDatabaseMetadata.class.getName());
 
   public VitessMariaDBDatabaseMetadata(VitessConnection connection) throws SQLException {
     this.setConnection(connection);
